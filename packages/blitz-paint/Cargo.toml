@@ -21,6 +21,9 @@ apple-font-embolden = []
 # drag/hover interaction in blitz-dom (off by default while the feature
 # matures).
 scrollbars = ["blitz-dom/scrollbars"]
+# Paint text in vertical writing modes: glyph runs are laid out by Parley in the
+# inline root's own axes and have to be mapped onto physical space here.
+writing-mode = ["blitz-dom/writing-mode"]
 
 [dependencies]
 # Blitz dependencies

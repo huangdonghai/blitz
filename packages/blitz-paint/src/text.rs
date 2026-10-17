@@ -562,6 +562,25 @@ fn flush_line_decorations(
     }
 }
 
+/// Block-axis geometry of an inline root laid out in a vertical writing mode, as
+/// `(block extent in device px, block axis starts at the right edge)`.
+///
+/// `None` when the inline root is horizontal (or its layout has not been
+/// performed yet), in which case Parley's coordinates are already physical.
+#[cfg(feature = "writing-mode")]
+fn vertical_text(doc: &BaseDocument, inline_root_id: NodeId, scale: f64) -> Option<(f32, bool)> {
+    let vertical = doc
+        .get_node(inline_root_id)?
+        .element_data()?
+        .inline_layout_data
+        .as_ref()?
+        .vertical_text?;
+    Some((
+        vertical.block_extent * scale as f32,
+        vertical.block_axis_starts_at_right,
+    ))
+}
+
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
@@ -580,6 +599,12 @@ pub(crate) fn stroke_text<'a>(
     stack.clear();
     path_scratch.clear();
     deco_boxes.clear();
+
+    // Vertical writing modes: Parley positions glyphs in the inline root's own
+    // axes (x = inline advance, y = block axis / baseline), which coincide with
+    // physical space only for `horizontal-tb`. Map them in `draw_glyphs` below.
+    #[cfg(feature = "writing-mode")]
+    let vertical = vertical_text(doc, inline_root_id, scale);
 
     // Persistent stack mirroring the ancestor path (inline root -> current run's
     // node) as we walk the runs. The `text-decoration-*` properties are *not*
@@ -644,6 +669,40 @@ pub(crate) fn stroke_text<'a>(
                     kurbo::Vec2::default()
                 };
 
+                // Map glyph positions from the inline root's axes onto physical
+                // space for vertical writing modes (see the note at the top).
+                #[cfg(feature = "writing-mode")]
+                let glyphs = glyph_run.positioned_glyphs().map(|glyph| {
+                    let (x, y) = match vertical {
+                        Some((block_extent, from_right)) => {
+                            // Upright orientation — UAX #50 `vo` = U/Tu/Tr, which
+                            // covers Han and kana under `text-orientation: mixed`.
+                            // The horizontal advance becomes the vertical step and
+                            // the glyph is centred on the column's central
+                            // baseline (css-writing-modes-3 §4.2).
+                            let advance = glyph.advance;
+                            let centre = glyph.y + (metrics.descent - metrics.ascent) / 2.0;
+                            let block_pos = if from_right {
+                                block_extent - centre
+                            } else {
+                                centre
+                            };
+                            (
+                                block_pos - advance / 2.0,
+                                glyph.x + (advance + metrics.ascent - metrics.descent) / 2.0,
+                            )
+                        }
+                        None => (glyph.x, glyph.y),
+                    };
+                    anyrender::Glyph { id: glyph.id as _, x, y }
+                });
+                #[cfg(not(feature = "writing-mode"))]
+                let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
+                    id: glyph.id as _,
+                    x: glyph.x,
+                    y: glyph.y,
+                });
+
                 let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
                 scene.draw_glyphs(
                     font,
@@ -656,11 +715,7 @@ pub(crate) fn stroke_text<'a>(
                     1.0, // alpha
                     transform,
                     glyph_xform,
-                    glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-                        id: glyph.id as _,
-                        x: glyph.x,
-                        y: glyph.y,
-                    }),
+                    glyphs,
                 );
 
                 // Accumulate this run's contribution to each decorating box on its ancestor

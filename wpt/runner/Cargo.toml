@@ -16,7 +16,7 @@ blitz-dom = { workspace = true, features = ["svg", "floats", "system-fonts", "wo
 blitz-html = {workspace = true }
 blitz-vibey-script = { workspace = true }
 blitz-traits = { workspace = true }
-blitz-paint = { workspace = true, features = ["default"] }
+blitz-paint = { workspace = true, features = ["default", "writing-mode"] }
 anyrender = { workspace = true }
 anyrender_vello = { workspace = true, optional = true }
 anyrender_vello_cpu = { workspace = true, optional = true }

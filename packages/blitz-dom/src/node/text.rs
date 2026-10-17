@@ -33,6 +33,27 @@ pub struct TextLayout {
     /// containing block (as `SPAN_*_CB` flags). The inline root claims those boxes in its place.
     /// Set by each `RunMode::PerformLayout` run of inline layout.
     pub span_cb_flags: stylo_taffy::StyleFlags,
+    /// Vertical writing mode geometry, recorded by each `RunMode::PerformLayout`
+    /// run of inline layout. `None` for horizontal writing modes.
+    ///
+    /// Parley lays text out in the axes of the container's own writing mode
+    /// (inline axis = "width", block axis = "height"), which only coincides with
+    /// physical space for `horizontal-tb`. Painting a vertical inline root
+    /// therefore needs the physical block extent in order to map — and, for
+    /// `vertical-rl`, mirror — line box positions onto the screen.
+    pub vertical_text: Option<VerticalTextPaint>,
+}
+
+/// Physical geometry needed to paint an inline root laid out in a vertical
+/// writing mode. Parley's coordinates are in the writing mode's own axes, so the
+/// painter has to map the block axis onto physical x (mirrored for
+/// `vertical-rl`, whose block axis starts at the right edge).
+#[derive(Debug, Clone, Copy)]
+pub struct VerticalTextPaint {
+    /// Physical block extent of the content box, in CSS px.
+    pub block_extent: f32,
+    /// Whether the block axis starts at the right edge (`vertical-rl`).
+    pub block_axis_starts_at_right: bool,
 }
 
 impl TextLayout {

@@ -21,6 +21,8 @@ use taffy::{BlockItemStyle as _, Clear, Float, prelude::TaffyMaxContent};
 use stylo_taffy::StyleFlags;
 
 use super::resolve_calc_value;
+#[cfg(feature = "writing-mode")]
+use crate::node::VerticalTextPaint;
 use crate::layout::LayoutPassState;
 use crate::stylo_to_parley;
 
@@ -1116,6 +1118,25 @@ impl LayoutPassState<'_> {
 
         if inputs.run_mode == RunMode::PerformLayout {
             inline_layout.span_cb_flags = span_cb_flags;
+
+            // Record the physical geometry needed to paint a vertical inline root.
+            // Parley works in the axes of the container's own writing mode, so the
+            // painter needs the physical block extent to map (and, for
+            // `vertical-rl`, mirror) line box positions onto physical x.
+            #[cfg(feature = "writing-mode")]
+            {
+                let wm = self.nodes[node_id].writing_mode();
+                inline_layout.vertical_text = if wm.is_vertical() {
+                    Some(VerticalTextPaint {
+                        // In a vertical writing mode, Taffy's block axis — which
+                        // `final_size.height` measures — is physical x.
+                        block_extent: final_size.height - content_box_inset.vertical_axis_sum(),
+                        block_axis_starts_at_right: !wm.is_vertical_lr(),
+                    })
+                } else {
+                    None
+                };
+            }
         }
 
         // Put layout back
