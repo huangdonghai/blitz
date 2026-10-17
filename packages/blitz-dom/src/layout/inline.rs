@@ -665,6 +665,15 @@ impl LayoutPassState<'_> {
             .layout
             .set_text_indent(resolved_text_indent * scale, indent_options);
 
+        // In vertical writing modes Taffy's block axis is physical x, so a line box must be as
+        // tall as its tallest box rather than `max(ascent) + max(descent)` (CSS Writing Modes 3
+        // §7.1: the font's ascent and descent belong to the inline axis).
+        #[cfg(feature = "writing-mode")]
+        {
+            let wm = self.nodes[node_id].writing_mode();
+            inline_layout.layout.set_vertical(wm.is_vertical());
+        }
+
         #[cfg(not(feature = "floats"))]
         {
             inline_layout.layout.break_all_lines(Some(width));
@@ -677,6 +686,13 @@ impl LayoutPassState<'_> {
         // Perform inline layout
         #[cfg(feature = "floats")]
         {
+            // `perform_layout` breaks lines independently of `compute_size`, so the writing mode
+            // has to be re-applied here.
+            #[cfg(feature = "writing-mode")]
+            {
+                let wm = self.nodes[node_id].writing_mode();
+                inline_layout.layout.set_vertical(wm.is_vertical());
+            }
             let mut breaker = inline_layout.layout.break_lines();
             let initial_slot = block_ctx.find_content_slot(0.0, Clear::None, None);
             let mut has_active_floats = initial_slot.segment_id.is_some();
