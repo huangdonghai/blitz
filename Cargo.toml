@@ -322,6 +322,8 @@ rustc-hash = { workspace = true }
 # [patch."https://github.com/dioxuslabs/taffy"]
 # taffy = { path = "../taffy" }
 
-# [patch."https://github.com/linebender/parley"]
-# parley = { path = "../parley/parley" }
-# fontique = { path = "../parley/fontique" }
+# Local parley checkout for vertical text work (route A). The upstream hint
+# patches the git source; blitz now depends on parley from crates.io, so the
+# patch target is `crates-io` instead.
+[patch.crates-io]
+parley = { path = "../parley/parley" }
