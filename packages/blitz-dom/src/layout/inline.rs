@@ -670,7 +670,7 @@ impl LayoutPassState<'_> {
         // §7.1: the font's ascent and descent belong to the inline axis).
         #[cfg(feature = "writing-mode")]
         {
-            let wm = self.nodes[node_id].writing_mode();
+            let wm = self.layout_wm_of(node_id);
             inline_layout.layout.set_vertical(wm.is_vertical());
         }
 
@@ -690,7 +690,7 @@ impl LayoutPassState<'_> {
             // has to be re-applied here.
             #[cfg(feature = "writing-mode")]
             {
-                let wm = self.nodes[node_id].writing_mode();
+                let wm = self.layout_wm_of(node_id);
                 inline_layout.layout.set_vertical(wm.is_vertical());
             }
             let mut breaker = inline_layout.layout.break_lines();
@@ -1141,13 +1141,20 @@ impl LayoutPassState<'_> {
             // `vertical-rl`, mirror) line box positions onto physical x.
             #[cfg(feature = "writing-mode")]
             {
-                let wm = self.nodes[node_id].writing_mode();
+                let wm = self.layout_wm_of(node_id);
                 inline_layout.vertical_text = if wm.is_vertical() {
                     Some(VerticalTextPaint {
                         // In a vertical writing mode, Taffy's block axis — which
                         // `final_size.height` measures — is physical x.
                         block_extent: final_size.height - content_box_inset.vertical_axis_sum(),
                         block_axis_starts_at_right: !wm.is_vertical_lr(),
+                        // Taffy's inline axis — which `final_size.width` measures
+                        // — is physical y.
+                        inline_extent: final_size.width - content_box_inset.horizontal_axis_sum(),
+                        // Mirror only when Parley's idea of the line's start edge (the top,
+                        // or the bottom for a right-to-left paragraph) differs from the
+                        // writing mode's inline start.
+                        inline_axis_needs_mirror: wm.is_inline_tb() != wm.is_bidi_ltr(),
                     })
                 } else {
                     None

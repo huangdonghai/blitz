@@ -1,5 +1,5 @@
 use anyrender::PaintScene;
-use blitz_dom::{BaseDocument, NodeId, node::TextBrush, util::ToColorColor};
+use blitz_dom::{BaseDocument, NodeId, node::TextBrush, node::VerticalTextPaint, util::ToColorColor};
 use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
 use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
 use peniko::Fill;
@@ -562,23 +562,29 @@ fn flush_line_decorations(
     }
 }
 
-/// Block-axis geometry of an inline root laid out in a vertical writing mode, as
-/// `(block extent in device px, block axis starts at the right edge)`.
+/// Block- and inline-axis geometry of an inline root laid out in a vertical
+/// writing mode, with extents converted to device px.
 ///
 /// `None` when the inline root is horizontal (or its layout has not been
 /// performed yet), in which case Parley's coordinates are already physical.
 #[cfg(feature = "writing-mode")]
-fn vertical_text(doc: &BaseDocument, inline_root_id: NodeId, scale: f64) -> Option<(f32, bool)> {
+fn vertical_text(
+    doc: &BaseDocument,
+    inline_root_id: NodeId,
+    scale: f64,
+) -> Option<VerticalTextPaint> {
     let vertical = doc
         .get_node(inline_root_id)?
         .element_data()?
         .inline_layout_data
         .as_ref()?
         .vertical_text?;
-    Some((
-        vertical.block_extent * scale as f32,
-        vertical.block_axis_starts_at_right,
-    ))
+    Some(VerticalTextPaint {
+        block_extent: vertical.block_extent * scale as f32,
+        block_axis_starts_at_right: vertical.block_axis_starts_at_right,
+        inline_extent: vertical.inline_extent * scale as f32,
+        inline_axis_needs_mirror: vertical.inline_axis_needs_mirror,
+    })
 }
 
 pub(crate) fn stroke_text<'a>(
@@ -674,7 +680,7 @@ pub(crate) fn stroke_text<'a>(
                 #[cfg(feature = "writing-mode")]
                 let glyphs = glyph_run.positioned_glyphs().map(|glyph| {
                     let (x, y) = match vertical {
-                        Some((block_extent, from_right)) => {
+                        Some(vertical) => {
                             // Upright orientation — UAX #50 `vo` = U/Tu/Tr, which
                             // covers Han and kana under `text-orientation: mixed`.
                             // The horizontal advance becomes the vertical step and
@@ -682,15 +688,22 @@ pub(crate) fn stroke_text<'a>(
                             // baseline (css-writing-modes-3 §4.2).
                             let advance = glyph.advance;
                             let centre = glyph.y + (metrics.descent - metrics.ascent) / 2.0;
-                            let block_pos = if from_right {
-                                block_extent - centre
+                            let block_pos = if vertical.block_axis_starts_at_right {
+                                vertical.block_extent - centre
                             } else {
                                 centre
                             };
-                            (
-                                block_pos - advance / 2.0,
-                                glyph.x + (advance + metrics.ascent - metrics.descent) / 2.0,
-                            )
+                            // The inline axis is mapped onto physical y. When the
+                            // line's inline start is not the edge Parley measured
+                            // `glyph.x` from, each glyph's advance box is measured
+                            // from the bottom of the content box instead.
+                            let inline_pos = if vertical.inline_axis_needs_mirror {
+                                vertical.inline_extent - glyph.x
+                                    + (metrics.ascent - metrics.descent - advance) / 2.0
+                            } else {
+                                glyph.x + (advance + metrics.ascent - metrics.descent) / 2.0
+                            };
+                            (block_pos - advance / 2.0, inline_pos)
                         }
                         None => (glyph.x, glyph.y),
                     };

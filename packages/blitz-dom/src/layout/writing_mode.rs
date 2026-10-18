@@ -118,12 +118,31 @@ impl BaseDocument {
 impl LayoutPassState<'_> {
     /// The writing mode in which `node_id`'s layout algorithm runs (the root's is resolved once per
     /// pass by [`BaseDocument::root_layout_wm`]).
+    ///
+    /// A node that inherits its writing mode from its parent (its computed value matches the
+    /// parent's) inherits the parent's *used* value. This matters for the root element, whose used
+    /// writing mode is the document's principal writing mode (css-writing-modes-3 §8.1): its own
+    /// inline content and pseudo-elements follow the principal writing mode rather than the value
+    /// the root element itself specifies.
+    ///
+    /// `horizontal-tb` is the initial value, so a computed value of it may equally well have been
+    /// specified by the node itself, in which case it keeps its own writing mode. Only a
+    /// non-initial value is treated as inherited (or propagated from an ancestor).
     #[inline]
     pub(crate) fn layout_wm_of(&self, node_id: crate::NodeId) -> WritingMode {
-        if Some(node_id) == self.root_id {
-            self.root_wm
-        } else {
-            self.nodes[node_id].writing_mode()
+        let mut node_id = node_id;
+        loop {
+            if Some(node_id) == self.root_id {
+                return self.root_wm;
+            }
+            let computed = self.nodes[node_id].writing_mode();
+            if computed == WritingMode::empty() {
+                return computed;
+            }
+            match self.nodes[node_id].parent {
+                Some(parent) if self.nodes[parent].writing_mode() == computed => node_id = parent,
+                _ => return computed,
+            }
         }
     }
 

@@ -47,13 +47,25 @@ pub struct TextLayout {
 /// Physical geometry needed to paint an inline root laid out in a vertical
 /// writing mode. Parley's coordinates are in the writing mode's own axes, so the
 /// painter has to map the block axis onto physical x (mirrored for
-/// `vertical-rl`, whose block axis starts at the right edge).
+/// `vertical-rl`, whose block axis starts at the right edge) and the inline axis
+/// onto physical y (mirrored when the inline axis runs bottom-to-top).
 #[derive(Debug, Clone, Copy)]
 pub struct VerticalTextPaint {
     /// Physical block extent of the content box, in CSS px.
     pub block_extent: f32,
     /// Whether the block axis starts at the right edge (`vertical-rl`).
     pub block_axis_starts_at_right: bool,
+    /// Physical inline extent of the content box, in CSS px.
+    pub inline_extent: f32,
+    /// Whether the painter has to mirror the inline axis across the content box.
+    ///
+    /// Parley positions a line's content against the physical top edge that its
+    /// coordinates start from — a left-to-right paragraph is placed at the top for
+    /// `text-align: start`, a right-to-left one at the bottom. When that edge is not the
+    /// writing mode's inline start — which is the bottom edge for `sideways-lr` with
+    /// `direction: ltr`, and for `vertical-*` and `sideways-rl` with `direction: rtl` —
+    /// the glyph positions have to be flipped.
+    pub inline_axis_needs_mirror: bool,
 }
 
 impl TextLayout {
