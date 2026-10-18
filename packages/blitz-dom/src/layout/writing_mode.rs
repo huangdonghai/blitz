@@ -33,7 +33,7 @@ use stylo_taffy::WritingMode;
 use stylo_taffy::WritingModeExt;
 use taffy::{
     AvailableSpace, AxisStaticEdge, AxisStaticPosition, Layout, LayoutInput, LayoutOutput, NodeId,
-    Point, RoundTree, RunMode, Size, TraversePartialTree,
+    Point, ResolveOrZero, RoundTree, RunMode, Size, TraversePartialTree,
 };
 
 /// The block-axis sizes a box fixes with its own style, in CSS pixels.
@@ -271,10 +271,13 @@ impl LayoutPassState<'_> {
         inputs: LayoutInput,
         parent_wm: WritingMode,
     ) -> LayoutOutput {
-        let percent_basis = self.orthogonal_percent_basis.replace((
-            dom_node_id(node_id),
-            inputs.parent_size.width.unwrap_or(0.0),
-        ));
+        // The containing block's inline size, in the parent's axes. Percentage margins and padding
+        // of the orthogonal child resolve against it (css-writing-modes-3 §7.2), and the child's
+        // inline-axis margins reduce the space available to its inline size.
+        let containing_block_inline_size = inputs.parent_size.width.unwrap_or(0.0);
+        let percent_basis = self
+            .orthogonal_percent_basis
+            .replace((dom_node_id(node_id), containing_block_inline_size));
 
         let mut inputs = inputs.transpose();
 
@@ -315,13 +318,30 @@ impl LayoutPassState<'_> {
                 // css-writing-modes-3 §7.3.1/§7.3.2: an auto inline size in an orthogonal flow is
                 // fit-content against the available space in that axis: the containing block's
                 // block size if definite, else the fallback size from `available_size_fallback`.
+                // The child's inline-axis margins sit outside its inline size, so they reduce the
+                // space available to it. They resolve against the containing block's inline size
+                // (§7.2) — note that `inputs.parent_size` has been transposed into the child's
+                // axes and therefore cannot be used to resolve them.
+                let inline_margins = {
+                    let margin = taffy::CoreStyle::margin(
+                        &self.nodes[dom_node_id(node_id)].layout_style(),
+                    );
+                    let resolve = |value: taffy::LengthPercentageAuto| {
+                        value.resolve_or_zero(
+                            Some(containing_block_inline_size),
+                            super::resolve_calc_value,
+                        )
+                    };
+                    resolve(margin.left) + resolve(margin.right)
+                };
                 let available = match (inputs.available_space.width, inputs.parent_size.width) {
+                    // A definite available space has already had the child's margins subtracted.
                     (AvailableSpace::Definite(size), _) => size,
-                    (_, Some(size)) => size,
+                    (_, Some(size)) => size - inline_margins,
                     _ => {
                         let containing_block =
                             self.nodes[dom_node_id(node_id)].layout_parent.get();
-                        match containing_block {
+                        let fallback = match containing_block {
                             Some(containing_block) => {
                                 self.available_size_fallback(containing_block, parent_wm)
                             }
@@ -333,7 +353,8 @@ impl LayoutPassState<'_> {
                                     viewport.height.to_f32_px()
                                 }
                             }
-                        }
+                        };
+                        fallback - inline_margins
                     }
                 };
                 let measure = |doc: &mut Self, available_space: AvailableSpace| {
