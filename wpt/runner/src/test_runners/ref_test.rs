@@ -306,6 +306,8 @@ fn render_document_to_buffer(
     // let computed_height = document.as_ref().root_element().final_layout.size.height;
     // let render_height = (computed_height as u32).clamp(HEIGHT, 4000);
     let render_height = HEIGHT;
+    let dump_layout = matches!(buffer_kind, BufferKind::Test)
+        && std::env::var_os("WPT_DUMP_LAYOUT").is_some();
 
     // Render document to RGBA buffer
     let buf = ctx.buffers.get_mut(buffer_kind);
@@ -326,6 +328,10 @@ fn render_document_to_buffer(
         },
         buf,
     );
+
+    if dump_layout {
+        super::dump_layout(document);
+    }
 
     fs::create_dir_all(out_path.parent().unwrap()).unwrap();
     let mut file = File::create(out_path).unwrap();

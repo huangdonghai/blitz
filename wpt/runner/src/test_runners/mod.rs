@@ -28,6 +28,56 @@ pub use harness_test::process_harness_test;
 pub use js_wrapper::{js_test_has_window_variant, js_test_variants, wrapper_html_for_js_test};
 pub use ref_test::process_ref_test;
 
+/// Debug helper (`WPT_DUMP_LAYOUT=1`): print the physical layout tree of a rendered
+/// document, one line per element or text node.
+pub fn dump_layout(document: &BaseDocument) {
+    fn walk(doc: &BaseDocument, node_id: blitz_dom::NodeId, depth: usize) {
+        let Some(node) = doc.get_node(node_id) else {
+            return;
+        };
+        if node.element_data().is_none() {
+            // Layout data is only kept for boxes; text nodes are skipped.
+            if let Some(text) = node.text_data() {
+                let text = text.content.trim();
+                if !text.is_empty() {
+                    println!(
+                        "{:width$}\"{}\"",
+                        "",
+                        text.chars().take(16).collect::<String>(),
+                        width = depth * 2
+                    );
+                }
+            }
+        } else {
+            let layout = node.final_layout();
+            let mut label = node.element_data().unwrap().name.local.to_string();
+            if let Some(id) = node.attr(blitz_dom::local_name!("id")) {
+                label.push('#');
+                label.push_str(id);
+            }
+            if let Some(class) = node.attr(blitz_dom::local_name!("class")) {
+                label.push('.');
+                label.push_str(class);
+            }
+            println!(
+                "{:width$}{label} pos=({:.1},{:.1}) size=({:.1}x{:.1})",
+                "",
+                layout.location.x,
+                layout.location.y,
+                layout.size.width,
+                layout.size.height,
+                width = depth * 2
+            );
+        }
+        for child in &node.children {
+            walk(doc, *child, depth + 1);
+        }
+    }
+    if let Some(root) = document.try_root_element() {
+        walk(document, root.id, 0);
+    }
+}
+
 static TIMEOUT_QUARANTINE: LazyLock<HashMap<&'static str, &'static str>> = LazyLock::new(|| {
     let mut tests = HashMap::new();
     for line in include_str!("../../timeout-quarantine.txt").lines() {
