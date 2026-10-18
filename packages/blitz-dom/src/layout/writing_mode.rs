@@ -310,11 +310,9 @@ impl LayoutPassState<'_> {
             && inputs.known_dimensions.width.is_none()
             && !is_intrinsic_inline_measurement
         {
-            let inline_size_is_auto =
-                taffy::CoreStyle::size(&self.nodes[dom_node_id(node_id)].layout_style())
-                    .width
-                    .is_auto();
-            if inline_size_is_auto {
+            let inline_size =
+                taffy::CoreStyle::size(&self.nodes[dom_node_id(node_id)].layout_style()).width;
+            if inline_size.is_auto() {
                 // css-writing-modes-3 §7.3.1/§7.3.2: an auto inline size in an orthogonal flow is
                 // fit-content against the available space in that axis: the containing block's
                 // block size if definite, else the fallback size from `available_size_fallback`.
@@ -379,6 +377,44 @@ impl LayoutPassState<'_> {
                 let min_content = measure(self, AvailableSpace::MinContent);
                 inputs.known_dimensions.width = Some(available.min(max_content).max(min_content));
                 inputs.known_dimensions_are_definite.width = true;
+            } else if let taffy::ExpandedDimension::Percent(percent) = inline_size.expand() {
+                // css-writing-modes-3 §7.3.2: a percentage inline size in an orthogonal flow
+                // resolves against the containing block's block size. Taffy does that itself when
+                // `parent_size` provides the block size, but when the containing block's block
+                // size is indefinite the percentage falls back to the §7.3.1 fallback size.
+                if inputs.parent_size.width.is_none() {
+                    let containing_block = self.nodes[dom_node_id(node_id)].layout_parent.get();
+                    let fallback = match containing_block {
+                        Some(containing_block) => {
+                            self.available_size_fallback(containing_block, parent_wm)
+                        }
+                        None => {
+                            let viewport = self.stylist.device().au_viewport_size();
+                            if parent_wm.is_vertical() {
+                                viewport.width.to_f32_px()
+                            } else {
+                                viewport.height.to_f32_px()
+                            }
+                        }
+                    };
+                    // The percentage resolves to a content-box size, but `known_dimensions` is a
+                    // border-box size, so add the inline-axis padding and border.
+                    let style = self.nodes[dom_node_id(node_id)].layout_style();
+                    let resolve = |value: taffy::LengthPercentage| {
+                        value.resolve_or_zero(
+                            Some(containing_block_inline_size),
+                            super::resolve_calc_value,
+                        )
+                    };
+                    let padding = taffy::CoreStyle::padding(&style);
+                    let border = taffy::CoreStyle::border(&style);
+                    let inline_inset = resolve(padding.left)
+                        + resolve(padding.right)
+                        + resolve(border.left)
+                        + resolve(border.right);
+                    inputs.known_dimensions.width = Some(percent * fallback + inline_inset);
+                    inputs.known_dimensions_are_definite.width = true;
+                }
             }
         }
 
