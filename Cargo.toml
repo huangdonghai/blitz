@@ -327,3 +327,11 @@ rustc-hash = { workspace = true }
 # patch target is `crates-io` instead.
 [patch.crates-io]
 parley = { path = "../parley/parley" }
+# Local stylo fork: enables `writing-mode: sideways-rl | sideways-lr` parsing
+# under the `servo` feature (upstream gates those values on `feature = "gecko"`).
+stylo = { path = "../stylo/style" }
+stylo_traits = { path = "../stylo/style_traits" }
+stylo_atoms = { path = "../stylo/stylo_atoms" }
+stylo_static_prefs = { path = "../stylo/stylo_static_prefs" }
+stylo_dom = { path = "../stylo/stylo_dom" }
+selectors = { path = "../stylo/selectors" }
