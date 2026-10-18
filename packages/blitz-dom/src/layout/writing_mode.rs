@@ -24,12 +24,72 @@ use super::{BlockContext, LayoutPassState};
 use crate::document::BaseDocument;
 use crate::dom_node_id;
 use crate::node::Node;
+use style::computed_values::box_sizing::T as BoxSizing;
+use style::values::computed::length_percentage::Unpacked as UnpackedLengthPercentage;
+use style::values::computed::{
+    LengthPercentage, MaxSize as StyloMaxSize, Overflow, Size as StyloSize,
+};
 use stylo_taffy::WritingMode;
 use stylo_taffy::WritingModeExt;
 use taffy::{
     AvailableSpace, AxisStaticEdge, AxisStaticPosition, Layout, LayoutInput, LayoutOutput, NodeId,
     Point, RoundTree, RunMode, Size, TraversePartialTree,
 };
+
+/// The block-axis sizes a box fixes with its own style, in CSS pixels.
+#[derive(Clone, Copy, Default)]
+struct BlockSizeConstraints {
+    /// A fixed block size.
+    size: Option<f32>,
+    /// A fixed min block size.
+    min: Option<f32>,
+    /// A fixed max block size.
+    max: Option<f32>,
+}
+
+impl BlockSizeConstraints {
+    /// css-writing-modes-3 §7.3.1, first candidate: the containing block's inner max size (if
+    /// fixed) floored by its inner min size (if fixed).
+    fn max_floored_by_min(self) -> Option<f32> {
+        match (self.max, self.min) {
+            (Some(max), min) => Some(min.map_or(max, |min| max.max(min))),
+            (None, min) => min,
+        }
+    }
+
+    /// css-writing-modes-3 §7.3.1, second candidate: the scrollport's inner size if fixed, else
+    /// capped by its inner max size if fixed, floored by its inner min size if fixed.
+    fn scrollport(self) -> Option<f32> {
+        let capped = match (self.size, self.max) {
+            (Some(size), Some(max)) => Some(size.min(max)),
+            (size, max) => size.or(max),
+        };
+        capped.map(|size| self.min.map_or(size, |min| size.max(min)))
+    }
+}
+
+/// A fixed length in CSS pixels. Percentages and `calc()` depend on the size being resolved, so
+/// they are not fixed here.
+fn fixed_px(value: &LengthPercentage) -> Option<f32> {
+    match value.unpack() {
+        UnpackedLengthPercentage::Length(len) => Some(len.px()),
+        _ => None,
+    }
+}
+
+fn fixed_size(value: &StyloSize) -> Option<f32> {
+    match value {
+        StyloSize::LengthPercentage(value) => fixed_px(&value.0),
+        _ => None,
+    }
+}
+
+fn fixed_max_size(value: &StyloMaxSize) -> Option<f32> {
+    match value {
+        StyloMaxSize::LengthPercentage(value) => fixed_px(&value.0),
+        _ => None,
+    }
+}
 
 impl BaseDocument {
     /// The writing mode in which the root element's layout algorithm runs: the HTML special case of
@@ -65,6 +125,109 @@ impl LayoutPassState<'_> {
         } else {
             self.nodes[node_id].writing_mode()
         }
+    }
+
+    /// The block-axis sizes `node_id` fixes with its own style, as inner sizes: for a `border-box`
+    /// box the block-axis padding and border are subtracted.
+    fn block_size_constraints(&self, node_id: crate::NodeId) -> BlockSizeConstraints {
+        let node = &self.nodes[node_id];
+        let Some(styles) = node.primary_styles() else {
+            return BlockSizeConstraints::default();
+        };
+        let vertical = node.writing_mode().is_vertical();
+        let (size, min, max) = if vertical {
+            (
+                styles.clone_width(),
+                styles.clone_min_width(),
+                styles.clone_max_width(),
+            )
+        } else {
+            (
+                styles.clone_height(),
+                styles.clone_min_height(),
+                styles.clone_max_height(),
+            )
+        };
+        let mut constraints = BlockSizeConstraints {
+            size: fixed_size(&size),
+            min: fixed_size(&min),
+            max: fixed_max_size(&max),
+        };
+        if styles.clone_box_sizing() == BoxSizing::BorderBox {
+            let padding = styles.clone_padding();
+            let border = styles.clone_border();
+            let px = |value: &LengthPercentage| fixed_px(value).unwrap_or(0.0);
+            let inset = if vertical {
+                px(&padding.padding_left.0)
+                    + px(&padding.padding_right.0)
+                    + border.border_left_width.0.to_f32_px()
+                    + border.border_right_width.0.to_f32_px()
+            } else {
+                px(&padding.padding_top.0)
+                    + px(&padding.padding_bottom.0)
+                    + border.border_top_width.0.to_f32_px()
+                    + border.border_bottom_width.0.to_f32_px()
+            };
+            let inner = |value: Option<f32>| value.map(|value| (value - inset).max(0.0));
+            constraints = BlockSizeConstraints {
+                size: inner(constraints.size),
+                min: inner(constraints.min),
+                max: inner(constraints.max),
+            };
+        }
+        constraints
+    }
+
+    /// Whether `node_id` establishes a scroll container (`overflow` other than `visible`/`clip`).
+    fn is_scroll_container(&self, node_id: crate::NodeId) -> bool {
+        let Some(styles) = self.nodes[node_id].primary_styles() else {
+            return false;
+        };
+        let scrolls = |overflow: Overflow| {
+            !matches!(overflow, Overflow::Visible | Overflow::Clip)
+        };
+        scrolls(styles.clone_overflow_x()) || scrolls(styles.clone_overflow_y())
+    }
+
+    /// The fallback size used for the auto inline size of an orthogonal flow whose containing
+    /// block's block size is not definite (css-writing-modes-3 §7.3.1): the smallest of the
+    /// containing block's inner max size (floored by its inner min size), the nearest ancestor
+    /// scrollport's inner size (capped by its inner max size, floored by its inner min size) and
+    /// the initial containing block.
+    fn available_size_fallback(
+        &self,
+        containing_block: crate::NodeId,
+        parent_wm: WritingMode,
+    ) -> f32 {
+        let viewport = self.stylist.device().au_viewport_size();
+        let initial_containing_block = if parent_wm.is_vertical() {
+            viewport.width.to_f32_px()
+        } else {
+            viewport.height.to_f32_px()
+        };
+        let mut available = initial_containing_block;
+
+        if let Some(size) = self
+            .block_size_constraints(containing_block)
+            .max_floored_by_min()
+        {
+            available = available.min(size);
+        }
+
+        // Only the nearest scroll container is consulted: if it fixes no size, the initial
+        // containing block applies rather than a scroll container further up the tree.
+        let mut current = Some(containing_block);
+        while let Some(node_id) = current {
+            if self.is_scroll_container(node_id) {
+                if let Some(size) = self.block_size_constraints(node_id).scrollport() {
+                    available = available.min(size);
+                }
+                break;
+            }
+            current = self.nodes[node_id].layout_parent.get();
+        }
+
+        available
     }
 
     /// Lay out `node_id`, translating between the parent's writing mode and the node's own at an
@@ -149,19 +312,27 @@ impl LayoutPassState<'_> {
                     .width
                     .is_auto();
             if inline_size_is_auto {
-                // css-writing-modes-3 §7.3.1: an auto inline size in an orthogonal flow is
+                // css-writing-modes-3 §7.3.1/§7.3.2: an auto inline size in an orthogonal flow is
                 // fit-content against the available space in that axis: the containing block's
-                // block size if definite, else the initial containing block (nearest fixed-size
-                // scroll container not implemented).
+                // block size if definite, else the fallback size from `available_size_fallback`.
                 let available = match (inputs.available_space.width, inputs.parent_size.width) {
                     (AvailableSpace::Definite(size), _) => size,
                     (_, Some(size)) => size,
                     _ => {
-                        let viewport = self.stylist.device().au_viewport_size();
-                        if parent_wm.is_vertical() {
-                            viewport.width.to_f32_px()
-                        } else {
-                            viewport.height.to_f32_px()
+                        let containing_block =
+                            self.nodes[dom_node_id(node_id)].layout_parent.get();
+                        match containing_block {
+                            Some(containing_block) => {
+                                self.available_size_fallback(containing_block, parent_wm)
+                            }
+                            None => {
+                                let viewport = self.stylist.device().au_viewport_size();
+                                if parent_wm.is_vertical() {
+                                    viewport.width.to_f32_px()
+                                } else {
+                                    viewport.height.to_f32_px()
+                                }
+                            }
                         }
                     }
                 };
