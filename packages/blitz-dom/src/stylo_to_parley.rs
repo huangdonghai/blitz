@@ -310,20 +310,21 @@ pub(crate) fn font_features(style: &stylo::ComputedValues) -> Vec<parley::FontFe
 /// geometrically, but they keep their horizontal forms, which leaves punctuation
 /// sitting in the wrong part of the em box.
 ///
-/// `vrt2` is deliberately *not* enabled: [§5.1.2][spec] states that it "is not
-/// used by CSS", which delegates orientation to [UAX #50] instead. And
-/// `sideways-rl`/`sideways-lr` rotate every glyph, so they use no vertical
-/// features at all.
+/// §5.1.1 also requires the opposite for the two sideways kinds: upright
+/// typesetting uses "vertical font metrics and composition", while sideways
+/// typesetting is a run "rotated 90° clockwise from their upright orientation,
+/// using horizontal metrics and composition, and vertical typesetting features
+/// are not used". That covers both `writing-mode: sideways-rl`/`sideways-lr` and
+/// `text-orientation: sideways`. `mixed` and `upright` keep `vert` — under
+/// `mixed` the upright characters are exactly the ones it applies to.
 ///
-/// `text-orientation` is ignored by this build — Stylo only honours it under its
-/// `gecko` feature — so every `vertical-rl`/`vertical-lr` box is treated as
-/// `mixed`, where the upright characters are exactly the ones `vert` applies to.
+/// `vrt2` is deliberately *not* enabled: [§5.1.2][spec] states that it "is not
+/// used by CSS", which delegates orientation to [UAX #50] instead.
 ///
 /// [spec]: https://www.w3.org/TR/css-writing-modes-3/
 /// [UAX #50]: https://www.unicode.org/reports/tr50/
 fn writing_mode_features(writing_mode: stylo::WritingMode) -> Option<parley::FontFeature> {
-    let upright = writing_mode.is_vertical()
-        && !writing_mode.contains(stylo::WritingMode::VERTICAL_SIDEWAYS);
+    let upright = writing_mode.is_vertical() && !writing_mode.is_sideways();
     upright.then(|| feature(b"vert", 1))
 }
 
@@ -694,9 +695,9 @@ mod tests {
 
     /// `vert` is required for upright text in a vertical writing mode (CSS
     /// Writing Modes 3 §5.1.1) and must not appear anywhere else: horizontal
-    /// text has no vertical forms, and `sideways-*` rotates every glyph rather
-    /// than substituting it. `vrt2` is never implied — §5.1.2 says CSS does not
-    /// use it.
+    /// text has no vertical forms, and both `writing-mode: sideways-*` and
+    /// `text-orientation: sideways` rotate every glyph rather than substituting
+    /// it. `vrt2` is never implied — §5.1.2 says CSS does not use it.
     #[test]
     fn writing_mode_features_enable_vert_only_when_upright() {
         use stylo::WritingMode as W;
@@ -708,6 +709,14 @@ mod tests {
         assert_eq!(implied(W::WRITING_MODE_VERTICAL_LR), Some(*b"vert"));
         assert_eq!(implied(W::WRITING_MODE_SIDEWAYS_RL), None);
         assert_eq!(implied(W::WRITING_MODE_SIDEWAYS_LR), None);
+
+        // `text-orientation: upright` is upright text, `text-orientation:
+        // sideways` is not.
+        assert_eq!(
+            implied(W::WRITING_MODE_VERTICAL_RL | W::UPRIGHT),
+            Some(*b"vert")
+        );
+        assert_eq!(implied(W::WRITING_MODE_VERTICAL_RL | W::TEXT_SIDEWAYS), None);
 
         // `direction: rtl` is orthogonal to the block axis and must not change
         // the answer (it only sets INLINE_REVERSED on top of the same flags).
