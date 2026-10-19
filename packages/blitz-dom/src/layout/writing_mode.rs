@@ -440,7 +440,19 @@ impl LayoutPassState<'_> {
         let mut output = self.compute_child_layout_in_current_wm(node_id, inputs, None);
         self.orthogonal_percent_basis = percent_basis;
         transpose_static_positions(&mut output, self.layout_wm, parent_wm);
-        output.transpose()
+
+        // `LayoutOutput::transpose` drops the baselines, because a baseline is a block-axis
+        // quantity in the child's frame and the parent's inline axis cannot carry it. The line
+        // that places an atomic inline still needs one: it aligns the box's own baseline — the
+        // baseline of its last line box (CSS2 §10.8.1) — to the line's, and a box that has none
+        // is put on the line's baseline by its bottom margin edge instead. The two placements
+        // differ by the box's half-leading, and for a `text-combine-upright` composition, whose
+        // one-em square is laid out as an orthogonal inline-block, that is the difference between
+        // its bottom edge and its centre landing on the line's central baseline (§4.2, §4.4).
+        let baselines = output.baselines;
+        let mut output = output.transpose();
+        output.baselines = baselines;
+        output
     }
 
     /// Convert every `unrounded_layout` (written in the writing mode of the box that placed it) to
