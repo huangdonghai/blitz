@@ -282,6 +282,17 @@ pub(crate) fn font_features(style: &stylo::ComputedValues) -> Vec<parley::FontFe
     self::font_variant_position(font_styles.font_variant_position, &mut features);
     features.extend(self::writing_mode_features(style.writing_mode));
 
+    // CSS Writing Modes 3 9.1.3: a horizontal-in-vertical composition must use
+    // the width-specific variants where the font has them, and geometric
+    // scaling is only the fallback. `hwid` gives the half-width forms; the
+    // painter still compresses whatever remains into the em square.
+    if style
+        .flags
+        .contains(style::computed_value_flags::ComputedValueFlags::IS_TEXT_COMBINED)
+    {
+        features.push(feature(b"hwid", 1));
+    }
+
     self::font_feature_settings(&font_styles.font_feature_settings, &mut features);
 
     features.sort_by_key(|feature| feature.tag);
