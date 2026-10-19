@@ -455,13 +455,29 @@ pub(crate) fn fetch_font_face_rules<'a>(
                         let Source::Local(name) = source else {
                             continue;
                         };
-                        let Some(family_id) = ctx.collection.family_id(name.name.as_ref()) else {
+                        let requested = name.name.as_ref();
+                        let Some(family_id) = ctx.collection.family_id(requested) else {
                             continue;
                         };
                         let Some(family) = ctx.collection.family(family_id) else {
                             continue;
                         };
-                        let info = family.default_font().or_else(|| family.fonts().first());
+                        // `local()` names a single face, by its full name or
+                        // PostScript name (CSS Fonts 4 §4.3.3.1). `family_id`
+                        // only gets as far as the family — the DirectWrite
+                        // backend registers per-face names as aliases of it — so
+                        // the face has to be picked out by name here.
+                        // `TsukuMinPr6-HV` and `TsukuMinPr6-M` are two weights of
+                        // one family, and falling straight through to the family
+                        // default renders both as the same face.
+                        let info = family
+                            .fonts()
+                            .iter()
+                            .find(|info| {
+                                info.has_local_name(requested, Some(&mut ctx.source_cache))
+                            })
+                            .or_else(|| family.default_font())
+                            .or_else(|| family.fonts().first());
                         let Some(info) = info else { continue };
                         if let Some(blob) = info.load(Some(&mut ctx.source_cache)) {
                             bytes = Some(blob.as_ref().to_vec());
