@@ -14,8 +14,8 @@ pub(crate) mod stylo {
     pub(crate) use style::computed_values::text_wrap_mode::T as TextWrapMode;
     pub(crate) use style::computed_values::unicode_bidi::T as UnicodeBidi;
     pub(crate) use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
+    pub(crate) use style::logical_geometry::WritingMode;
     pub(crate) use style::properties::ComputedValues;
-    pub(crate) use style::properties::style_structs::Font;
     pub(crate) use style::values::computed::AlignmentBaseline;
     pub(crate) use style::values::computed::BaselineShift;
     pub(crate) use style::values::computed::LineBreak;
@@ -271,7 +271,8 @@ pub(crate) fn font_variant_east_asian(
 /// Parley stably sorts the feature list by tag and HarfBuzz applies the last of any
 /// duplicate tags, so appending `font-feature-settings` after the `font-variant-*`
 /// features gives it the higher precedence required by the spec.
-pub(crate) fn font_features(font_styles: &stylo::Font) -> Vec<parley::FontFeature> {
+pub(crate) fn font_features(style: &stylo::ComputedValues) -> Vec<parley::FontFeature> {
+    let font_styles = style.get_font();
     let mut features = Vec::new();
 
     self::font_variant_ligatures(font_styles.font_variant_ligatures, &mut features);
@@ -279,6 +280,7 @@ pub(crate) fn font_features(font_styles: &stylo::Font) -> Vec<parley::FontFeatur
     self::font_variant_numeric(font_styles.font_variant_numeric, &mut features);
     self::font_variant_east_asian(font_styles.font_variant_east_asian, &mut features);
     self::font_variant_position(font_styles.font_variant_position, &mut features);
+    features.extend(self::writing_mode_features(style.writing_mode));
 
     self::font_feature_settings(&font_styles.font_feature_settings, &mut features);
 
@@ -286,6 +288,32 @@ pub(crate) fn font_features(font_styles: &stylo::Font) -> Vec<parley::FontFeatur
     features.dedup_by_key(|feature| feature.tag);
 
     features
+}
+
+/// OpenType features implied by the writing mode.
+///
+/// [CSS Writing Modes 3 §5.1.1][spec] requires the `vert` feature to be enabled
+/// when text is set upright in a vertical writing mode, so characters that have
+/// vertical forms — CJK punctuation in particular — are substituted for their
+/// vertical variants. Without it the painter still transposes the glyphs
+/// geometrically, but they keep their horizontal forms, which leaves punctuation
+/// sitting in the wrong part of the em box.
+///
+/// `vrt2` is deliberately *not* enabled: [§5.1.2][spec] states that it "is not
+/// used by CSS", which delegates orientation to [UAX #50] instead. And
+/// `sideways-rl`/`sideways-lr` rotate every glyph, so they use no vertical
+/// features at all.
+///
+/// `text-orientation` is ignored by this build — Stylo only honours it under its
+/// `gecko` feature — so every `vertical-rl`/`vertical-lr` box is treated as
+/// `mixed`, where the upright characters are exactly the ones `vert` applies to.
+///
+/// [spec]: https://www.w3.org/TR/css-writing-modes-3/
+/// [UAX #50]: https://www.unicode.org/reports/tr50/
+fn writing_mode_features(writing_mode: stylo::WritingMode) -> Option<parley::FontFeature> {
+    let upright = writing_mode.is_vertical()
+        && !writing_mode.contains(stylo::WritingMode::VERTICAL_SIDEWAYS);
+    upright.then(|| feature(b"vert", 1))
 }
 
 pub(crate) fn base_direction(
@@ -428,7 +456,7 @@ pub(crate) fn style(
     let font_style = self::font_style(font_styles.font_style);
     let font_width = self::font_width(font_styles.font_width);
     let font_variations = self::font_variations(&font_styles.font_variation_settings);
-    let font_features = self::font_features(font_styles);
+    let font_features = self::font_features(style);
 
     // Convert font family
     let families: Vec<_> = font_styles
@@ -651,5 +679,28 @@ mod tests {
         assert_eq!(flat, vec![(*b"tnum", 1), (*b"tnum", 0)]);
         let last_tnum = flat.iter().rev().find(|(tag, _)| tag == b"tnum").unwrap();
         assert_eq!(last_tnum.1, 0);
+    }
+
+    /// `vert` is required for upright text in a vertical writing mode (CSS
+    /// Writing Modes 3 §5.1.1) and must not appear anywhere else: horizontal
+    /// text has no vertical forms, and `sideways-*` rotates every glyph rather
+    /// than substituting it. `vrt2` is never implied — §5.1.2 says CSS does not
+    /// use it.
+    #[test]
+    fn writing_mode_features_enable_vert_only_when_upright() {
+        use stylo::WritingMode as W;
+
+        let implied = |writing_mode| writing_mode_features(writing_mode).map(|f| f.tag.to_bytes());
+
+        assert_eq!(implied(W::WRITING_MODE_HORIZONTAL_TB), None);
+        assert_eq!(implied(W::WRITING_MODE_VERTICAL_RL), Some(*b"vert"));
+        assert_eq!(implied(W::WRITING_MODE_VERTICAL_LR), Some(*b"vert"));
+        assert_eq!(implied(W::WRITING_MODE_SIDEWAYS_RL), None);
+        assert_eq!(implied(W::WRITING_MODE_SIDEWAYS_LR), None);
+
+        // `direction: rtl` is orthogonal to the block axis and must not change
+        // the answer (it only sets INLINE_REVERSED on top of the same flags).
+        let rtl_vertical = W::WRITING_MODE_VERTICAL_RL | W::INLINE_REVERSED;
+        assert_eq!(implied(rtl_vertical), Some(*b"vert"));
     }
 }
