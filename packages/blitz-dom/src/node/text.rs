@@ -66,6 +66,21 @@ pub struct VerticalTextPaint {
     /// `direction: ltr`, and for `vertical-*` and `sideways-rl` with `direction: rtl` —
     /// the glyph positions have to be flipped.
     pub inline_axis_needs_mirror: bool,
+    /// How `text-orientation` decides which glyphs are rotated.
+    pub text_orientation: TextOrientation,
+}
+
+/// The `text-orientation` of a vertical inline root.
+///
+/// CSS Writing Modes §5.1: `mixed` (the initial value) orients each character
+/// from UAX #50's `Vertical_Orientation`, `upright` keeps every character
+/// upright, and `sideways` rotates every character 90° clockwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextOrientation {
+    #[default]
+    Mixed,
+    Upright,
+    Sideways,
 }
 
 impl TextLayout {

@@ -1,5 +1,9 @@
 use anyrender::PaintScene;
-use blitz_dom::{BaseDocument, NodeId, node::TextBrush, node::VerticalTextPaint, util::ToColorColor};
+use blitz_dom::{
+    BaseDocument, NodeId, node::TextBrush, node::TextOrientation, node::VerticalTextPaint,
+    util::ToColorColor,
+};
+use icu_properties::{CodePointMapData, props::VerticalOrientation};
 use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
 use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
 use peniko::Fill;
@@ -584,6 +588,7 @@ pub(crate) fn vertical_text(
         block_axis_starts_at_right: vertical.block_axis_starts_at_right,
         inline_extent: vertical.inline_extent * scale as f32,
         inline_axis_needs_mirror: vertical.inline_axis_needs_mirror,
+        text_orientation: vertical.text_orientation,
     })
 }
 
@@ -611,6 +616,17 @@ pub(crate) fn stroke_text<'a>(
     // physical space only for `horizontal-tb`. Map them in `draw_glyphs` below.
     #[cfg(feature = "writing-mode")]
     let vertical = vertical_text(doc, inline_root_id, scale);
+    // The laid-out text, so `text-orientation: mixed` can be decided per
+    // character: glyphs carry only their glyph id, not their source character.
+    #[cfg(feature = "writing-mode")]
+    let layout_text: &str = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|data| data.inline_layout_data.as_ref())
+        .map(|layout| layout.text.as_str())
+        .unwrap_or_default();
+    #[cfg(feature = "writing-mode")]
+    let vo_map = CodePointMapData::<VerticalOrientation>::new();
 
     // Persistent stack mirroring the ancestor path (inline root -> current run's
     // node) as we walk the runs. The `text-decoration-*` properties are *not*
@@ -678,58 +694,158 @@ pub(crate) fn stroke_text<'a>(
                 // Map glyph positions from the inline root's axes onto physical
                 // space for vertical writing modes (see the note at the top).
                 #[cfg(feature = "writing-mode")]
-                let glyphs = glyph_run.positioned_glyphs().map(|glyph| {
-                    let (x, y) = match vertical {
-                        Some(vertical) => {
-                            // Upright orientation — UAX #50 `vo` = U/Tu/Tr, which
-                            // covers Han and kana under `text-orientation: mixed`.
-                            // The horizontal advance becomes the vertical step and
-                            // the glyph is centred on the column's central
-                            // baseline (css-writing-modes-3 §4.2).
+                if let Some(vertical) = vertical {
+                    // Upright glyphs are set on the line's central baseline (§4.2);
+                    // sideways ones are rotated 90° clockwise and keep the same
+                    // axis. See the note on `vertical_text`.
+                    let line_metrics = *line.metrics();
+                    let line_centre =
+                        (line_metrics.block_min_coord + line_metrics.block_max_coord) / 2.0;
+                    let baseline = glyph_run.baseline();
+                    let mut pen = glyph_run.offset();
+                    let mut upright = Vec::new();
+                    let mut rotated = Vec::new();
+
+                    // Walk clusters rather than `positioned_glyphs`, because the
+                    // orientation is decided per character and glyphs do not carry
+                    // their source character.
+                    for cluster in run.visual_clusters() {
+                        let sideways = match vertical.text_orientation {
+                            TextOrientation::Upright => false,
+                            TextOrientation::Sideways => true,
+                            TextOrientation::Mixed => layout_text
+                                .get(cluster.text_range())
+                                .and_then(|text| text.chars().next())
+                                .is_some_and(|c| {
+                                    vo_map.get(c) == VerticalOrientation::Rotated
+                                }),
+                        };
+                        for glyph in cluster.glyphs() {
                             let advance = glyph.advance;
-                            let centre = glyph.y + (metrics.descent - metrics.ascent) / 2.0;
+                            let inline_pos = pen;
+                            pen += advance;
+
+                            // The axis is the line box's centre, not the run's own
+                            // metrics: §4.4 aligns every inline box in the line to
+                            // the dominant (central) baseline. `glyph.y` keeps the
+                            // column (block-axis) position and any `vertical-align`
+                            // shift.
+                            let centre =
+                                baseline + glyph.y + (line_centre - line_metrics.baseline);
                             let block_pos = if vertical.block_axis_starts_at_right {
                                 vertical.block_extent - centre
                             } else {
                                 centre
                             };
-                            // The inline axis is mapped onto physical y. When the
-                            // line's inline start is not the edge Parley measured
-                            // `glyph.x` from, each glyph's advance box is measured
-                            // from the bottom of the content box instead.
-                            let inline_pos = if vertical.inline_axis_needs_mirror {
-                                vertical.inline_extent - glyph.x
-                                    + (metrics.ascent - metrics.descent - advance) / 2.0
-                            } else {
-                                glyph.x + (advance + metrics.ascent - metrics.descent) / 2.0
-                            };
-                            (block_pos - advance / 2.0, inline_pos)
-                        }
-                        None => (glyph.x, glyph.y),
-                    };
-                    anyrender::Glyph { id: glyph.id as _, x, y }
-                });
-                #[cfg(not(feature = "writing-mode"))]
-                let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-                    id: glyph.id as _,
-                    x: glyph.x,
-                    y: glyph.y,
-                });
 
-                let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
-                scene.draw_glyphs(
-                    font,
-                    font_size,
-                    !FONT_EMBOLDEN_ENABLED, // hint
-                    normalized_coords,
-                    embolden,
-                    Fill::NonZero,
-                    &anyrender::Paint::from(text_color),
-                    1.0, // alpha
-                    transform,
-                    glyph_xform,
-                    glyphs,
-                );
+                            let (x, y) = if sideways {
+                                // Rotated 90° clockwise: the advance runs down the
+                                // column, and the glyph's vertical extent becomes its
+                                // width, centred on the axis.
+                                let x = block_pos - (metrics.ascent - metrics.descent) / 2.0;
+                                let y = if vertical.inline_axis_needs_mirror {
+                                    vertical.inline_extent - inline_pos - advance
+                                } else {
+                                    inline_pos
+                                };
+                                (x, y)
+                            } else {
+                                let x = block_pos - advance / 2.0;
+                                let y = if vertical.inline_axis_needs_mirror {
+                                    vertical.inline_extent - inline_pos
+                                        + (metrics.ascent - metrics.descent - advance) / 2.0
+                                } else {
+                                    inline_pos + (advance + metrics.ascent - metrics.descent) / 2.0
+                                };
+                                (x, y)
+                            };
+
+                            let target = if sideways { &mut rotated } else { &mut upright };
+                            target.push(anyrender::Glyph {
+                                id: glyph.id as _,
+                                x,
+                                y,
+                            });
+                        }
+                    }
+
+                    let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
+                    scene.draw_glyphs(
+                        font,
+                        font_size,
+                        !FONT_EMBOLDEN_ENABLED, // hint
+                        normalized_coords,
+                        embolden,
+                        Fill::NonZero,
+                        &anyrender::Paint::from(text_color),
+                        1.0, // alpha
+                        transform,
+                        glyph_xform,
+                        upright.into_iter(),
+                    );
+                    if !rotated.is_empty() {
+                        // `Affine * Affine` applies the right operand first, so the
+                        // synthesis skew still acts in glyph space.
+                        let turned = Affine::rotate(std::f64::consts::FRAC_PI_2)
+                            * glyph_xform.unwrap_or(Affine::IDENTITY);
+                        scene.draw_glyphs(
+                            font,
+                            font_size,
+                            !FONT_EMBOLDEN_ENABLED, // hint
+                            normalized_coords,
+                            embolden,
+                            Fill::NonZero,
+                            &anyrender::Paint::from(text_color),
+                            1.0, // alpha
+                            transform,
+                            Some(turned),
+                            rotated.into_iter(),
+                        );
+                    }
+                } else {
+                    let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
+                        id: glyph.id as _,
+                        x: glyph.x,
+                        y: glyph.y,
+                    });
+                    let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
+                    scene.draw_glyphs(
+                        font,
+                        font_size,
+                        !FONT_EMBOLDEN_ENABLED, // hint
+                        normalized_coords,
+                        embolden,
+                        Fill::NonZero,
+                        &anyrender::Paint::from(text_color),
+                        1.0, // alpha
+                        transform,
+                        glyph_xform,
+                        glyphs,
+                    );
+                }
+                #[cfg(not(feature = "writing-mode"))]
+                {
+                    let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
+                        id: glyph.id as _,
+                        x: glyph.x,
+                        y: glyph.y,
+                    });
+
+                    let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
+                    scene.draw_glyphs(
+                        font,
+                        font_size,
+                        !FONT_EMBOLDEN_ENABLED, // hint
+                        normalized_coords,
+                        embolden,
+                        Fill::NonZero,
+                        &anyrender::Paint::from(text_color),
+                        1.0, // alpha
+                        transform,
+                        glyph_xform,
+                        glyphs,
+                    );
+                }
 
                 // Accumulate this run's contribution to each decorating box on its ancestor
                 // path. The decoration is drawn once per box after the whole line has been

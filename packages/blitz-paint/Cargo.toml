@@ -41,6 +41,7 @@ taffy = { workspace = true }
 
 # Linebender + WGPU dependencies
 parley = { workspace = true, features = ["bytemuck"] }
+icu_properties = { workspace = true }
 skrifa = { workspace = true }
 color = { workspace = true }
 peniko = { workspace = true }

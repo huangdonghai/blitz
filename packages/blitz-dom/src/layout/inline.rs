@@ -22,7 +22,7 @@ use stylo_taffy::StyleFlags;
 
 use super::resolve_calc_value;
 #[cfg(feature = "writing-mode")]
-use crate::node::VerticalTextPaint;
+use crate::node::{TextOrientation, VerticalTextPaint};
 use crate::layout::LayoutPassState;
 use crate::stylo_to_parley;
 
@@ -1155,6 +1155,20 @@ impl LayoutPassState<'_> {
                         // or the bottom for a right-to-left paragraph) differs from the
                         // writing mode's inline start.
                         inline_axis_needs_mirror: wm.is_inline_tb() != wm.is_bidi_ltr(),
+                        // `TEXT_SIDEWAYS` comes from `text-orientation: sideways`;
+                        // `VERTICAL_SIDEWAYS` from `writing-mode: sideways-*`, which
+                        // rotates everything too. `UPRIGHT` only exists for
+                        // `text-orientation: upright`, so its absence means `mixed`.
+                        text_orientation: if wm.contains(
+                            stylo_taffy::WritingMode::TEXT_SIDEWAYS
+                                | stylo_taffy::WritingMode::VERTICAL_SIDEWAYS,
+                        ) {
+                            TextOrientation::Sideways
+                        } else if wm.contains(stylo_taffy::WritingMode::UPRIGHT) {
+                            TextOrientation::Upright
+                        } else {
+                            TextOrientation::Mixed
+                        },
                     })
                 } else {
                     None
