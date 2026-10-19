@@ -820,10 +820,27 @@ pub(crate) fn stroke_text<'a>(
                             };
 
                             let (x, y) = if sideways {
-                                // Rotated 90° clockwise: the advance runs down the
-                                // column, and the glyph's vertical extent becomes its
-                                // width, centred on the axis.
-                                let x = block_pos - (metrics.ascent - metrics.descent) / 2.0;
+                                // Rotated 90° clockwise, so the glyph's ascent points
+                                // right and its descent left, and its baseline runs
+                                // down the column at `x`.
+                                //
+                                // Which baseline the line aligns on is what §4.2
+                                // decides from `text-orientation`: the central
+                                // baseline for `mixed` — which rotates the
+                                // horizontal-only scripts too — and `upright`, and
+                                // the alphabetic baseline for `sideways`, where the
+                                // whole line is one rotated horizontal line and every
+                                // glyph therefore shares one baseline whatever its
+                                // size. `line_centre` and `line_metrics.baseline` are
+                                // those two baselines of the line.
+                                let x = match vertical.text_orientation {
+                                    TextOrientation::Sideways => {
+                                        block_pos - (line_metrics.baseline - line_centre)
+                                    }
+                                    // The glyph's central baseline sits half its
+                                    // ascent-minus-descent to the right of its origin.
+                                    _ => block_pos - (metrics.ascent - metrics.descent) / 2.0,
+                                };
                                 let y = if vertical.inline_axis_needs_mirror {
                                     vertical.inline_extent - inline_pos - advance
                                 } else {
