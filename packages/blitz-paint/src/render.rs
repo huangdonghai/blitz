@@ -387,14 +387,19 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // The adjustment is expressed in the element's own coordinates (CSS px,
         // origin at its border box), so it composes to the right of the box's
         // own transform.
-        let combine_transform = match text_combine_adjustment(node) {
+        let combine_transform = match text_combine_adjustment(node, self.scale) {
             Some((factor, dx)) => {
                 let centre = Vec2 {
                     x: box_size.width * 0.5,
                     y: box_size.height * 0.5,
                 };
+                // Only the advance has to fit one em (CSS Writing Modes 3
+                // 9.1.3), so the contents are compressed horizontally and keep
+                // their height — the same as Chrome, whose composition is a
+                // one-em advance at the natural glyph height rather than a
+                // uniformly shrunk square.
                 Affine::translate(centre)
-                    * Affine::scale(factor)
+                    * Affine::scale_non_uniform(factor, 1.0)
                     * Affine::translate(-centre)
                     * Affine::translate(Vec2 { x: dx, y: 0.0 })
             }
@@ -750,7 +755,7 @@ fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
 /// horizontal writing mode, so its contents keep their natural width and
 /// overflow the square. Returns the scale that fits them into one em, plus the
 /// horizontal offset (CSS px) that centres them in the square.
-fn text_combine_adjustment(node: &Node) -> Option<(f64, f64)> {
+fn text_combine_adjustment(node: &Node, scale: f64) -> Option<(f64, f64)> {
     if !node.is_text_combined() {
         return None;
     }
@@ -769,8 +774,13 @@ fn text_combine_adjustment(node: &Node) -> Option<(f64, f64)> {
         .clone_font_size()
         .computed_size
         .0
-        .px() as f64;
-    (natural > one_em).then(|| (one_em / natural, -(natural - one_em) / 2.0))
+        .px() as f64
+        // The line advance is in layout units, which scale with the device
+        // pixel ratio; the computed font size is in CSS pixels.
+        * scale;
+    // The offset is applied in the element's own coordinates (CSS pixels),
+    // while the advance is in layout units.
+    (natural > one_em).then(|| (one_em / natural, -(natural - one_em) / 2.0 / scale))
 }
 
 impl ElementCx<'_, '_> {
