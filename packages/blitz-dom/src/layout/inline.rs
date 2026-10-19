@@ -1159,12 +1159,9 @@ impl LayoutPassState<'_> {
                         // `VERTICAL_SIDEWAYS` from `writing-mode: sideways-*`, which
                         // rotates everything too. `UPRIGHT` only exists for
                         // `text-orientation: upright`, so its absence means `mixed`.
-                        text_orientation: if wm.contains(
-                            stylo_taffy::WritingMode::TEXT_SIDEWAYS
-                                | stylo_taffy::WritingMode::VERTICAL_SIDEWAYS,
-                        ) {
+                        text_orientation: if wm.is_sideways() {
                             TextOrientation::Sideways
-                        } else if wm.contains(stylo_taffy::WritingMode::UPRIGHT) {
+                        } else if wm.is_upright() {
                             TextOrientation::Upright
                         } else {
                             TextOrientation::Mixed
