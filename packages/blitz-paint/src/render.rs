@@ -380,9 +380,31 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         // Don't render things that are out of view
         let overflow = *node.scrollable_overflow();
+        // CSS Writing Modes 3 §9.1.3: a `text-combine-upright` composition may
+        // advance no more than one em. Its contents are laid out at their
+        // natural width inside the one-em square, so contents that overflow are
+        // compressed — geometrically here — and centred in the square (§9.1.2).
+        // The adjustment is expressed in the element's own coordinates (CSS px,
+        // origin at its border box), so it composes to the right of the box's
+        // own transform.
+        let combine_transform = match text_combine_adjustment(node) {
+            Some((factor, dx)) => {
+                let centre = Vec2 {
+                    x: box_size.width * 0.5,
+                    y: box_size.height * 0.5,
+                };
+                Affine::translate(centre)
+                    * Affine::scale(factor)
+                    * Affine::translate(-centre)
+                    * Affine::translate(Vec2 { x: dx, y: 0.0 })
+            }
+            None => Affine::IDENTITY,
+        };
+
         let transform = parent_style_transform
             * Affine::translate(box_position)
-            * node.transform().as_deref().copied().unwrap_or_default();
+            * node.transform().as_deref().copied().unwrap_or_default()
+            * combine_transform;
 
         let screen_transform = Affine::translate(Vec2 {
             x: -self.initial_x,
@@ -719,6 +741,36 @@ struct ElementCx<'dom, 'a> {
 /// Converts parley BoundingBox into peniko Rect
 fn convert_rect(rect: &parley::BoundingBox) -> kurbo::Rect {
     peniko::kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1)
+}
+
+/// Compression for a `text-combine-upright` composition (CSS Writing Modes 3
+/// §9.1.3).
+///
+/// The style adjuster lays the composition out as a one-em inline-block with a
+/// horizontal writing mode, so its contents keep their natural width and
+/// overflow the square. Returns the scale that fits them into one em, plus the
+/// horizontal offset (CSS px) that centres them in the square.
+fn text_combine_adjustment(node: &Node) -> Option<(f64, f64)> {
+    if !node.is_text_combined() {
+        return None;
+    }
+    let natural = node
+        .element_data()?
+        .inline_layout_data
+        .as_ref()?
+        .layout
+        .lines()
+        .next()?
+        .metrics()
+        .advance as f64;
+    let one_em = node
+        .primary_styles()?
+        .get_font()
+        .clone_font_size()
+        .computed_size
+        .0
+        .px() as f64;
+    (natural > one_em).then(|| (one_em / natural, -(natural - one_em) / 2.0))
 }
 
 impl ElementCx<'_, '_> {

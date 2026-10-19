@@ -1190,6 +1190,19 @@ impl Node {
             .unwrap_or(stylo_taffy::WritingMode::empty())
     }
 
+    /// Whether this box is a `text-combine-upright` composition.
+    ///
+    /// CSS Writing Modes 3 §9.1: the combined units advance as a single em, and
+    /// §9.1.3 requires the composition to be compressed into that em. The style
+    /// adjuster marks such boxes with [`ComputedValueFlags::IS_TEXT_COMBINED`].
+    pub fn is_text_combined(&self) -> bool {
+        self.primary_styles().is_some_and(|styles| {
+            styles
+                .flags
+                .contains(style::computed_value_flags::ComputedValueFlags::IS_TEXT_COMBINED)
+        })
+    }
+
     /// The node's `display` as a [`taffy::Display`]. Returns [`taffy::Display::Block`]
     /// for nodes without computed styles (e.g. text nodes).
     pub fn taffy_display(&self) -> taffy::Display {
