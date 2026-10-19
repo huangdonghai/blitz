@@ -76,6 +76,45 @@ pub(crate) fn draw_inline_backgrounds<'a>(
 /// head table so they aren't re-parsed either.
 type WinAscentCache = HashMap<(u64, u32), Option<f32>>;
 
+/// Cached [`vertical_glyph_metrics`], keyed by font face and glyph id.
+type VerticalMetricsCache = HashMap<(u64, u32, u32), Option<(f32, f32)>>;
+
+/// The font's vertical origin and vertical advance for a glyph, as `unitsPerEm`
+/// ratios.
+///
+/// Vertical typesetting places each glyph with its vertical origin on the pen
+/// and advances by its vertical advance (CSS Writing Modes 3 5.1.1). OpenType
+/// derives the origin from `VORG` when the face has one, and otherwise from the
+/// glyph's bounding box and its `vmtx` top side bearing (`vertOriginY = yMax +
+/// tsb`).
+///
+/// Both matter for upright text. Approximating the origin with the top of the
+/// em box leaves punctuation, whose ink sits in a corner, visibly high; and
+/// advancing by the horizontal advance packs Latin letters, which are about an
+/// em tall when upright but only half an em wide, on top of each other.
+fn vertical_glyph_metrics(font: &parley::FontData, glyph_id: u32) -> Option<(f32, f32)> {
+    use skrifa::raw::{FontRef, TableProvider as _};
+    use skrifa::{
+        GlyphId, MetadataProvider as _,
+        instance::{LocationRef, Size},
+    };
+    let font_ref = FontRef::from_index(font.data.as_ref(), font.index).ok()?;
+    let units_per_em = font_ref.head().ok()?.units_per_em() as f32;
+    let glyph_id = GlyphId::new(glyph_id);
+    let vmtx = font_ref.vmtx().ok()?;
+    let advance = vmtx.advance(glyph_id)? as f32 / units_per_em;
+    let origin = if let Ok(vorg) = font_ref.vorg() {
+        vorg.vertical_origin_y(glyph_id) as f32 / units_per_em
+    } else {
+        let bounds = font_ref
+            .glyph_metrics(Size::unscaled(), LocationRef::default())
+            .bounds(glyph_id)?;
+        let top_side_bearing = vmtx.side_bearing(glyph_id)?;
+        (bounds.y_max + top_side_bearing as f32) / units_per_em
+    };
+    Some((origin, advance))
+}
+
 /// The font's OS/2 `usWinAscent`, in the same (device) pixels as `font_size`.
 ///
 /// This is the ascent browsers use as the top of the "em box" when positioning overlines. It
@@ -253,6 +292,7 @@ pub(crate) struct DrawTextContext {
     path_scratch: Vec<NodeId>,
     deco_boxes: Vec<LineDecoration>,
     win_ascent_ratios: WinAscentCache,
+    vertical_metrics: VerticalMetricsCache,
 }
 
 /// Resolve the CSS `text-decoration-thickness` to a device-pixel size.
@@ -606,6 +646,7 @@ pub(crate) fn stroke_text<'a>(
         path_scratch,
         deco_boxes,
         win_ascent_ratios,
+        vertical_metrics,
     } = context;
     stack.clear();
     path_scratch.clear();
@@ -641,6 +682,11 @@ pub(crate) fn stroke_text<'a>(
         // draws one decoration per box rather than one stepped segment per differently-sized
         // run. Clearing preserves the allocation for the next line and inline context.
         deco_boxes.clear();
+
+        // Difference between the painted and the laid-out inline position on
+        // this line, carried from run to run (see the upright branch below).
+        #[cfg(feature = "writing-mode")]
+        let mut pen_delta = 0.0f32;
 
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
@@ -702,7 +748,13 @@ pub(crate) fn stroke_text<'a>(
                     let line_centre =
                         (line_metrics.block_min_coord + line_metrics.block_max_coord) / 2.0;
                     let baseline = glyph_run.baseline();
-                    let mut pen = glyph_run.offset();
+                    // Upright glyphs advance by their vertical metrics, which
+                    // differ from the horizontal advances Parley laid the run
+                    // out with. `pen_delta` carries the accumulated difference
+                    // into the following runs, so their start positions follow
+                    // what was actually painted instead of overlapping it.
+                    let mut pen = glyph_run.offset() + pen_delta;
+                    let parley_end = glyph_run.offset() + glyph_run.advance();
                     let mut upright = Vec::new();
                     let mut rotated = Vec::new();
 
@@ -722,8 +774,37 @@ pub(crate) fn stroke_text<'a>(
                         };
                         for glyph in cluster.glyphs() {
                             let advance = glyph.advance;
+                            // The glyph's vertical origin and vertical advance.
+                            // The em box and the horizontal advance are the
+                            // fallback for faces with no `vmtx`.
+                            let cached = *vertical_metrics
+                                .entry((font.data.id(), font.index, glyph.id))
+                                .or_insert_with(|| vertical_glyph_metrics(font, glyph.id));
+                            let (origin, step) = match cached {
+                                Some((origin_ratio, advance_ratio)) => {
+                                    (origin_ratio * font_size, advance_ratio * font_size)
+                                }
+                                // CSS Writing Modes 3 5.1.1 requires the UA to
+                                // synthesize vertical metrics for faces that
+                                // have none: one em of advance, with the em box
+                                // filling the cell. Falling back to the
+                                // horizontal advance would overlap upright
+                                // Latin, which is half an em wide but an em tall.
+                                None => (
+                                    font_size * metrics.ascent
+                                        / (metrics.ascent + metrics.descent).max(f32::EPSILON),
+                                    font_size,
+                                ),
+                            };
+
                             let inline_pos = pen;
-                            pen += advance;
+                            // Upright glyphs advance by their vertical advance
+                            // (CSS Writing Modes 3 5.1.1) — a Latin letter is
+                            // about an em tall but only half an em wide, so
+                            // advancing by its width would overlap the next one.
+                            // A rotated glyph advances by its width, which the
+                            // rotation turns into the step down the column.
+                            pen += if sideways { advance } else { step };
 
                             // The axis is the line box's centre, not the run's own
                             // metrics: §4.4 aligns every inline box in the line to
@@ -752,10 +833,9 @@ pub(crate) fn stroke_text<'a>(
                             } else {
                                 let x = block_pos - advance / 2.0;
                                 let y = if vertical.inline_axis_needs_mirror {
-                                    vertical.inline_extent - inline_pos
-                                        + (metrics.ascent - metrics.descent - advance) / 2.0
+                                    vertical.inline_extent - inline_pos - step + origin
                                 } else {
-                                    inline_pos + (advance + metrics.ascent - metrics.descent) / 2.0
+                                    inline_pos + origin
                                 };
                                 (x, y)
                             };
@@ -802,6 +882,7 @@ pub(crate) fn stroke_text<'a>(
                             rotated.into_iter(),
                         );
                     }
+                    pen_delta = pen - parley_end;
                 } else {
                     let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
                         id: glyph.id as _,

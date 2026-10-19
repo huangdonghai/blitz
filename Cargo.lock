@@ -1020,6 +1020,7 @@ dependencies = [
  "bytemuck",
  "color",
  "euclid",
+ "icu_properties",
  "kurbo",
  "parley",
  "peniko",
