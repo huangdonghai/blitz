@@ -1531,10 +1531,13 @@ impl Node {
             if let Some(ild) = element_data.inline_layout_data.as_ref() {
                 let layout = &ild.layout;
                 let scale = layout.scale();
-                let y = y - ild.block_offset;
+                // Parley coordinates: transposed for vertical writing modes (see
+                // `TextLayout::layout_point`). `HitResult` keeps the physical
+                // point, which `text_offset_at_point` maps again for itself.
+                let (layout_x, layout_y) = ild.layout_point(x, y);
 
                 if let Some((cluster, _side)) =
-                    Cluster::from_point_exact(layout, x * scale, y * scale)
+                    Cluster::from_point_exact(layout, layout_x * scale, layout_y * scale)
                 {
                     let node_id = cluster.style().brush.id;
                     let text_pointer_events_none = self
@@ -1591,10 +1594,12 @@ impl Node {
         let inline_layout = element_data.inline_layout_data.as_ref()?;
         let layout = &inline_layout.layout;
         let scale = layout.scale();
-        let y = y - inline_layout.block_offset;
+        // Parley coordinates: transposed for vertical writing modes, so the
+        // along-line position is read from the correct physical axis.
+        let (layout_x, layout_y) = inline_layout.layout_point(x, y);
 
         // Use Parley's cluster hit testing (from_point is more forgiving than from_point_exact)
-        let (cluster, side) = Cluster::from_point(layout, x * scale, y * scale)?;
+        let (cluster, side) = Cluster::from_point(layout, layout_x * scale, layout_y * scale)?;
 
         // Determine byte offset based on which side of the cluster was clicked
         // For LTR text: left side = start of cluster, right side = end of cluster

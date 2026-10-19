@@ -3,7 +3,7 @@ use selectors::context::QuirksMode;
 use std::sync::atomic::Ordering as Ao;
 use std::{
     io::Cursor,
-    sync::{Arc, atomic::AtomicUsize, mpsc::Sender},
+    sync::{Arc, Mutex, atomic::AtomicUsize, mpsc::Sender},
 };
 use style::{
     font_face::{FontFaceSourceFormat, FontFaceSourceFormatKeyword, FontStyleRange, Source},
@@ -288,6 +288,7 @@ impl NetHandler for ResourceHandler<NestedStylesheetHandler> {
             &self.shell_provider,
             &self.data.lock.read(),
             self.data.loader.abort_signal.as_ref(),
+            None,
         );
 
         let import_rule = self.data.import_rule.clone();
@@ -387,6 +388,7 @@ pub(crate) fn fetch_font_face(
     shell_provider: &Arc<dyn ShellProvider>,
     read_guard: &SharedRwLockReadGuard,
     abort_signal: Option<&AbortSignal>,
+    font_ctx: Option<&Arc<Mutex<parley::FontContext>>>,
 ) {
     fetch_font_face_rules(
         sheet.contents(read_guard).rules(read_guard).iter(),
@@ -397,6 +399,7 @@ pub(crate) fn fetch_font_face(
         shell_provider,
         read_guard,
         abort_signal,
+        font_ctx,
     )
 }
 
@@ -411,6 +414,7 @@ pub(crate) fn fetch_font_face_rules<'a>(
     shell_provider: &Arc<dyn ShellProvider>,
     read_guard: &SharedRwLockReadGuard,
     abort_signal: Option<&AbortSignal>,
+    font_ctx: Option<&Arc<Mutex<parley::FontContext>>>,
 ) {
     rules
         .filter_map(|rule| match rule {
@@ -434,6 +438,52 @@ pub(crate) fn fetch_font_face_rules<'a>(
             _ => None,
         })
         .for_each(|(source_list, overrides)| {
+            // `local(...)` names a font installed on the system. Resolve it here
+            // and register its bytes under the `@font-face` family name, exactly
+            // as a downloaded font is registered below. A stylesheet that relies
+            // on installed fonts — common in EPUBs, which often reference a font
+            // shipped with the reader — otherwise falls through to the generic
+            // family and renders in a different font than browsers that honour
+            // `local()`.
+            if let Some(font_ctx) = font_ctx
+                && overrides.family_name.is_some()
+            {
+                let mut bytes = None;
+                {
+                    let mut ctx = font_ctx.lock().unwrap();
+                    for source in &source_list.0 {
+                        let Source::Local(name) = source else {
+                            continue;
+                        };
+                        let Some(family_id) = ctx.collection.family_id(name.name.as_ref()) else {
+                            continue;
+                        };
+                        let Some(family) = ctx.collection.family(family_id) else {
+                            continue;
+                        };
+                        let info = family.default_font().or_else(|| family.fonts().first());
+                        let Some(info) = info else { continue };
+                        if let Some(blob) = info.load(Some(&mut ctx.source_cache)) {
+                            bytes = Some(blob.as_ref().to_vec());
+                            break;
+                        }
+                    }
+                }
+                if let Some(bytes) = bytes {
+                    // Hand it to the document exactly like a downloaded font:
+                    // that path also registers the font in every per-thread font
+                    // context (layout runs in parallel) and invalidates the
+                    // already-shaped text, so the local font is actually used.
+                    let _ = tx.send(DocumentEvent::ResourceLoad(ResourceLoadResponse {
+                        request_id: 0,
+                        node_id,
+                        resolved_url: None,
+                        result: Ok(Resource::Font(Bytes::from(bytes), overrides)),
+                    }));
+                    return;
+                }
+            }
+
             // Find the first font source in the source list that specifies a font of a type
             // that we support.
             let preferred_source = source_list

@@ -1159,6 +1159,16 @@ impl BaseDocument {
         }
     }
 
+    /// The font context this document shapes with: system fonts already
+    /// scanned, plus the fonts registered for this document.
+    ///
+    /// Handing it to the next document's [`DocumentConfig`] skips a second
+    /// system-font scan, which is expensive (hundreds of milliseconds on a
+    /// Windows machine with many installed fonts).
+    pub fn font_context(&self) -> parley::FontContext {
+        self.font_ctx.lock().unwrap().clone()
+    }
+
     /// The document's base URL
     pub fn url(&self) -> &url::Url {
         &self.url
@@ -1231,6 +1241,7 @@ impl BaseDocument {
             &self.shell_provider,
             &self.guard.read(),
             self.abort_signal.as_ref(),
+            Some(&self.font_ctx),
         );
 
         // Store data on element

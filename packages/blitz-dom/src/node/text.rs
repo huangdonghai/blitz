@@ -69,6 +69,39 @@ pub struct VerticalTextPaint {
 }
 
 impl TextLayout {
+    /// Map a physical point, relative to the inline root's content box, into
+    /// Parley's layout coordinates.
+    ///
+    /// Parley lays text out in the writing mode's own axes (inline axis =
+    /// "width", block axis = "height"), which coincide with physical space only
+    /// for `horizontal-tb`. Callers that paint a vertical inline root already
+    /// transpose the result; hit testing has to transpose the point the other
+    /// way, otherwise the along-line position is read off the wrong axis and
+    /// selection/caret mapping ignores it entirely.
+    pub fn layout_point(&self, x: f32, y: f32) -> (f32, f32) {
+        match self.vertical_text {
+            Some(vertical) => {
+                // Physical inline axis is `y`; physical block axis is `x`
+                // (mirrored for `vertical-rl`, whose block axis starts at the
+                // right edge). `align-content` shifts the line boxes along the
+                // block axis, which here is Parley's own y.
+                let inline = y;
+                let block = if vertical.block_axis_starts_at_right {
+                    vertical.block_extent - x
+                } else {
+                    x
+                };
+                let inline = if vertical.inline_axis_needs_mirror {
+                    vertical.inline_extent - inline
+                } else {
+                    inline
+                };
+                (inline, block - self.block_offset)
+            }
+            None => (x, y - self.block_offset),
+        }
+    }
+
     pub fn new() -> Self {
         Default::default()
     }

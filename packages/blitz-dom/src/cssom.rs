@@ -522,6 +522,7 @@ impl BaseDocument {
                 &self.shell_provider,
                 &guard,
                 self.abort_signal.as_ref(),
+                Some(&self.font_ctx),
             );
         }
         let (change_kind, ancestors) = match &list {

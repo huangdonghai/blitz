@@ -875,12 +875,22 @@ impl ElementCx<'_, '_> {
 
             // Render text selection highlight (if any) using cached selection ranges
             if let Some(&(sel_start, sel_end)) = self.context.selection_ranges.get(&self.node.id) {
+                // Selection geometry comes from Parley in the writing mode's own
+                // axes, so vertical inline roots need the same transpose the
+                // glyphs get below.
+                #[cfg(feature = "writing-mode")]
+                let selection_vertical =
+                    crate::text::vertical_text(self.context.dom, self.node.id, self.scale);
+                #[cfg(not(feature = "writing-mode"))]
+                let selection_vertical = None;
+
                 crate::text::draw_text_selection(
                     scene,
                     &text_layout.layout,
                     transform,
                     sel_start,
                     sel_end,
+                    selection_vertical,
                 );
             }
 

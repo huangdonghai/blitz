@@ -568,7 +568,7 @@ fn flush_line_decorations(
 /// `None` when the inline root is horizontal (or its layout has not been
 /// performed yet), in which case Parley's coordinates are already physical.
 #[cfg(feature = "writing-mode")]
-fn vertical_text(
+pub(crate) fn vertical_text(
     doc: &BaseDocument,
     inline_root_id: NodeId,
     scale: f64,
@@ -797,19 +797,49 @@ pub(crate) fn stroke_text<'a>(
 
 /// Draw selection highlight rectangles for the given byte range in a layout.
 /// Uses Parley's Selection type for accurate geometry calculation.
+///
+/// `vertical` carries the inline root's vertical writing mode geometry (see
+/// [`vertical_text`]); Parley reports selection geometry in the writing mode's
+/// own axes, so the rectangles have to be transposed the same way the glyphs
+/// are, otherwise the highlight is drawn in the wrong place.
 pub(crate) fn draw_text_selection(
     scene: &mut impl PaintScene,
     layout: &Layout<TextBrush>,
     transform: Affine,
     selection_start: usize,
     selection_end: usize,
+    vertical: Option<VerticalTextPaint>,
 ) {
     let anchor = Cursor::from_byte_index(layout, selection_start, Affinity::Downstream);
     let focus = Cursor::from_byte_index(layout, selection_end, Affinity::Downstream);
     let selection = Selection::new(anchor, focus);
 
     selection.geometry_with(layout, |rect, _line_idx| {
-        let rect = kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1);
+        let rect = match vertical {
+            // Parley's inline axis (x) becomes physical y, its block axis (y)
+            // becomes physical x — mirrored for `vertical-rl` and for an inline
+            // axis that does not start at the measured edge.
+            Some(vertical) => {
+                let (inline0, inline1) = if vertical.inline_axis_needs_mirror {
+                    (
+                        vertical.inline_extent as f64 - rect.x1,
+                        vertical.inline_extent as f64 - rect.x0,
+                    )
+                } else {
+                    (rect.x0, rect.x1)
+                };
+                let (block0, block1) = if vertical.block_axis_starts_at_right {
+                    (
+                        vertical.block_extent as f64 - rect.y1,
+                        vertical.block_extent as f64 - rect.y0,
+                    )
+                } else {
+                    (rect.y0, rect.y1)
+                };
+                kurbo::Rect::new(block0, inline0, block1, inline1)
+            }
+            None => kurbo::Rect::new(rect.x0, rect.y0, rect.x1, rect.y1),
+        };
         scene.fill(Fill::NonZero, transform, SELECTION_COLOR, None, &rect);
     });
 }
