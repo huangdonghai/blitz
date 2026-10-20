@@ -632,6 +632,48 @@ pub(crate) fn vertical_text(
     })
 }
 
+/// The extent of a line in the coordinates the painter draws its glyphs in, so
+/// it can be culled against the visible region.
+///
+/// Parley reports the line in its own axes, so a vertical inline root needs the
+/// same block/inline transposition — and the same mirroring — that the glyphs
+/// get in [`stroke_text`].
+fn line_extent(line: &Line<'_, TextBrush>, vertical: Option<&VerticalTextPaint>) -> Rect {
+    let metrics = line.metrics();
+    let inline = (metrics.offset, metrics.offset + metrics.advance);
+    let block = (metrics.block_min_coord, metrics.block_max_coord);
+    let Some(vertical) = vertical else {
+        return Rect::new(
+            f64::from(inline.0),
+            f64::from(block.0),
+            f64::from(inline.1),
+            f64::from(block.1),
+        );
+    };
+    let x = |block: f32| {
+        if vertical.block_axis_starts_at_right {
+            vertical.block_extent - block
+        } else {
+            block
+        }
+    };
+    let y = |inline: f32| {
+        if vertical.inline_axis_needs_mirror {
+            vertical.inline_extent - inline
+        } else {
+            inline
+        }
+    };
+    let (x0, x1) = (x(block.0), x(block.1));
+    let (y0, y1) = (y(inline.0), y(inline.1));
+    Rect::new(
+        f64::from(x0.min(x1)),
+        f64::from(y0.min(y1)),
+        f64::from(x0.max(x1)),
+        f64::from(y0.max(y1)),
+    )
+}
+
 pub(crate) fn stroke_text<'a>(
     scene: &mut impl PaintScene,
     lines: impl Iterator<Item = Line<'a, TextBrush>>,
@@ -639,6 +681,7 @@ pub(crate) fn stroke_text<'a>(
     transform: Affine,
     scale: f64,
     inline_root_id: NodeId,
+    cull_rect: Rect,
     context: &mut DrawTextContext,
 ) {
     let DrawTextContext {
@@ -657,6 +700,10 @@ pub(crate) fn stroke_text<'a>(
     // physical space only for `horizontal-tb`. Map them in `draw_glyphs` below.
     #[cfg(feature = "writing-mode")]
     let vertical = vertical_text(doc, inline_root_id, scale);
+    // Without the feature every inline root is horizontal, which `line_extent`
+    // takes as its `None`.
+    #[cfg(not(feature = "writing-mode"))]
+    let vertical: Option<VerticalTextPaint> = None;
     // The laid-out text, so `text-orientation: mixed` can be decided per
     // character: glyphs carry only their glyph id, not their source character.
     #[cfg(feature = "writing-mode")]
@@ -677,6 +724,23 @@ pub(crate) fn stroke_text<'a>(
     // for each run, only resolve styles for the nodes newly descended into (popping
     // as we ascend). `path_scratch` is a reusable buffer for the run's node path.
     for line in lines {
+        // A line is a row of text in a horizontal writing mode and a whole
+        // column of it in a vertical one, so a paragraph that is only partly on
+        // screen otherwise hands the rasterizer every line it has — and a long
+        // vertical document, which is mostly off screen, is nearly all of them.
+        // Glyphs can overhang their line box (italics, accents, a vertical
+        // origin outside the em box), so cull with a line's worth of slack.
+        let extent = line_extent(&line, vertical.as_ref());
+        let slack = f64::from(line.metrics().line_height).max(1.0);
+        let extent = extent.inflate(slack, slack);
+        if extent.x1 < cull_rect.x0
+            || extent.x0 > cull_rect.x1
+            || extent.y1 < cull_rect.y0
+            || extent.y0 > cull_rect.y1
+        {
+            continue;
+        }
+
         // Decorations accumulated for this line, keyed by decorating box, so each box is
         // painted once (spanning all its runs) using its own font — matching Firefox, which
         // draws one decoration per box rather than one stepped segment per differently-sized

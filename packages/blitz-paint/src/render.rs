@@ -460,7 +460,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         // Apply CSS transform property (where transforms are 2d)
 
-        let mut cx = self.element_cx(node, *node.final_layout(), transform, custom_widget_scene);
+        let mut cx = self.element_cx(
+            node,
+            *node.final_layout(),
+            transform,
+            clip_rect,
+            custom_widget_scene,
+        );
 
         // If this element clips its overflow it establishes a scrollport: narrow the clip
         // rectangle passed to descendants to the visible (clipped) region so that content
@@ -476,6 +482,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         } else {
             clip_rect
         };
+        cx.clip_rect = child_clip_rect;
 
         // Compute clip-path (if any) and wrap all rendering in a clip layer
         let clip_path_shape = cx.clip_path_shape();
@@ -650,6 +657,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         node: &'dom Node,
         layout: Layout,
         transform: Affine,
+        clip_rect: Rect,
         custom_widget_scene: Option<&'a Scene>,
     ) -> ElementCx<'dom, 'a> {
         let style = node
@@ -678,6 +686,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             node,
             element,
             transform,
+            clip_rect,
             #[cfg(feature = "svg")]
             svg: match element.image_data() {
                 Some(blitz_dom::node::ImageData::Svg(svg)) => Some(svg),
@@ -734,6 +743,9 @@ struct ElementCx<'dom, 'a> {
     node: &'dom Node,
     element: &'dom ElementData,
     transform: Affine,
+    /// The visible region, in screen coordinates: what descendants may be culled
+    /// against (see [`ElementCx::local_cull_rect`]).
+    clip_rect: Rect,
     #[cfg(feature = "svg")]
     svg: Option<&'dom blitz_dom::node::SvgImageData>,
     text_input: Option<&'dom TextInputData>,
@@ -909,6 +921,31 @@ impl ElementCx<'_, '_> {
         }
     }
 
+    /// The visible region in the coordinates this element's glyphs are painted
+    /// in, so whole lines of text outside it can be skipped.
+    ///
+    /// `transform` is the one the glyphs are drawn with — the inline root's own
+    /// coordinates to content coordinates — and `clip_rect` is in screen
+    /// coordinates, so the region has to be mapped back through the same screen
+    /// offset the culling in `render_element` uses.
+    fn local_cull_rect(&self, transform: Affine) -> Rect {
+        let screen = Affine::translate(Vec2 {
+            x: -self.context.initial_x,
+            y: -self.context.initial_y,
+        }) * transform;
+        // A degenerate transform has no visible region to speak of; cull nothing
+        // rather than guess at one.
+        if screen.determinant().abs() < f64::EPSILON {
+            return Rect::new(
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+            );
+        }
+        screen.inverse().transform_rect_bbox(self.clip_rect)
+    }
+
     fn draw_inline_layout(&self, scene: &mut impl PaintScene, pos: Point) {
         if self.node.flags.is_inline_root() {
             let text_layout = self.element
@@ -965,6 +1002,7 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
+                self.local_cull_rect(transform),
                 &mut draw_text_context,
             );
         }
@@ -1031,6 +1069,7 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
+                self.local_cull_rect(transform),
                 &mut draw_text_context,
             );
         }
@@ -1086,6 +1125,7 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
+                self.local_cull_rect(transform),
                 &mut draw_text_context,
             );
         }
