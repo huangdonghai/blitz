@@ -5,7 +5,7 @@ use blitz_dom::{
 };
 use icu_properties::{CodePointMapData, props::VerticalOrientation};
 use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
-use parley::{Affinity, Cursor, Layout, Line, PositionedLayoutItem, Selection};
+use parley::{Affinity, Cursor, Layout, Line, LineMetrics, PositionedLayoutItem, Selection};
 use peniko::Fill;
 use std::collections::HashMap;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
@@ -321,10 +321,17 @@ fn decoration_size(
 }
 
 /// Draws a single decoration line of the given `text-decoration-style` spanning
-/// `[x0, x0 + width]`. `baseline` is the line's baseline and `offset` positions the line
-/// relative to it (`y = baseline - offset + size / 2`, growing downward). Geometry is built
-/// explicitly (rather than relying on backend dash support) so it renders consistently
-/// across renderers.
+/// `[x0, x0 + width]` along Parley's inline axis. `baseline` is the line's baseline and
+/// `offset` positions the line along the block axis (`y = baseline - offset + size / 2`,
+/// growing away from the text). Geometry is built explicitly (rather than relying on
+/// backend dash support) so it renders consistently across renderers.
+///
+/// The geometry is built in Parley's layout coordinates, so `transform` has to map those
+/// onto physical space 閳?see [`vertical_transform`] for the vertical writing modes.
+///
+/// `block_sign` orients the block axis: `+1` when a larger block coordinate means the
+/// same as it does horizontally (below the baseline), `-1` when it points the other way
+/// (see the note on the decoration block axis in [`flush_line_decorations`]).
 ///
 /// `double_dir` points away from the text (`+1` = down, `-1` = up) and is used to place the
 /// second line of a `double` decoration.
@@ -339,20 +346,30 @@ fn draw_decoration_line(
     offset: f32,
     size: f32,
     brush: &anyrender::Paint,
+    block_sign: f64,
     double_dir: f64,
     deco_style: TextDecorationStyle,
     inset_start: f64,
     inset_end: f64,
 ) {
-    // Inset the line from the box's start/end edges (assumes LTR: start is the left edge).
-    // Negative insets extend the line past the text.
+    // Inset the line from the box's start/end edges (inline-start is the left edge in
+    // Parley's horizontal axes). Negative insets extend the line past the text.
     let x = x0 + inset_start;
     let w = width - inset_start - inset_end;
     if w <= 0.0 {
         return;
     }
-    let y = (baseline - offset + size / 2.0) as f64;
+    // `offset` is the signed distance from the baseline to the near edge of the line,
+    // measured the same way a horizontal underline's is (negative = below the baseline).
+    // When the block axis points the other way (see `block_sign`), the line has to be
+    // mirrored about the baseline so it still sits on the same physical side.
     let size = size as f64;
+    let y = f64::from(baseline) - block_sign * (f64::from(offset) - size / 2.0);
+    if std::env::var_os("CUOTUO_DEBUG_DECO").is_some() {
+        let p0 = transform * kurbo::Point::new(x, y);
+        let p1 = transform * kurbo::Point::new(x + w, y);
+        eprintln!("  line x0={x} w={w} baseline={baseline} offset={offset} size={size} block_sign={block_sign} y={y} -> p0={p0:?} p1={p1:?} xform={transform:?}");
+    }
     let butt_stroke = Stroke::new(size).with_caps(Cap::Butt);
 
     match deco_style {
@@ -367,10 +384,11 @@ fn draw_decoration_line(
         // Two lines, each `size` thick, separated by a 1px (CSS) gap. This
         // matches Chrome, where the second line is offset by `thickness + 1px`
         // and sits further from the text (below for underline, above for
-        // overline).
+        // overline). `double_dir` is in block-axis terms, so it follows the
+        // block axis rather than the physical y axis.
         TextDecorationStyle::Double => {
             let one_css_px = scale;
-            for cy in [y, y + double_dir * (size + one_css_px)] {
+            for cy in [y, y + block_sign * double_dir * (size + one_css_px)] {
                 let line = kurbo::Line::new((x, cy), (x + w, cy));
                 scene.stroke(&butt_stroke, transform, brush, None, &line);
             }
@@ -407,7 +425,7 @@ fn draw_decoration_line(
                 dx += dash + gap;
             }
         }
-        // A squiggle built from alternating quadratic Béziers.
+        // A squiggle built from alternating quadratic B鑼厇iers.
         TextDecorationStyle::Wavy => {
             let amplitude = size;
             let half_wave = (2.0 * size).max(1.0);
@@ -417,7 +435,7 @@ fn draw_decoration_line(
             let mut up = true;
             while px < x + w {
                 let nx = (px + half_wave).min(x + w);
-                // A quad Bézier reaches half the control-point offset at its
+                // A quad B鑼厇ier reaches half the control-point offset at its
                 // midpoint, so use `2 * amplitude` to hit the target peak.
                 let ctrl_y = if up {
                     y - 2.0 * amplitude
@@ -434,7 +452,9 @@ fn draw_decoration_line(
     }
 }
 
+
 /// Paint the decorations accumulated for one line, one line per decorating box.
+#[allow(clippy::too_many_arguments)]
 fn flush_line_decorations(
     scene: &mut impl PaintScene,
     transform: Affine,
@@ -442,8 +462,54 @@ fn flush_line_decorations(
     deco_boxes: &[LineDecoration],
     win_ascent_ratios: &mut WinAscentCache,
     inline_root_id: NodeId,
-    line_baseline: f32,
+    metrics: &LineMetrics,
+    vertical: Option<&VerticalTextPaint>,
 ) {
+    let line_baseline = metrics.baseline;
+    // Decorations are positioned in Parley's layout axes, like the glyphs, so a
+    // vertical inline root has to map them onto physical space the same way.
+    //
+    // Parley's block axis runs from the writing mode's block-start, but "under" is
+    // always the physical left in a vertical writing mode (CSS Writing Modes 3,
+    // Abstract-to-Physical Mappings), which is the *end* of a `vertical-lr` block
+    // axis. Decorating offsets are therefore measured backwards along a block axis
+    // that does not start at the right edge.
+    #[cfg(feature = "writing-mode")]
+    let (transform, block_sign) = match vertical {
+        Some(vertical) => (
+            transform * vertical_transform(vertical),
+            if vertical.block_axis_starts_at_right { 1.0 } else { -1.0 },
+        ),
+        None => (transform, 1.0),
+    };
+    #[cfg(not(feature = "writing-mode"))]
+    let (transform, block_sign) = {
+        let _ = vertical;
+        (transform, 1.0)
+    };
+
+    // In a vertical writing mode the glyphs of a line are centred on the line's block
+    // centre, not on the run's alphabetic baseline (see the vertical branch of
+    // `stroke_text`): every glyph is placed at `baseline + (block_centre - line
+    // baseline)`. A decoration measured from the alphabetic baseline alone would sit
+    // that far off its characters, which on the sample book page put every underline
+    // a couple of pixels through the glyphs.
+    #[cfg(feature = "writing-mode")]
+    let baseline_shift = if vertical.is_some() {
+        (metrics.block_min_coord + metrics.block_max_coord) / 2.0 - metrics.baseline
+    } else {
+        0.0
+    };
+    #[cfg(not(feature = "writing-mode"))]
+    let baseline_shift = 0.0f32;
+
+    // CSS Writing Modes 3 5.1.1 sets an upright glyph in a square cell centred on the
+    // line's central baseline, so along the block axis that cell reaches half an em either
+    // side of the baseline. The font's horizontal ascent/descent/underline metrics say
+    // nothing about that, and using them drops the line inside the glyphs: Chrome puts
+    // `auto` and `under` alike just outside the cell (compared against Chrome 141).
+    let upright_cell = vertical.is_some_and(|v| v.text_orientation != TextOrientation::Sideways);
+
     // Draw innermost boxes first so ancestors' decorations paint on top, matching the
     // per-run drawing order this replaced (`stack.iter().rev()`).
     for acc in deco_boxes.iter().rev() {
@@ -464,6 +530,24 @@ fn flush_line_decorations(
             (None, None) => continue,
         };
         let geom = &geom;
+        // Half the square cell an upright glyph is set in (see `upright_cell`).
+        let half_cell = geom.font_size / 2.0;
+        if std::env::var_os("CUOTUO_DEBUG_DECO").is_some() {
+            eprintln!(
+                "deco node={:?} vert={:?} line_baseline={line_baseline} run_baseline={} under_off={} min_x={} max_x={}",
+                acc.node_id,
+                vertical.map(|v| (
+                    v.block_extent,
+                    v.block_axis_starts_at_right,
+                    v.inline_extent,
+                    v.inline_axis_needs_mirror
+                )),
+                geom.baseline,
+                geom.underline_offset,
+                acc.min_x,
+                acc.max_x
+            );
+        }
         let width = acc.max_x - acc.min_x;
         if width <= 0.0 {
             continue;
@@ -509,7 +593,9 @@ fn flush_line_decorations(
             // descending glyphs like "gqy".
             // An explicit offset under `auto` is taken from the alphabetic
             // baseline, as CSS and Chrome have it, not from the auto gap.
-            let base_offset = if deco.underline_under {
+            let base_offset = if upright_cell {
+                -half_cell
+            } else if deco.underline_under {
                 -geom.descent
             } else if deco.underline_offset.is_some() && !deco.underline_from_font {
                 0.0
@@ -525,10 +611,11 @@ fn flush_line_decorations(
                 scale,
                 acc.min_x,
                 width,
-                geom.baseline,
+                geom.baseline + baseline_shift,
                 offset,
                 size,
                 &brush,
+                block_sign,
                 1.0,
                 deco.style,
                 inset_start,
@@ -550,9 +637,13 @@ fn flush_line_decorations(
                 geom.css_font_size,
                 scale,
             );
-            let ascent =
-                win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
-            let offset = ascent + size;
+            let offset = if upright_cell {
+                half_cell + size
+            } else {
+                let ascent =
+                    win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
+                ascent + size
+            };
 
             // A `double` overline extends upward, away from the text.
             draw_decoration_line(
@@ -561,10 +652,11 @@ fn flush_line_decorations(
                 scale,
                 acc.min_x,
                 width,
-                geom.baseline,
+                geom.baseline + baseline_shift,
                 offset,
                 size,
                 &brush,
+                block_sign,
                 -1.0,
                 deco.style,
                 inset_start,
@@ -583,9 +675,14 @@ fn flush_line_decorations(
             // Chrome (which places it `2/3 * ascent` below the text-top). Parley's
             // `strikethrough_offset` (the font's `yStrikeoutPosition`) sits lower and would
             // draw the line too close to the baseline.
-            let ascent =
-                win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
-            let offset = ascent / 3.0 + size / 2.0;
+            let offset = if upright_cell {
+                // Through the middle of the cell, which is where the line box's axis runs.
+                size / 2.0
+            } else {
+                let ascent =
+                    win_ascent(win_ascent_ratios, &geom.font, geom.font_size).unwrap_or(geom.ascent);
+                ascent / 3.0 + size / 2.0
+            };
 
             draw_decoration_line(
                 scene,
@@ -593,10 +690,11 @@ fn flush_line_decorations(
                 scale,
                 acc.min_x,
                 width,
-                geom.baseline,
+                geom.baseline + baseline_shift,
                 offset,
                 size,
                 &brush,
+                block_sign,
                 1.0,
                 deco.style,
                 inset_start,
@@ -632,11 +730,43 @@ pub(crate) fn vertical_text(
     })
 }
 
+/// Maps Parley's layout coordinates (x = inline axis, y = block axis) onto the
+/// physical space a vertical inline root paints its glyphs in.
+///
+/// Decorations are positioned from a run's baseline along the block axis, which is
+/// Parley's `y` 閳?so for a vertical root a "horizontal" decoration line is really a
+/// line running down the column, and the block axis it is offset along is physical
+/// `x`. Both axes can start at the far edge (see [`vertical_text`]), hence the
+/// mirroring.
+#[cfg(feature = "writing-mode")]
+fn vertical_transform(vertical: &VerticalTextPaint) -> Affine {
+    let (x_from_block, x_offset) = if vertical.block_axis_starts_at_right {
+        (-1.0, f64::from(vertical.block_extent))
+    } else {
+        (1.0, 0.0)
+    };
+    let (y_from_inline, y_offset) = if vertical.inline_axis_needs_mirror {
+        (-1.0, f64::from(vertical.inline_extent))
+    } else {
+        (1.0, 0.0)
+    };
+    Affine::new([
+        // Physical x = block axis (mirrored for `vertical-rl`),
+        // physical y = inline axis (mirrored when it does not start at the top).
+        0.0,
+        y_from_inline,
+        x_from_block,
+        0.0,
+        x_offset,
+        y_offset,
+    ])
+}
+
 /// The extent of a line in the coordinates the painter draws its glyphs in, so
 /// it can be culled against the visible region.
 ///
 /// Parley reports the line in its own axes, so a vertical inline root needs the
-/// same block/inline transposition — and the same mirroring — that the glyphs
+/// same block/inline transposition 閳?and the same mirroring 閳?that the glyphs
 /// get in [`stroke_text`].
 fn line_extent(line: &Line<'_, TextBrush>, vertical: Option<&VerticalTextPaint>) -> Rect {
     let metrics = line.metrics();
@@ -726,7 +856,7 @@ pub(crate) fn stroke_text<'a>(
     for line in lines {
         // A line is a row of text in a horizontal writing mode and a whole
         // column of it in a vertical one, so a paragraph that is only partly on
-        // screen otherwise hands the rasterizer every line it has — and a long
+        // screen otherwise hands the rasterizer every line it has 閳?and a long
         // vertical document, which is mostly off screen, is nearly all of them.
         // Glyphs can overhang their line box (italics, accents, a vertical
         // origin outside the em box), so cull with a line's worth of slack.
@@ -742,7 +872,7 @@ pub(crate) fn stroke_text<'a>(
         }
 
         // Decorations accumulated for this line, keyed by decorating box, so each box is
-        // painted once (spanning all its runs) using its own font — matching Firefox, which
+        // painted once (spanning all its runs) using its own font 閳?matching Firefox, which
         // draws one decoration per box rather than one stepped segment per differently-sized
         // run. Clearing preserves the allocation for the next line and inline context.
         deco_boxes.clear();
@@ -801,12 +931,20 @@ pub(crate) fn stroke_text<'a>(
                     kurbo::Vec2::default()
                 };
 
+                // The inline extent this run covers, in Parley's layout coordinates.
+                // A vertical root overrides it with the extent it actually paints
+                // (see the `run_x0`/`run_x1` assignments in that branch): upright
+                // glyphs advance by their vertical metrics, which Parley's layout
+                // does not know about, so the two drift apart along the line.
+                let mut run_x0 = glyph_run.offset() as f64;
+                let mut run_x1 = run_x0 + glyph_run.advance() as f64;
+
                 // Map glyph positions from the inline root's axes onto physical
                 // space for vertical writing modes (see the note at the top).
                 #[cfg(feature = "writing-mode")]
                 if let Some(vertical) = vertical {
-                    // Upright glyphs are set on the line's central baseline (§4.2);
-                    // sideways ones are rotated 90° clockwise and keep the same
+                    // Upright glyphs are set on the line's central baseline (鎼?.2);
+                    // sideways ones are rotated 90鎺?clockwise and keep the same
                     // axis. See the note on `vertical_text`.
                     let line_metrics = *line.metrics();
                     let line_centre =
@@ -819,13 +957,20 @@ pub(crate) fn stroke_text<'a>(
                     // what was actually painted instead of overlapping it.
                     let mut pen = glyph_run.offset() + pen_delta;
                     let parley_end = glyph_run.offset() + glyph_run.advance();
+                    run_x0 = f64::from(pen);
                     let mut upright = Vec::new();
                     let mut rotated = Vec::new();
 
                     // Walk clusters rather than `positioned_glyphs`, because the
                     // orientation is decided per character and glyphs do not carry
-                    // their source character.
-                    for cluster in run.visual_clusters() {
+                    // their source character. The clusters must be the *glyph
+                    // run's* own: a line item is split into one glyph run per
+                    // style, and `run` spans the whole item. Iterating the item's
+                    // clusters here paints every character once per glyph run, and the
+                    // pen advances for each of them, so the whole line's text repeats
+                    // down the column (a page with nested inline spans and
+                    // punctuation trimming produces several runs per item).
+                    for cluster in glyph_run.visual_clusters() {
                         let sideways = match vertical.text_orientation {
                             TextOrientation::Upright => false,
                             TextOrientation::Sideways => true,
@@ -863,7 +1008,7 @@ pub(crate) fn stroke_text<'a>(
 
                             let inline_pos = pen;
                             // Upright glyphs advance by their vertical advance
-                            // (CSS Writing Modes 3 5.1.1) — a Latin letter is
+                            // (CSS Writing Modes 3 5.1.1) 閳?a Latin letter is
                             // about an em tall but only half an em wide, so
                             // advancing by its width would overlap the next one.
                             // A rotated glyph advances by its width, which the
@@ -871,7 +1016,7 @@ pub(crate) fn stroke_text<'a>(
                             pen += if sideways { advance } else { step };
 
                             // The axis is the line box's centre, not the run's own
-                            // metrics: §4.4 aligns every inline box in the line to
+                            // metrics: 鎼?.4 aligns every inline box in the line to
                             // the dominant (central) baseline. `glyph.y` keeps the
                             // column (block-axis) position and any `vertical-align`
                             // shift.
@@ -884,14 +1029,14 @@ pub(crate) fn stroke_text<'a>(
                             };
 
                             let (x, y) = if sideways {
-                                // Rotated 90° clockwise, so the glyph's ascent points
+                                // Rotated 90鎺?clockwise, so the glyph's ascent points
                                 // right and its descent left, and its baseline runs
                                 // down the column at `x`.
                                 //
-                                // Which baseline the line aligns on is what §4.2
+                                // Which baseline the line aligns on is what 鎼?.2
                                 // decides from `text-orientation`: the central
-                                // baseline for `mixed` — which rotates the
-                                // horizontal-only scripts too — and `upright`, and
+                                // baseline for `mixed` 閳?which rotates the
+                                // horizontal-only scripts too 閳?and `upright`, and
                                 // the alphabetic baseline for `sideways`, where the
                                 // whole line is one rotated horizontal line and every
                                 // glyph therefore shares one baseline whatever its
@@ -963,6 +1108,9 @@ pub(crate) fn stroke_text<'a>(
                             rotated.into_iter(),
                         );
                     }
+                    // The decorations of this run have to land on the glyphs that were
+                    // painted, not on the position Parley reported.
+                    run_x1 = f64::from(pen);
                     pen_delta = pen - parley_end;
                 } else {
                     let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
@@ -1025,8 +1173,6 @@ pub(crate) fn stroke_text<'a>(
                     css_font_size,
                 };
                 let run_node_id = style.brush.id;
-                let run_x0 = glyph_run.offset() as f64;
-                let run_x1 = run_x0 + glyph_run.advance() as f64;
 
                 for entry in stack.iter() {
                     if entry.decoration.is_none() {
@@ -1068,7 +1214,8 @@ pub(crate) fn stroke_text<'a>(
             deco_boxes,
             win_ascent_ratios,
             inline_root_id,
-            line.metrics().baseline,
+            line.metrics(),
+            vertical.as_ref(),
         );
     }
 }
@@ -1095,7 +1242,7 @@ pub(crate) fn draw_text_selection(
     selection.geometry_with(layout, |rect, _line_idx| {
         let rect = match vertical {
             // Parley's inline axis (x) becomes physical y, its block axis (y)
-            // becomes physical x — mirrored for `vertical-rl` and for an inline
+            // becomes physical x 閳?mirrored for `vertical-rl` and for an inline
             // axis that does not start at the measured edge.
             Some(vertical) => {
                 let (inline0, inline1) = if vertical.inline_axis_needs_mirror {
