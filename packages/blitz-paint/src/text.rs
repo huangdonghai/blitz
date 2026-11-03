@@ -1137,7 +1137,9 @@ fn flush_line_decorations(
                 deco.style,
                 inset_start,
                 inset_end,
-                vertical.is_some() && deco.underline_right,
+                vertical.is_some_and(|v| {
+            v.text_orientation != TextOrientation::Sideways && deco.underline_right
+        }),
             );
         }
         if deco.line.contains(TextDecorationLine::OVERLINE) {
@@ -1179,7 +1181,9 @@ fn flush_line_decorations(
                 deco.style,
                 inset_start,
                 inset_end,
-                vertical.is_some() && deco.underline_right,
+                vertical.is_some_and(|v| {
+            v.text_orientation != TextOrientation::Sideways && deco.underline_right
+        }),
             );
         }
         if deco.line.contains(TextDecorationLine::LINE_THROUGH) {
@@ -1218,7 +1222,9 @@ fn flush_line_decorations(
                 deco.style,
                 inset_start,
                 inset_end,
-                vertical.is_some() && deco.underline_right,
+                vertical.is_some_and(|v| {
+            v.text_orientation != TextOrientation::Sideways && deco.underline_right
+        }),
             );
         }
     }
