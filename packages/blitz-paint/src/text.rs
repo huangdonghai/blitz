@@ -9,6 +9,7 @@ use parley::{Affinity, Cursor, Layout, Line, LineMetrics, PositionedLayoutItem, 
 use peniko::Fill;
 use std::collections::HashMap;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
+use style::values::computed::Display;
 use style::values::computed::{
     Length, LengthPercentage, TextDecorationLength, TextDecorationLine, TextUnderlinePosition,
 };
@@ -971,7 +972,7 @@ pub(crate) fn stroke_text<'a>(
     #[cfg(feature = "writing-mode")]
     let vo_map = CodePointMapData::<VerticalOrientation>::new();
 
-    // Persistent stack mirroring the ancestor path (inline root -> current run's
+    // Persistent stack mirroring the ancestor path (document root -> current run's
     // node) as we walk the runs. The `text-decoration-*` properties are *not*
     // inherited; instead a decoration set on an ancestor is propagated to the
     // descendant text it wraps. Rather than re-resolving styles for the whole
@@ -1036,12 +1037,32 @@ pub(crate) fn stroke_text<'a>(
                 let mut walk_id = Some(style.brush.id);
                 while let Some(node_id) = walk_id {
                     path_scratch.push(node_id);
-                    if node_id == inline_root_id {
-                        break;
-                    }
+                    // Past the inline root as well: `text-decoration` propagates from every
+                    // ancestor box to the text inside it, and a block nested in a decorated
+                    // block is a line of its own (the corpus's propagation cases are exactly
+                    // that). An inline root only says where the line's layout data lives.
                     walk_id = doc.get_node(node_id).and_then(|node| node.parent);
                 }
                 path_scratch.reverse();
+
+                // A decoration does not reach into an atomic inline: `inline-block`,
+                // `inline-flex` and their kin are laid out as boxes of their own, so only the
+                // decorations from that box downwards apply to the text inside it.
+                let boundary = path_scratch
+                    .iter()
+                    .rposition(|&node_id| {
+                        doc.get_node(node_id)
+                            .and_then(|node| node.primary_styles())
+                            .is_some_and(|styles| {
+                                let display = styles.clone_display();
+                                display == Display::InlineBlock
+                                    || display == Display::InlineFlex
+                                    || display == Display::InlineGrid
+                                    || display == Display::InlineTable
+                            })
+                    })
+                    .unwrap_or(0);
+                path_scratch.drain(..boundary);
 
                 let shared = stack
                     .iter()
