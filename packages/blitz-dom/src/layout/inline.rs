@@ -693,6 +693,12 @@ impl LayoutPassState<'_> {
             .layout
             .set_text_indent(resolved_text_indent * scale, indent_options);
 
+        // A ruby annotation is drawn but takes no room in the line (CSS Ruby 1: the annotation
+        // is laid out over its base), so its advances are cleared before the lines are broken.
+        inline_layout
+            .layout
+            .clear_advances(&inline_layout.text, &inline_layout.ruby_ranges);
+
         // In vertical writing modes Taffy's block axis is physical x, so a line box must be as
         // tall as its tallest box rather than `max(ascent) + max(descent)` (CSS Writing Modes 3
         // §7.1: the font's ascent and descent belong to the inline axis).
@@ -722,8 +728,11 @@ impl LayoutPassState<'_> {
         // Perform inline layout
         #[cfg(feature = "floats")]
         {
-            // `perform_layout` breaks lines independently of `compute_size`, so the writing mode
-            // has to be re-applied here.
+            // `perform_layout` breaks lines independently of `compute_size`, so the cleared
+            // annotation advances and the writing mode have to be re-applied here.
+            inline_layout
+                .layout
+                .clear_advances(&inline_layout.text, &inline_layout.ruby_ranges);
             #[cfg(feature = "writing-mode")]
             {
                 let wm = self.layout_wm_of(node_id);

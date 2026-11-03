@@ -116,7 +116,7 @@ fn emphasis_glyph(
 ) -> Option<(u32, f32, f32, f32, f32, f32)> {
     use skrifa::raw::{FontRef, TableProvider as _};
     use skrifa::{
-        GlyphId, MetadataProvider as _,
+        MetadataProvider as _,
         instance::{LocationRef, Size},
     };
 
@@ -612,6 +612,103 @@ struct GlyphBatch {
     transform: Affine,
     glyph_xform: Option<Affine>,
     glyphs: Vec<anyrender::Glyph>,
+}
+
+/// A glyph's advance in `unitsPerEm` ratios, read from its font.
+fn glyph_advance(font: &parley::FontData, glyph_id: u32) -> f64 {
+    use skrifa::raw::{FontRef, TableProvider as _};
+    use skrifa::{
+        MetadataProvider as _,
+        instance::{LocationRef, Size},
+    };
+
+    let Ok(font_ref) = FontRef::from_index(font.data.as_ref(), font.index) else {
+        return 0.0;
+    };
+    let units_per_em = font_ref
+        .head()
+        .map(|head| head.units_per_em() as f32)
+        .unwrap_or(1000.0);
+    font_ref
+        .glyph_metrics(Size::unscaled(), LocationRef::default())
+        .advance_width(skrifa::GlyphId::new(glyph_id))
+        .map(|advance| f64::from(advance / units_per_em))
+        .unwrap_or(0.0)
+}
+
+/// Collect a run's glyphs in layout coordinates.
+///
+/// A ruby annotation is drawn over the character it belongs to rather than after it: its
+/// advance was cleared before the lines were broken (see the inline layout), so the glyphs it
+/// shaped sit where the base character ends. They are moved to the base's centre and lifted by
+/// the line's ascent, the same place `text-emphasis` puts its marks.
+fn run_glyphs(
+    glyph_run: &parley::layout::GlyphRun<'_, TextBrush>,
+    doc: &BaseDocument,
+    ascent: f64,
+    baseline: f64,
+    base_centre: &mut Option<f64>,
+) -> Vec<anyrender::Glyph> {
+    let plain = || {
+        glyph_run
+            .positioned_glyphs()
+            .map(|glyph| anyrender::Glyph {
+                id: glyph.id as _,
+                x: glyph.x,
+                y: glyph.y,
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let is_annotation = doc
+        .get_node(glyph_run.style().brush.id)
+        .and_then(|node| node.element_data())
+        .is_some_and(|element| matches!(&*element.name.local, "rt" | "rtc"));
+    if !is_annotation {
+        let mut pen = f64::from(glyph_run.offset());
+        let mut last = None;
+        for cluster in glyph_run.visual_clusters() {
+            let advance = f64::from(cluster.advance());
+            last = Some(pen + advance / 2.0);
+            pen += advance;
+        }
+        if let Some(last) = last {
+            *base_centre = Some(last);
+        }
+        return plain();
+    }
+
+    let Some(centre) = *base_centre else {
+        // Nothing to hang the annotation on: leave it where it is.
+        return plain();
+    };
+
+    // The shaped advances were cleared, so the annotation's width comes from the font.
+    let font = glyph_run.run().font();
+    let font_size = f64::from(glyph_run.run().font_size());
+    let mut start = f64::INFINITY;
+    let mut end = f64::NEG_INFINITY;
+    for glyph in glyph_run.positioned_glyphs() {
+        let advance = glyph_advance(font, glyph.id) * font_size;
+        start = start.min(f64::from(glyph.x));
+        end = end.max(f64::from(glyph.x) + advance);
+    }
+    if !(start.is_finite() && end.is_finite()) {
+        return Vec::new();
+    }
+    let shift = centre - (start + end) / 2.0;
+    glyph_run
+        .positioned_glyphs()
+        .map(|glyph| anyrender::Glyph {
+            id: glyph.id as _,
+            x: (f64::from(glyph.x) + shift) as f32,
+            // The annotation sits in the margin above the base text: its box is one and a half
+            // times its size tall and rests on the edge of the ascent, so its baseline is three
+            // quarters of the way up. This is where Chrome draws it (measured against a render
+            // of the same page).
+            y: (baseline - ascent - font_size * 0.75) as f32,
+        })
+        .collect()
 }
 
 /// Where a run's glyphs start and end along the inline axis, in device pixels.
@@ -1118,6 +1215,10 @@ pub(crate) fn stroke_text<'a>(
         // Glyphs of this line, drawn once its decorations are in the scene.
         glyph_batches.clear();
 
+        // Where the last ordinary character of this line sits along the inline axis: a ruby
+        // annotation is drawn over it.
+        let mut base_centre: Option<f64> = None;
+
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
                 let run = glyph_run.run();
@@ -1363,11 +1464,13 @@ pub(crate) fn stroke_text<'a>(
                     run_x1 = f64::from(pen);
                     pen_delta = pen - parley_end;
                 } else {
-                    let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-                        id: glyph.id as _,
-                        x: glyph.x,
-                        y: glyph.y,
-                    });
+                    let glyphs = run_glyphs(
+                        &glyph_run,
+                        doc,
+                        f64::from(metrics.ascent),
+                        f64::from(glyph_run.baseline()),
+                        &mut base_centre,
+                    );
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
                     glyph_batches.push(GlyphBatch {
                         font: font.clone(),
@@ -1377,16 +1480,18 @@ pub(crate) fn stroke_text<'a>(
                         paint: anyrender::Paint::from(text_color),
                         transform,
                         glyph_xform,
-                        glyphs: glyphs.collect(),
+                        glyphs,
                     });
                 }
                 #[cfg(not(feature = "writing-mode"))]
                 {
-                    let glyphs = glyph_run.positioned_glyphs().map(|glyph| anyrender::Glyph {
-                        id: glyph.id as _,
-                        x: glyph.x,
-                        y: glyph.y,
-                    });
+                    let glyphs = run_glyphs(
+                        &glyph_run,
+                        doc,
+                        f64::from(metrics.ascent),
+                        f64::from(glyph_run.baseline()),
+                        &mut base_centre,
+                    );
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
                     glyph_batches.push(GlyphBatch {

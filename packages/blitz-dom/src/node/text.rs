@@ -33,6 +33,12 @@ pub struct TextLayout {
     /// containing block (as `SPAN_*_CB` flags). The inline root claims those boxes in its place.
     /// Set by each `RunMode::PerformLayout` run of inline layout.
     pub span_cb_flags: stylo_taffy::StyleFlags,
+    /// Byte ranges of the text that belongs to ruby annotations (`<rt>`, `<rtc>`).
+    ///
+    /// An annotation is drawn but takes no room in the line: its advances are cleared before
+    /// breaking (see [`parley::layout::Layout::clear_advances`]), and the painter lifts it above
+    /// the character it annotates.
+    pub ruby_ranges: Vec<std::ops::Range<usize>>,
     /// Vertical writing mode geometry, recorded by each `RunMode::PerformLayout`
     /// run of inline layout. `None` for horizontal writing modes.
     ///

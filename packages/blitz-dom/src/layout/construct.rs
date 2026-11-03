@@ -1035,6 +1035,16 @@ pub(crate) fn find_inline_layout_embedded_boxes(
     }
 }
 
+/// Where the ruby annotations are in the text being built.
+///
+/// An annotation is part of the inline content — it has to be shaped like any other text — but
+/// it takes no room in the line, so the layout only needs to know which bytes it covers.
+#[derive(Default)]
+struct RubyBuild {
+    text_len: usize,
+    ranges: Vec<std::ops::Range<usize>>,
+}
+
 pub(crate) fn build_inline_layout_into(
     nodes: &crate::NodeTree,
     layout_ctx: &mut LayoutContext<TextBrush>,
@@ -1097,6 +1107,7 @@ pub(crate) fn build_inline_layout_into(
         }
     };
     // The marker is a separate box, so words in the content don't continue from it.
+    let mut ruby = RubyBuild::default();
     let mut text_transformer = TextTransformer::default();
     text_transformer.word_break(&builder);
 
@@ -1107,6 +1118,7 @@ pub(crate) fn build_inline_layout_into(
             nodes,
             before_id,
             &text_transform,
+            &mut ruby,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -1116,6 +1128,7 @@ pub(crate) fn build_inline_layout_into(
             nodes,
             child_id,
             &text_transform,
+            &mut ruby,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1125,18 +1138,47 @@ pub(crate) fn build_inline_layout_into(
             nodes,
             after_id,
             &text_transform,
+            &mut ruby,
         );
     }
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
+    text_layout.ruby_ranges = ruby.ranges;
     return;
 
+    /// Walk one node, recording the byte range of a ruby annotation's text around it.
     fn build_inline_layout_recursive(
         builder: &mut TreeBuilder<TextBrush>,
         text_transformer: &mut TextTransformer,
         nodes: &crate::NodeTree,
         node_id: NodeId,
         parent_text_transform: &CaseTransform,
+        ruby: &mut RubyBuild,
+    ) {
+        let is_annotation = nodes[node_id]
+            .element_data()
+            .is_some_and(|element| matches!(&*element.name.local, "rt" | "rtc"));
+        let start = is_annotation.then_some(ruby.text_len);
+        build_inline_layout_node(
+            builder,
+            text_transformer,
+            nodes,
+            node_id,
+            parent_text_transform,
+            ruby,
+        );
+        if let Some(start) = start {
+            ruby.ranges.push(start..ruby.text_len);
+        }
+    }
+
+    fn build_inline_layout_node(
+        builder: &mut TreeBuilder<TextBrush>,
+        text_transformer: &mut TextTransformer,
+        nodes: &crate::NodeTree,
+        node_id: NodeId,
+        parent_text_transform: &CaseTransform,
+        ruby: &mut RubyBuild,
     ) {
         let node = &nodes[node_id];
 
@@ -1199,6 +1241,7 @@ pub(crate) fn build_inline_layout_into(
                                 nodes,
                                 child_id,
                                 &text_transform,
+                                ruby,
                             );
                         }
                         builder.pop_style_span();
@@ -1233,6 +1276,7 @@ pub(crate) fn build_inline_layout_into(
                                 ),
                             ]);
                             builder.push_text("\n");
+                            ruby.text_len += 1;
                             builder.pop_style_span();
                             text_transformer.word_break(builder);
                         } else {
@@ -1254,6 +1298,7 @@ pub(crate) fn build_inline_layout_into(
                                     nodes,
                                     before_id,
                                     &text_transform,
+                                    ruby,
                                 );
                             }
 
@@ -1264,6 +1309,7 @@ pub(crate) fn build_inline_layout_into(
                                     nodes,
                                     child_id,
                                     &text_transform,
+                                    ruby,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1273,6 +1319,7 @@ pub(crate) fn build_inline_layout_into(
                                     nodes,
                                     after_id,
                                     &text_transform,
+                                    ruby,
                                 );
                             }
 
@@ -1308,6 +1355,7 @@ pub(crate) fn build_inline_layout_into(
                 let text =
                     text_transformer.transform(&data.content, parent_text_transform, builder);
                 builder.push_text(text);
+                ruby.text_len += text.len();
             }
             NodeData::Comment { .. } => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
