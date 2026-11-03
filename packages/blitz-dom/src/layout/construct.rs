@@ -1422,11 +1422,27 @@ pub(crate) fn build_inline_layout_into(
                         .resolve_to_absolute(&itext.color)
                         .as_color_color()
                 });
+                // Emphasis marks are not drawn for punctuation (CSS Text Decoration 3 5.4):
+                // a comma or a bracket would collect a dot for no reason.
+                let category = icu_properties::CodePointMapData::<icu_properties::props::GeneralCategory>::new();
                 for character in text.chars() {
                     let mut scratch = [0u8; 4];
                     let piece = character.encode_utf8(&mut scratch);
                     builder.push_text(piece);
                     ruby.text_len += piece.len();
+                    use icu_properties::props::GeneralCategory as Category;
+                    if matches!(
+                        category.get(character),
+                        Category::ConnectorPunctuation
+                            | Category::DashPunctuation
+                            | Category::OpenPunctuation
+                            | Category::ClosePunctuation
+                            | Category::InitialPunctuation
+                            | Category::FinalPunctuation
+                            | Category::OtherPunctuation
+                    ) {
+                        continue;
+                    }
 
                     let mut scratch = [0u8; 4];
                     let mark = mark.encode_utf8(&mut scratch);
