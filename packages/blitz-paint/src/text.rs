@@ -9,6 +9,8 @@ use parley::{Affinity, Cursor, Layout, Line, LineMetrics, PositionedLayoutItem, 
 use peniko::Fill;
 use std::collections::HashMap;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
+use style::values::computed::{TextEmphasisPosition, TextEmphasisStyle};
+use style::values::specified::text::{TextEmphasisFillMode, TextEmphasisShapeKeyword};
 use style::values::computed::Display;
 use style::values::computed::{
     Length, LengthPercentage, TextDecorationLength, TextDecorationLine, TextUnderlinePosition,
@@ -101,6 +103,50 @@ pub(crate) fn draw_inline_backgrounds<'a>(
 /// blob's unique id and face index. `None` is cached for fonts without a usable OS/2 or
 /// head table so they aren't re-parsed either.
 type WinAscentCache = HashMap<(u64, u32), Option<f32>>;
+
+/// Metrics for an emphasis mark's glyph: `(advance, x_min, y_min, x_max, y_max)` as
+/// `unitsPerEm` ratios.
+type EmphasisMetricsCache = HashMap<(u64, u32, u32), Option<(f32, f32, f32, f32, f32)>>;
+
+/// The glyph an emphasis mark is drawn with, with the metrics needed to centre it.
+fn emphasis_glyph(
+    cache: &mut EmphasisMetricsCache,
+    font: &parley::FontData,
+    character: char,
+) -> Option<(u32, f32, f32, f32, f32, f32)> {
+    use skrifa::raw::{FontRef, TableProvider as _};
+    use skrifa::{
+        GlyphId, MetadataProvider as _,
+        instance::{LocationRef, Size},
+    };
+
+    let font_ref = FontRef::from_index(font.data.as_ref(), font.index).ok()?;
+    let glyph_id = font_ref.charmap().map(character)?;
+    let metrics = font_ref.glyph_metrics(Size::unscaled(), LocationRef::default());
+    let cached = cache
+        .entry((font.data.id(), font.index, glyph_id.to_u32()))
+        .or_insert_with(|| {
+            let units_per_em = font_ref.head().ok()?.units_per_em() as f32;
+            let advance = metrics.advance_width(glyph_id)?;
+            let bounds = metrics.bounds(glyph_id)?;
+            Some((
+                advance / units_per_em,
+                bounds.x_min / units_per_em,
+                bounds.y_min / units_per_em,
+                bounds.x_max / units_per_em,
+                bounds.y_max / units_per_em,
+            ))
+        });
+    let cached = (*cached)?;
+    Some((
+        glyph_id.to_u32(),
+        cached.0,
+        cached.1,
+        cached.2,
+        cached.3,
+        cached.4,
+    ))
+}
 
 /// Cached [`vertical_glyph_metrics`], keyed by font face and glyph id.
 type VerticalMetricsCache = HashMap<(u64, u32, u32), Option<(f32, f32)>>;
@@ -209,6 +255,15 @@ struct ResolvedDecoration {
     inset: GenericTextDecorationInset<LengthPercentage>,
 }
 
+/// An emphasis mark: the glyph drawn over (or under) every character of a box.
+#[derive(Clone, Copy)]
+struct EmphasisMark {
+    glyph: char,
+    color: Color,
+    /// `true` for `text-emphasis-position: over`, the initial value in a horizontal mode.
+    over: bool,
+}
+
 /// An element on the current ancestor path (inline root -> run node), caching the
 /// values resolved from its computed style so descending into the same node across
 /// consecutive runs doesn't re-resolve them.
@@ -219,6 +274,9 @@ struct DecorationStackEntry {
     text_color: Color,
     /// The decoration this node introduces as a decorating box, if any.
     decoration: Option<ResolvedDecoration>,
+    /// The emphasis mark this node draws over its own text (`text-emphasis` inherits, so the
+    /// innermost node of a run carries the mark that applies to it).
+    emphasis: Option<EmphasisMark>,
 }
 
 /// Resolve the cached style values for a single node into a [`DecorationStackEntry`].
@@ -228,6 +286,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             node_id,
             text_color: Color::BLACK,
             decoration: None,
+            emphasis: None,
         };
     };
 
@@ -270,6 +329,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
     DecorationStackEntry {
         node_id,
         text_color,
+        emphasis: emphasis_mark(itext, text_color),
         decoration,
     }
 }
@@ -325,6 +385,7 @@ pub(crate) struct DrawTextContext {
     glyph_batches: Vec<GlyphBatch>,
     win_ascent_ratios: WinAscentCache,
     vertical_metrics: VerticalMetricsCache,
+    emphasis_metrics: EmphasisMetricsCache,
 }
 
 /// Resolve the CSS `text-decoration-thickness` to a device-pixel size.
@@ -494,6 +555,46 @@ fn draw_decoration_line(
     }
 }
 
+
+/// The mark a box's `text-emphasis-style` asks for, with its colour.
+///
+/// The shapes are the characters the spec names (CSS Text Decoration 3 5.5), so the mark is
+/// drawn from the font like any other glyph rather than as a shape of our own.
+fn emphasis_mark(
+    itext: &style::properties::style_structs::InheritedText,
+    text_color: Color,
+) -> Option<EmphasisMark> {
+    let glyph = match &itext.text_emphasis_style {
+        TextEmphasisStyle::None => return None,
+        TextEmphasisStyle::String(string) => string.chars().next()?,
+        TextEmphasisStyle::Keyword { fill, shape } => {
+            use TextEmphasisFillMode::{Filled, Open};
+            use TextEmphasisShapeKeyword::{Circle, Dot, DoubleCircle, Sesame, Triangle};
+            match (fill, shape) {
+                (Filled, Dot) => '\u{2022}',
+                (Open, Dot) => '\u{25E6}',
+                (Filled, Circle) => '\u{25CF}',
+                (Open, Circle) => '\u{25CB}',
+                (Filled, DoubleCircle) => '\u{25C9}',
+                (Open, DoubleCircle) => '\u{25CE}',
+                (Filled, Triangle) => '\u{25B2}',
+                (Open, Triangle) => '\u{25B3}',
+                (Filled, Sesame) => '\u{FE45}',
+                (Open, Sesame) => '\u{FE46}',
+            }
+        }
+    };
+    let color = itext
+        .text_emphasis_color
+        .as_absolute()
+        .map(ToColorColor::as_color_color)
+        .unwrap_or(text_color);
+    Some(EmphasisMark {
+        glyph,
+        color,
+        over: !itext.text_emphasis_position.contains(TextEmphasisPosition::UNDER),
+    })
+}
 
 /// Glyphs waiting for their line's decorations to be painted.
 ///
@@ -946,6 +1047,7 @@ pub(crate) fn stroke_text<'a>(
         glyph_batches,
         win_ascent_ratios,
         vertical_metrics,
+        emphasis_metrics,
     } = context;
     stack.clear();
     path_scratch.clear();
@@ -1321,6 +1423,72 @@ pub(crate) fn stroke_text<'a>(
                 // the spaces between two words stay covered. L4 spells the trimmed set out as
                 // `text-decoration-skip-spaces`, whose L3 default is this.
                 let (ink_start, ink_end) = ink_extent(&glyph_run, layout_text);
+                // `text-emphasis`: a mark over (or under) every character of the box. It is
+                // drawn as a glyph at half the size (CSS Text Decoration 3 5), centred on the
+                // character it belongs to, which is also how the ruby annotations that stand in
+                // for it on a reference page are placed.
+                if let Some(mark) = stack.last().and_then(|entry| entry.emphasis) {
+                    let mark_size = font_size * 0.5;
+                    let mut pen = f64::from(glyph_run.offset());
+                    let mut glyphs = Vec::new();
+                    for cluster in glyph_run.visual_clusters() {
+                        let advance = f64::from(cluster.advance());
+                        let centre = pen + advance / 2.0;
+                        pen += advance;
+                        let is_space = layout_text
+                            .get(cluster.text_range())
+                            .is_some_and(|slice| slice.chars().all(char::is_whitespace));
+                        if is_space {
+                            continue;
+                        }
+                        let Some((glyph_id, advance_ratio, _x_min, y_min, _x_max, y_max)) =
+                            emphasis_glyph(emphasis_metrics, font, mark.glyph)
+                        else {
+                            continue;
+                        };
+
+                        let baseline = f64::from(glyph_run.baseline());
+                        // The mark's box is centred on the edge of the text's ascent (and of
+                        // its descent for `under`), which is where Chrome puts it.
+                        let half = f64::from(mark_size) / 2.0;
+                        let (near, far) = if mark.over {
+                            (
+                                baseline - f64::from(metrics.ascent) - half,
+                                baseline - f64::from(metrics.ascent) + half,
+                            )
+                        } else {
+                            (
+                                baseline + f64::from(metrics.descent) - half,
+                                baseline + f64::from(metrics.descent) + half,
+                            )
+                        };
+                        let ink_centre = (near + far) / 2.0;
+                        // `draw_glyphs` places a glyph by its baseline, and the mark's ink is
+                        // centred on `ink_centre`.
+                        let mark_baseline = ink_centre
+                            + f64::from(y_min + y_max) / 2.0 * f64::from(mark_size);
+                        glyphs.push(anyrender::Glyph {
+                            id: glyph_id as _,
+                            x: (centre - f64::from(advance_ratio * mark_size) / 2.0) as f32,
+                            y: mark_baseline as f32,
+                        });
+                    }
+                    if !glyphs.is_empty() {
+                        glyph_batches.push(GlyphBatch {
+                            font: font.clone(),
+                            font_size: mark_size,
+                            normalized_coords: bytemuck::cast_slice(run.normalized_coords())
+                                .to_vec(),
+                            embolden: kurbo::Vec2::default(),
+                            paint: anyrender::Paint::from(mark.color),
+                            transform,
+                            glyph_xform,
+                            glyphs,
+                        });
+                    }
+                }
+
+
 
                 for entry in stack.iter() {
                     if entry.decoration.is_none() {
