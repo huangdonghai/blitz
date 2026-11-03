@@ -1792,23 +1792,9 @@ pub(crate) fn stroke_text<'a>(
                     }
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
-                    glyph_batches.push(GlyphBatch {
-                        blur: 0.0,
-                        font: font.clone(),
-                        font_size,
-                        normalized_coords: normalized_coords.to_vec(),
-                        embolden,
-                        color: text_color,
-                        paint: anyrender::Paint::from(text_color),
-                        transform: run_transform,
-                        glyph_xform,
-                        glyphs: upright,
-                    });
-                    if !rotated.is_empty() {
-                        // `Affine * Affine` applies the right operand first, so the
-                        // synthesis skew still acts in glyph space.
-                        let turned = Affine::rotate(std::f64::consts::FRAC_PI_2)
-                            * glyph_xform.unwrap_or(Affine::IDENTITY);
+                    // Transparent text paints nothing: a colour glyph (an emoji) would
+                    // otherwise draw itself whatever colour the page asked for.
+                    if text_color.components[3] > 0.0 {
                         glyph_batches.push(GlyphBatch {
                             blur: 0.0,
                             font: font.clone(),
@@ -1816,11 +1802,33 @@ pub(crate) fn stroke_text<'a>(
                             normalized_coords: normalized_coords.to_vec(),
                             embolden,
                             color: text_color,
-                        paint: anyrender::Paint::from(text_color),
-                            transform,
-                            glyph_xform: Some(turned),
-                            glyphs: rotated,
+                            paint: anyrender::Paint::from(text_color),
+                            transform: run_transform,
+                            glyph_xform,
+                            glyphs: upright,
                         });
+                    }
+                    if !rotated.is_empty() {
+                        // `Affine * Affine` applies the right operand first, so the
+                        // synthesis skew still acts in glyph space.
+                        let turned = Affine::rotate(std::f64::consts::FRAC_PI_2)
+                            * glyph_xform.unwrap_or(Affine::IDENTITY);
+                        // Transparent text paints nothing: a colour glyph (an emoji) would
+                        // otherwise draw itself whatever colour the page asked for.
+                        if text_color.components[3] > 0.0 {
+                            glyph_batches.push(GlyphBatch {
+                                blur: 0.0,
+                                font: font.clone(),
+                                font_size,
+                                normalized_coords: normalized_coords.to_vec(),
+                                embolden,
+                                color: text_color,
+                            paint: anyrender::Paint::from(text_color),
+                                transform,
+                                glyph_xform: Some(turned),
+                                glyphs: rotated,
+                            });
+                        }
                     }
                     // The decorations of this run have to land on the glyphs that were
                     // painted, not on the position Parley reported.
@@ -1858,18 +1866,22 @@ pub(crate) fn stroke_text<'a>(
                         });
                     }
 
-                    glyph_batches.push(GlyphBatch {
-                        blur: 0.0,
-                        font: font.clone(),
-                        font_size,
-                        normalized_coords: normalized_coords.to_vec(),
-                        embolden,
-                        color: text_color,
-                        paint: anyrender::Paint::from(text_color),
-                        transform: run_transform,
-                        glyph_xform,
-                        glyphs,
-                    });
+                    // Transparent text paints nothing: a colour glyph (an emoji) would
+                    // otherwise draw itself whatever colour the page asked for.
+                    if text_color.components[3] > 0.0 {
+                        glyph_batches.push(GlyphBatch {
+                            blur: 0.0,
+                            font: font.clone(),
+                            font_size,
+                            normalized_coords: normalized_coords.to_vec(),
+                            embolden,
+                            color: text_color,
+                            paint: anyrender::Paint::from(text_color),
+                            transform: run_transform,
+                            glyph_xform,
+                            glyphs,
+                        });
+                    }
                 }
                 #[cfg(not(feature = "writing-mode"))]
                 {
@@ -1882,18 +1894,22 @@ pub(crate) fn stroke_text<'a>(
                     );
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
-                    glyph_batches.push(GlyphBatch {
-                        blur: 0.0,
-                        font: font.clone(),
-                        font_size,
-                        normalized_coords: normalized_coords.to_vec(),
-                        embolden,
-                        color: text_color,
-                        paint: anyrender::Paint::from(text_color),
-                        transform: run_transform,
-                        glyph_xform,
-                        glyphs: glyphs.collect(),
-                    });
+                    // Transparent text paints nothing: a colour glyph (an emoji) would
+                    // otherwise draw itself whatever colour the page asked for.
+                    if text_color.components[3] > 0.0 {
+                        glyph_batches.push(GlyphBatch {
+                            blur: 0.0,
+                            font: font.clone(),
+                            font_size,
+                            normalized_coords: normalized_coords.to_vec(),
+                            embolden,
+                            color: text_color,
+                            paint: anyrender::Paint::from(text_color),
+                            transform: run_transform,
+                            glyph_xform,
+                            glyphs: glyphs.collect(),
+                        });
+                    }
                 }
 
                 // Accumulate this run's contribution to each decorating box on its ancestor
