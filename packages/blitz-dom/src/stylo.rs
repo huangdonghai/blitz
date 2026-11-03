@@ -529,7 +529,7 @@ impl selectors::Element for BlitzNode<'_> {
         pe: &PseudoElement,
         _context: &mut MatchingContext<Self::Impl>,
     ) -> bool {
-        let pseudo = match self.try_stylo_element_data().and_then(|s| s.get()) {
+        let pseudo = match self.try_stylo_element_data().and_then(|s| s.try_get()) {
             Some(el) => el
                 .styles
                 .get_primary()

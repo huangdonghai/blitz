@@ -56,6 +56,16 @@ impl StyloData {
         self.as_ref().map(|w| w.borrow())
     }
 
+    /// Borrow the element data immutably without panicking when a restyle holds it exclusively.
+    ///
+    /// Selector matching uses this to ask an element whether it is a pseudo-element, a question
+    /// whose answer is the style the restyle is in the middle of replacing; `None` then means
+    /// "no answer yet", not "no such pseudo-element" — the element is restyled again when the
+    /// rules that apply to the pseudo-element change.
+    pub fn try_get(&self) -> Option<ElementDataRef<'_>> {
+        self.as_ref()?.try_borrow()
+    }
+
     /// Borrow the element data mutably, if present.
     pub fn get_mut(&mut self) -> Option<ElementDataMut<'_>> {
         self.as_mut().map(|w| w.borrow_mut())
