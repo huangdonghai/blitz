@@ -932,6 +932,9 @@ fn flush_line_decorations(
     inline_root_id: NodeId,
     metrics: &LineMetrics,
     vertical: Option<&VerticalTextPaint>,
+    line_index: usize,
+    first_line: &HashMap<NodeId, usize>,
+    last_line: &HashMap<NodeId, usize>,
 ) {
     let line_baseline = metrics.baseline;
     // Decorations are positioned in Parley's layout axes, like the glyphs, so a
@@ -1033,7 +1036,7 @@ fn flush_line_decorations(
         // `text-decoration-inset` shortens (or, when negative, extends) the line from the
         // inline-start/end edges. Percentages resolve against the decoration line length
         // (the box's total advance on this line); `auto` is no inset.
-        let (inset_start, inset_end) = match &deco.inset {
+        let (mut inset_start, mut inset_end) = match &deco.inset {
             GenericTextDecorationInset::LengthPercentage { start, end } => {
                 // The extent is in device pixels; convert to CSS pixels so the resolved
                 // result can be scaled back.
@@ -1045,6 +1048,22 @@ fn flush_line_decorations(
             }
             GenericTextDecorationInset::Auto => (0.0, 0.0),
         };
+        // The inset applies at the box's inline start and end, not at every line break: a
+        // decoration that wraps keeps its ends only on the first and last fragment.
+        // A box the map does not know (its decoration reaches the text some other way) keeps
+        // both ends, which is what a single-fragment decoration wants.
+        if first_line
+            .get(&acc.node_id)
+            .is_some_and(|first| *first != line_index)
+        {
+            inset_start = 0.0;
+        }
+        if last_line
+            .get(&acc.node_id)
+            .is_some_and(|last| *last != line_index)
+        {
+            inset_end = 0.0;
+        }
 
         if deco.line.contains(TextDecorationLine::UNDERLINE) {
             let size = decoration_size(
@@ -1308,6 +1327,30 @@ pub(crate) fn stroke_text<'a>(
         vertical_metrics,
         emphasis_metrics,
     } = context;
+    // Which lines each decorating box's decoration covers. `text-decoration-inset` only applies
+    // at the box's first and last fragment (CSS Text Decoration 4 2.3), so a decoration that
+    // wraps has to know whether this line is one of them before it is drawn.
+    let lines: Vec<Line<'a, TextBrush>> = lines.collect();
+    let mut first_line: HashMap<NodeId, usize> = HashMap::new();
+    let mut last_line: HashMap<NodeId, usize> = HashMap::new();
+    for (index, line) in lines.iter().enumerate() {
+        for item in line.items() {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+            let mut walk = doc.get_node(glyph_run.style().brush.id);
+            while let Some(node) = walk {
+                if let Some(styles) = node.primary_styles()
+                    && !styles.get_text().text_decoration_line.is_empty()
+                {
+                    first_line.entry(node.id).or_insert(index);
+                    last_line.insert(node.id, index);
+                }
+                walk = node.parent.and_then(|parent| doc.get_node(parent));
+            }
+        }
+    }
+
     stack.clear();
     path_scratch.clear();
     deco_boxes.clear();
@@ -1340,7 +1383,7 @@ pub(crate) fn stroke_text<'a>(
     // ancestor chain on every run, we cache each node's resolved values here and,
     // for each run, only resolve styles for the nodes newly descended into (popping
     // as we ascend). `path_scratch` is a reusable buffer for the run's node path.
-    for line in lines {
+    for (line_index, line) in lines.iter().enumerate() {
         // A line is a row of text in a horizontal writing mode and a whole
         // column of it in a vertical one, so a paragraph that is only partly on
         // screen otherwise hands the rasterizer every line it has 閳?and a long
@@ -1802,6 +1845,9 @@ pub(crate) fn stroke_text<'a>(
             inline_root_id,
             line.metrics(),
             vertical.as_ref(),
+            line_index,
+            &first_line,
+            &last_line,
         );
 
         // The line's text, over its decorations.
