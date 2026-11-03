@@ -39,6 +39,11 @@ pub struct TextLayout {
     /// breaking (see [`parley::layout::Layout::clear_advances`]), and the painter lifts it above
     /// the character it annotates.
     pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    /// Byte ranges of emphasis marks, with the colour `text-emphasis-color` gives them.
+    ///
+    /// The marks are shaped like text, so the painter needs to know which runs to paint in the
+    /// emphasis colour rather than the text's.
+    pub emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
     /// Vertical writing mode geometry, recorded by each `RunMode::PerformLayout`
     /// run of inline layout. `None` for horizontal writing modes.
     ///

@@ -1043,6 +1043,7 @@ pub(crate) fn find_inline_layout_embedded_boxes(
 struct RubyBuild {
     text_len: usize,
     ranges: Vec<std::ops::Range<usize>>,
+    emphasis: Vec<(std::ops::Range<usize>, crate::util::Color)>,
 }
 
 /// The character an element's `text-emphasis-style` asks for, if any.
@@ -1173,6 +1174,7 @@ pub(crate) fn build_inline_layout_into(
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
     text_layout.ruby_ranges = ruby.ranges;
+    text_layout.emphasis_ranges = ruby.emphasis;
     return;
 
     /// Walk one node, recording the byte range of a ruby annotation's text around it.
@@ -1411,6 +1413,15 @@ pub(crate) fn build_inline_layout_into(
                     .map(|style| style.get_font().font_size.computed_size().px())
                     .unwrap_or(16.0)
                     * scale;
+                // `text-emphasis-color` inherits too; `currentColor` is the text's own colour.
+                let emphasis_color = emphasis_style.map(|style| {
+                    use crate::util::ToColorColor as _;
+                    let itext = style.get_inherited_text();
+                    itext
+                        .text_emphasis_color
+                        .resolve_to_absolute(&itext.color)
+                        .as_color_color()
+                });
                 for character in text.chars() {
                     let mut scratch = [0u8; 4];
                     let piece = character.encode_utf8(&mut scratch);
@@ -1427,6 +1438,9 @@ pub(crate) fn build_inline_layout_into(
                     ruby.text_len += mark.len();
                     builder.pop_style_span();
                     ruby.ranges.push(start..ruby.text_len);
+                    if let Some(color) = emphasis_color {
+                        ruby.emphasis.push((start..ruby.text_len, color));
+                    }
                 }
             }
             NodeData::Comment { .. } => {

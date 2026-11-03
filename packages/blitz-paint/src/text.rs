@@ -1433,6 +1433,14 @@ pub(crate) fn stroke_text<'a>(
         .and_then(|element| element.inline_layout_data.as_ref())
         .map(|data| data.ruby_ranges.clone())
         .unwrap_or_default();
+    // `text-emphasis-color` paints the marks, which are shaped as annotation text and would
+    // otherwise take the text's own colour.
+    let emphasis_colors = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|element| element.inline_layout_data.as_ref())
+        .map(|data| data.emphasis_ranges.clone())
+        .unwrap_or_default();
 
     for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
@@ -1494,7 +1502,17 @@ pub(crate) fn stroke_text<'a>(
 
                 // The glyph colour comes from the run's own node (the stack top): `color`
                 // inherits, so the innermost inline element already carries the right value.
-                let text_color = stack.last().map(|e| e.text_color).unwrap_or(Color::BLACK);
+                let mut text_color = stack.last().map(|e| e.text_color).unwrap_or(Color::BLACK);
+                if let Some(start) = glyph_run
+                    .visual_clusters()
+                    .next()
+                    .map(|cluster| cluster.text_range().start)
+                    && let Some((_, color)) = emphasis_colors
+                        .iter()
+                        .find(|(range, _)| range.start <= start && start < range.end)
+                {
+                    text_color = *color;
+                }
 
                 // `position: relative` shifts a box's painting without moving its layout, and
                 // the shifts of nested boxes add up.
