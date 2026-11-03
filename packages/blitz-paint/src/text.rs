@@ -390,8 +390,8 @@ fn draw_decoration_line(
     // The ends are snapped to whole device pixels, which is what Chrome draws: a decoration is
     // a rule, not a glyph, and leaving it on a fractional advance paints a half-covered column
     // of pixels that the page that builds the same rule out of boxes does not have.
-    let start = (x0 + inset_start).round();
-    let end = (x0 + width - inset_end).round();
+    let start = (x0 + inset_start).floor();
+    let end = (x0 + width - inset_end).ceil();
     let x = start;
     let w = end - start;
     if w <= 0.0 {
