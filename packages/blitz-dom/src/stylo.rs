@@ -59,9 +59,31 @@ use style_dom::ElementState;
 
 use style::values::computed::text::TextAlign as StyloTextAlign;
 
+/// Puts stylo's thread state back however the body exits.
+///
+/// `enter` and `exit` are assertions about what the thread is doing, and the state they assert
+/// on is a thread-local. A page that panics between them used to leave `LAYOUT` set for the rest
+/// of that thread's life, so the next page to style panicked in `enter` and every page after it
+/// did too: one bad page turned into a cascade (a corpus run lost 177 pages to 9 real panics).
+/// A drop guard makes the state unwind with the panic instead.
+struct ThreadStateGuard(ThreadState);
+
+impl ThreadStateGuard {
+    fn enter(state: ThreadState) -> Self {
+        style::thread_state::enter(state);
+        Self(state)
+    }
+}
+
+impl Drop for ThreadStateGuard {
+    fn drop(&mut self) {
+        style::thread_state::exit(self.0);
+    }
+}
+
 impl crate::document::BaseDocument {
     pub fn resolve_stylist(&mut self, now: f64) {
-        style::thread_state::enter(ThreadState::LAYOUT);
+        let _thread_state = ThreadStateGuard::enter(ThreadState::LAYOUT);
 
         let guard = &self.guard;
         let guards = StylesheetGuards {
@@ -180,8 +202,6 @@ impl crate::document::BaseDocument {
 
         // Maybe run garbage collection. Stylo has internal to determine whether to run or not.
         self.stylist.rule_tree().maybe_gc();
-
-        style::thread_state::exit(ThreadState::LAYOUT);
     }
 
     /// Compute the style of an element which the regular style traversal
@@ -198,7 +218,7 @@ impl crate::document::BaseDocument {
             return None;
         }
 
-        style::thread_state::enter(ThreadState::LAYOUT);
+        let _thread_state = ThreadStateGuard::enter(ThreadState::LAYOUT);
 
         let guard = &self.guard;
         let guards = StylesheetGuards {
@@ -222,8 +242,6 @@ impl crate::document::BaseDocument {
             thread_local: &mut thread_local,
         };
         let styles = resolve_style(&mut context, node, RuleInclusion::All, None, None);
-
-        style::thread_state::exit(ThreadState::LAYOUT);
 
         Some(styles.primary().clone())
     }
