@@ -1431,7 +1431,7 @@ pub(crate) fn build_inline_layout_into(
                     builder.push_text(piece);
                     ruby.text_len += piece.len();
                     use icu_properties::props::GeneralCategory as Category;
-                    if matches!(
+                    if character.is_whitespace() || matches!(
                         category.get(character),
                         Category::ConnectorPunctuation
                             | Category::DashPunctuation
