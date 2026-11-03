@@ -302,6 +302,11 @@ struct LineDecoration {
     deco: ResolvedDecoration,
     min_x: f64,
     max_x: f64,
+    /// Inline position of the first glyph this box covers, and the end of the last one. The
+    /// decoration runs from glyph to glyph (CSS Text Decoration 3 2), so spaces that only pad
+    /// the box's edges are outside it.
+    first_ink_x: Option<f64>,
+    last_ink_end: Option<f64>,
     /// Geometry from a run whose innermost node is the decorating box itself.
     own: Option<DecorationRunGeometry>,
     /// Geometry from the first run the box covers (fallback when it has no own text on
@@ -478,6 +483,33 @@ fn draw_decoration_line(
 }
 
 
+/// Where a run's glyphs start and end along the inline axis, in device pixels.
+///
+/// A decoration runs from the box's first glyph to its last (CSS Text Decoration 3 2), so the
+/// whitespace that only pads the box's edges is not covered, while a space between two words is
+/// inside the run and stays covered. Whether a cluster is a space is a question for its text: a
+/// glyph does not carry one, so the cluster's range is looked up in the line's text.
+fn ink_extent(
+    glyph_run: &parley::layout::GlyphRun<'_, TextBrush>,
+    text: &str,
+) -> (Option<f64>, Option<f64>) {
+    let mut pen = f64::from(glyph_run.offset());
+    let mut first = None;
+    let mut end = None;
+    for cluster in glyph_run.visual_clusters() {
+        let width = f64::from(cluster.advance());
+        let is_space = text
+            .get(cluster.text_range())
+            .is_some_and(|slice| slice.chars().all(char::is_whitespace));
+        if !is_space {
+            first.get_or_insert(pen);
+            end = Some(pen + width);
+        }
+        pen += width;
+    }
+    (first, end)
+}
+
 /// How far past its line box the ink of a decorated line can reach, in device pixels.
 ///
 /// The thickest decoration in the inline root's subtree, plus the largest underline offset and
@@ -582,14 +614,11 @@ fn flush_line_decorations(
         let geom = match (&acc.own, &acc.first) {
             (Some(own), _) => own.clone(),
             (None, Some(first)) => {
-                let mut geom = first.clone();
-                // A descendant run's baseline may be shifted by `vertical-align`, but the
-                // decoration is positioned from the decorating box's own baseline. For the
-                // inline root that is the line's baseline.
-                if acc.node_id == inline_root_id {
-                    geom.baseline = line_baseline;
-                }
-                geom
+                // The box's decoration is positioned from the baseline of its own text. Taking
+                // the line box's baseline instead put a block's underline a pixel off the same
+                // text inside a span (the strut and the run round their ascent differently),
+                // and two pages that put the decoration on different boxes have to agree.
+                first.clone()
             }
             (None, None) => continue,
         };
@@ -612,7 +641,9 @@ fn flush_line_decorations(
                 acc.max_x
             );
         }
-        let width = acc.max_x - acc.min_x;
+        let min_x = acc.first_ink_x.unwrap_or(acc.min_x);
+        let max_x = acc.last_ink_end.unwrap_or(acc.max_x);
+        let width = max_x - min_x;
         if width <= 0.0 {
             continue;
         }
@@ -673,7 +704,7 @@ fn flush_line_decorations(
                 scene,
                 transform,
                 scale,
-                acc.min_x,
+                min_x,
                 width,
                 geom.baseline + baseline_shift,
                 offset,
@@ -714,7 +745,7 @@ fn flush_line_decorations(
                 scene,
                 transform,
                 scale,
-                acc.min_x,
+                min_x,
                 width,
                 geom.baseline + baseline_shift,
                 offset,
@@ -752,7 +783,7 @@ fn flush_line_decorations(
                 scene,
                 transform,
                 scale,
-                acc.min_x,
+                min_x,
                 width,
                 geom.baseline + baseline_shift,
                 offset,
@@ -1243,6 +1274,12 @@ pub(crate) fn stroke_text<'a>(
                 };
                 let run_node_id = style.brush.id;
 
+                // A decoration runs from the box's first glyph to its last (CSS Text
+                // Decoration 3 2), so spaces that only pad the box's edges are outside it while
+                // the spaces between two words stay covered. L4 spells the trimmed set out as
+                // `text-decoration-skip-spaces`, whose L3 default is this.
+                let (ink_start, ink_end) = ink_extent(&glyph_run, layout_text);
+
                 for entry in stack.iter() {
                     if entry.decoration.is_none() {
                         continue;
@@ -1255,6 +1292,8 @@ pub(crate) fn stroke_text<'a>(
                                 deco: entry.decoration.clone().unwrap(),
                                 min_x: f64::INFINITY,
                                 max_x: f64::NEG_INFINITY,
+                                first_ink_x: None,
+                                last_ink_end: None,
                                 own: None,
                                 first: None,
                             });
@@ -1264,6 +1303,14 @@ pub(crate) fn stroke_text<'a>(
                     let acc = &mut deco_boxes[idx];
                     acc.min_x = acc.min_x.min(run_x0);
                     acc.max_x = acc.max_x.max(run_x1);
+                    if acc.first_ink_x.is_none()
+                        && let Some(start) = ink_start
+                    {
+                        acc.first_ink_x = Some(start);
+                    }
+                    if let Some(end) = ink_end {
+                        acc.last_ink_end = Some(end);
+                    }
                     if acc.first.is_none() {
                         acc.first = Some(geometry.clone());
                     }
