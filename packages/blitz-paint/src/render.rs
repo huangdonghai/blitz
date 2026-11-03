@@ -964,12 +964,19 @@ impl ElementCx<'_, '_> {
 
             // Render inline element backgrounds (e.g. `<span style="background: ...">`)
             // behind the text and selection highlight.
+            #[cfg(feature = "writing-mode")]
+            let vertical =
+                crate::text::vertical_text(self.context.dom, self.node.id, self.scale);
+            #[cfg(not(feature = "writing-mode"))]
+            let vertical = None;
+
             crate::text::draw_inline_backgrounds(
                 scene,
                 text_layout.layout.lines(),
                 self.context.dom,
                 transform,
                 self.node.id,
+                vertical.as_ref(),
             );
 
             // Render text selection highlight (if any) using cached selection ranges

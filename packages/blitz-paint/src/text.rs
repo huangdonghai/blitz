@@ -32,7 +32,20 @@ pub(crate) fn draw_inline_backgrounds<'a>(
     doc: &BaseDocument,
     transform: Affine,
     inline_root_id: NodeId,
+    vertical: Option<&VerticalTextPaint>,
 ) {
+    // The rectangles are built in Parley's axes, like the glyphs, so a vertical inline root
+    // has to map them onto physical space the same way. Without that the box of an inline
+    // `background` lands next to the column instead of under its own text - on the sample
+    // book page a highlighted character (`<span class="kong">`) had no background under it.
+    #[cfg(feature = "writing-mode")]
+    let transform = match vertical {
+        Some(vertical) => transform * vertical_transform(vertical),
+        None => transform,
+    };
+    #[cfg(not(feature = "writing-mode"))]
+    let _ = vertical;
+
     for line in lines {
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
@@ -62,8 +75,20 @@ pub(crate) fn draw_inline_backgrounds<'a>(
             let x = glyph_run.offset() as f64;
             let w = glyph_run.advance() as f64;
             let baseline = glyph_run.baseline() as f64;
-            let y0 = baseline - metrics.ascent as f64;
-            let y1 = baseline + metrics.descent as f64;
+            // Upright text is set in a square cell centred on the line's central baseline, so
+            // the font's horizontal ascent and descent say nothing about the block axis: the
+            // box spans the line box instead, as it does in Chrome.
+            let (y0, y1) = if vertical.is_some() {
+                (
+                    f64::from(line.metrics().block_min_coord),
+                    f64::from(line.metrics().block_max_coord),
+                )
+            } else {
+                (
+                    baseline - f64::from(metrics.ascent),
+                    baseline + f64::from(metrics.descent),
+                )
+            };
             let rect = Rect::new(x, y0, x + w, y1);
 
             scene.fill(Fill::NonZero, transform, bg_color, None, &rect);
