@@ -384,8 +384,14 @@ fn draw_decoration_line(
 ) {
     // Inset the line from the box's start/end edges (inline-start is the left edge in
     // Parley's horizontal axes). Negative insets extend the line past the text.
-    let x = x0 + inset_start;
-    let w = width - inset_start - inset_end;
+    //
+    // The ends are snapped to whole device pixels, which is what Chrome draws: a decoration is
+    // a rule, not a glyph, and leaving it on a fractional advance paints a half-covered column
+    // of pixels that the page that builds the same rule out of boxes does not have.
+    let start = (x0 + inset_start).round();
+    let end = (x0 + width - inset_end).round();
+    let x = start;
+    let w = end - start;
     if w <= 0.0 {
         return;
     }
@@ -395,6 +401,10 @@ fn draw_decoration_line(
     // mirrored about the baseline so it still sits on the same physical side.
     let size = size as f64;
     let y = f64::from(baseline) - block_sign * (f64::from(offset) - size / 2.0);
+    // The thickness is whole pixels (`decoration_size` floors it), so snapping the near edge
+    // makes both of them whole: a rule left on a fractional baseline paints two half-covered
+    // rows, which is lighter than the integer-height box a reference page would draw for it.
+    let y = (y - size / 2.0).round() + size / 2.0;
     if std::env::var_os("CUOTUO_DEBUG_DECO").is_some() {
         let p0 = transform * kurbo::Point::new(x, y);
         let p1 = transform * kurbo::Point::new(x + w, y);
