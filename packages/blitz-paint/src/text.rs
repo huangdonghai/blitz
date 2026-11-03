@@ -949,8 +949,7 @@ fn flush_line_decorations(
     metrics: &LineMetrics,
     vertical: Option<&VerticalTextPaint>,
     line_index: usize,
-    first_line: &HashMap<NodeId, usize>,
-    last_line: &HashMap<NodeId, usize>,
+    fragments: &HashMap<NodeId, Vec<(usize, f64, f64)>>,
 ) {
     let line_baseline = metrics.baseline;
     // Decorations are positioned in Parley's layout axes, like the glyphs, so a
@@ -1049,13 +1048,17 @@ fn flush_line_decorations(
         };
 
         // `text-decoration-inset` shortens (or, when negative, extends) the line from the
-        // inline-start/end edges. Percentages resolve against the decoration line length
-        // (the box's total advance on this line); `auto` is no inset.
+        // inline-start/end edges. A percentage resolves against the whole decoration — every
+        // fragment the box covers — not against the one line being drawn; `auto` is no inset.
+        let fragments = fragments.get(&acc.node_id);
+        let total: f64 = fragments
+            .map(|fragments| fragments.iter().map(|(_, start, end)| end - start).sum())
+            .unwrap_or(width);
         let (mut inset_start, mut inset_end) = match &deco.inset {
             GenericTextDecorationInset::LengthPercentage { start, end } => {
                 // The extent is in device pixels; convert to CSS pixels so the resolved
                 // result can be scaled back.
-                let line_length = Length::new((width / scale) as f32);
+                let line_length = Length::new((total.max(width) / scale) as f32);
                 (
                     start.resolve(line_length).px() as f64 * scale,
                     end.resolve(line_length).px() as f64 * scale,
@@ -1065,19 +1068,36 @@ fn flush_line_decorations(
         };
         // The inset applies at the box's inline start and end, not at every line break: a
         // decoration that wraps keeps its ends only on the first and last fragment.
-        // A box the map does not know (its decoration reaches the text some other way) keeps
-        // both ends, which is what a single-fragment decoration wants.
-        if first_line
-            .get(&acc.node_id)
-            .is_some_and(|first| *first != line_index)
-        {
-            inset_start = 0.0;
-        }
-        if last_line
-            .get(&acc.node_id)
-            .is_some_and(|last| *last != line_index)
-        {
-            inset_end = 0.0;
+        // The inset is one offset from the start of the whole decoration and one from its end,
+        // measured along the fragments in order (CSS Text Decoration 4 2.3): an inset longer
+        // than a fragment carries into the next, which is how a percentage can consume the
+        // first line and bite into the second. A box the map does not know keeps both ends,
+        // which is what a single-fragment decoration wants.
+        if let Some(fragments) = fragments {
+            let mut along = 0.0;
+            for (line, start, end) in fragments {
+                let width = end - start;
+                if *line == line_index {
+                    // A negative inset extends the decoration past its end, but only at the
+                    // decoration's own ends: an inner fragment stays where it is.
+                    let keep_from = inset_start;
+                    let keep_to = total - inset_end;
+                    let local_start = keep_from - along;
+                    let local_end = keep_to - along;
+                    inset_start = if along == 0.0 {
+                        local_start
+                    } else {
+                        local_start.max(0.0)
+                    };
+                    inset_end = if along + width >= total {
+                        width - local_end
+                    } else {
+                        width - local_end.min(width)
+                    };
+                    break;
+                }
+                along += width;
+            }
         }
 
         // A `text-shadow` is painted under the decoration as well as under the text
@@ -1370,8 +1390,18 @@ pub(crate) fn stroke_text<'a>(
     // at the box's first and last fragment (CSS Text Decoration 4 2.3), so a decoration that
     // wraps has to know whether this line is one of them before it is drawn.
     let lines: Vec<Line<'a, TextBrush>> = lines.collect();
-    let mut first_line: HashMap<NodeId, usize> = HashMap::new();
-    let mut last_line: HashMap<NodeId, usize> = HashMap::new();
+    // Each decorating box's fragments, in order: `(line index, inline start, inline end)`.
+    // `text-decoration-inset` is measured along the whole decoration, so a fragment has to
+    // know how far along it sits.
+    let mut fragments: HashMap<NodeId, Vec<(usize, f64, f64)>> = HashMap::new();
+    // The painter measures a box from its first glyph to its last, so the pre-pass does the
+    // same: a trailing space is outside the decoration and must not count towards its length.
+    let text: &str = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|data| data.inline_layout_data.as_ref())
+        .map(|layout| layout.text.as_str())
+        .unwrap_or_default();
     for (index, line) in lines.iter().enumerate() {
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
@@ -1382,8 +1412,17 @@ pub(crate) fn stroke_text<'a>(
                 if let Some(styles) = node.primary_styles()
                     && !styles.get_text().text_decoration_line.is_empty()
                 {
-                    first_line.entry(node.id).or_insert(index);
-                    last_line.insert(node.id, index);
+                    let (ink_start, ink_end) = ink_extent(&glyph_run, text);
+                    let start = ink_start.unwrap_or_else(|| f64::from(glyph_run.offset()));
+                    let end = ink_end
+                        .unwrap_or_else(|| f64::from(glyph_run.offset() + glyph_run.advance()));
+                    let list = fragments.entry(node.id).or_default();
+                    match list.last_mut() {
+                        Some((line, _, last_end)) if *line == index => {
+                            *last_end = last_end.max(end);
+                        }
+                        _ => list.push((index, start, end)),
+                    }
                 }
                 walk = node.parent.and_then(|parent| doc.get_node(parent));
             }
@@ -1907,8 +1946,7 @@ pub(crate) fn stroke_text<'a>(
             line.metrics(),
             vertical.as_ref(),
             line_index,
-            &first_line,
-            &last_line,
+            &fragments,
         );
 
         // The line's text, over its decorations.
