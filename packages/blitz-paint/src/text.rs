@@ -251,6 +251,9 @@ struct ResolvedDecoration {
     underline_offset: Option<LengthPercentage>,
     /// Whether `text-underline-position: under` is in effect.
     underline_under: bool,
+    /// Whether `text-underline-position: right` is in effect. A vertical writing mode puts the
+    /// line on a side of the text, and `right` asks for the other one.
+    underline_right: bool,
     /// Whether `text-underline-position: from-font` is in effect.
     underline_from_font: bool,
     /// `text-decoration-inset`. Resolved per run.
@@ -367,6 +370,9 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             underline_under: itext
                 .text_underline_position
                 .contains(TextUnderlinePosition::UNDER),
+            underline_right: itext
+                .text_underline_position
+                .contains(TextUnderlinePosition::RIGHT),
             underline_from_font: itext
                 .text_underline_position
                 .contains(TextUnderlinePosition::FROM_FONT),
@@ -503,6 +509,7 @@ fn draw_decoration_line(
     deco_style: TextDecorationStyle,
     inset_start: f64,
     inset_end: f64,
+    mirror: bool,
 ) {
     // Inset the line from the box's start/end edges (inline-start is the left edge in
     // Parley's horizontal axes). Negative insets extend the line past the text.
@@ -527,6 +534,13 @@ fn draw_decoration_line(
     // makes both of them whole: a rule left on a fractional baseline paints two half-covered
     // rows, which is lighter than the integer-height box a reference page would draw for it.
     let y = (y - size / 2.0).round() + size / 2.0;
+    // In a vertical writing mode the line sits on a side of the text; `right` asks for the side
+    // the default does not pick, which is the drawn position mirrored about the baseline.
+    let y = if mirror {
+        2.0 * f64::from(baseline) - y
+    } else {
+        y
+    };
     if std::env::var_os("CUOTUO_DEBUG_DECO").is_some() {
         let p0 = transform * kurbo::Point::new(x, y);
         let p1 = transform * kurbo::Point::new(x + w, y);
@@ -1123,6 +1137,7 @@ fn flush_line_decorations(
                 deco.style,
                 inset_start,
                 inset_end,
+                vertical.is_some() && deco.underline_right,
             );
         }
         if deco.line.contains(TextDecorationLine::OVERLINE) {
@@ -1164,6 +1179,7 @@ fn flush_line_decorations(
                 deco.style,
                 inset_start,
                 inset_end,
+                vertical.is_some() && deco.underline_right,
             );
         }
         if deco.line.contains(TextDecorationLine::LINE_THROUGH) {
@@ -1202,6 +1218,7 @@ fn flush_line_decorations(
                 deco.style,
                 inset_start,
                 inset_end,
+                vertical.is_some() && deco.underline_right,
             );
         }
     }
