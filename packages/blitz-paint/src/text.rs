@@ -321,6 +321,7 @@ pub(crate) struct DrawTextContext {
     stack: Vec<DecorationStackEntry>,
     path_scratch: Vec<NodeId>,
     deco_boxes: Vec<LineDecoration>,
+    glyph_batches: Vec<GlyphBatch>,
     win_ascent_ratios: WinAscentCache,
     vertical_metrics: VerticalMetricsCache,
 }
@@ -492,6 +493,24 @@ fn draw_decoration_line(
     }
 }
 
+
+/// Glyphs waiting for their line's decorations to be painted.
+///
+/// A decoration is painted *before* the text it belongs to: a 20 px underline sitting on the
+/// baseline is covered by the glyphs, not painted over them, which is what Chrome draws and
+/// what a reference page that builds the same picture out of boxes has. The decoration
+/// geometry is only complete once every run of the line has been walked, so the drawing calls
+/// are queued with what they need and issued after `flush_line_decorations`.
+struct GlyphBatch {
+    font: parley::FontData,
+    font_size: f32,
+    normalized_coords: Vec<i16>,
+    embolden: kurbo::Vec2,
+    paint: anyrender::Paint,
+    transform: Affine,
+    glyph_xform: Option<Affine>,
+    glyphs: Vec<anyrender::Glyph>,
+}
 
 /// Where a run's glyphs start and end along the inline axis, in device pixels.
 ///
@@ -923,6 +942,7 @@ pub(crate) fn stroke_text<'a>(
         stack,
         path_scratch,
         deco_boxes,
+        glyph_batches,
         win_ascent_ratios,
         vertical_metrics,
     } = context;
@@ -991,6 +1011,9 @@ pub(crate) fn stroke_text<'a>(
         // this line, carried from run to run (see the upright branch below).
         #[cfg(feature = "writing-mode")]
         let mut pen_delta = 0.0f32;
+
+        // Glyphs of this line, drawn once its decorations are in the scene.
+        glyph_batches.clear();
 
         for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
@@ -1186,37 +1209,31 @@ pub(crate) fn stroke_text<'a>(
                     }
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
-                    scene.draw_glyphs(
-                        font,
+                    glyph_batches.push(GlyphBatch {
+                        font: font.clone(),
                         font_size,
-                        !FONT_EMBOLDEN_ENABLED, // hint
-                        normalized_coords,
+                        normalized_coords: normalized_coords.to_vec(),
                         embolden,
-                        Fill::NonZero,
-                        &anyrender::Paint::from(text_color),
-                        1.0, // alpha
+                        paint: anyrender::Paint::from(text_color),
                         transform,
                         glyph_xform,
-                        upright.into_iter(),
-                    );
+                        glyphs: upright,
+                    });
                     if !rotated.is_empty() {
                         // `Affine * Affine` applies the right operand first, so the
                         // synthesis skew still acts in glyph space.
                         let turned = Affine::rotate(std::f64::consts::FRAC_PI_2)
                             * glyph_xform.unwrap_or(Affine::IDENTITY);
-                        scene.draw_glyphs(
-                            font,
+                        glyph_batches.push(GlyphBatch {
+                            font: font.clone(),
                             font_size,
-                            !FONT_EMBOLDEN_ENABLED, // hint
-                            normalized_coords,
+                            normalized_coords: normalized_coords.to_vec(),
                             embolden,
-                            Fill::NonZero,
-                            &anyrender::Paint::from(text_color),
-                            1.0, // alpha
+                            paint: anyrender::Paint::from(text_color),
                             transform,
-                            Some(turned),
-                            rotated.into_iter(),
-                        );
+                            glyph_xform: Some(turned),
+                            glyphs: rotated,
+                        });
                     }
                     // The decorations of this run have to land on the glyphs that were
                     // painted, not on the position Parley reported.
@@ -1229,19 +1246,16 @@ pub(crate) fn stroke_text<'a>(
                         y: glyph.y,
                     });
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
-                    scene.draw_glyphs(
-                        font,
+                    glyph_batches.push(GlyphBatch {
+                        font: font.clone(),
                         font_size,
-                        !FONT_EMBOLDEN_ENABLED, // hint
-                        normalized_coords,
+                        normalized_coords: normalized_coords.to_vec(),
                         embolden,
-                        Fill::NonZero,
-                        &anyrender::Paint::from(text_color),
-                        1.0, // alpha
+                        paint: anyrender::Paint::from(text_color),
                         transform,
                         glyph_xform,
-                        glyphs,
-                    );
+                        glyphs: glyphs.collect(),
+                    });
                 }
                 #[cfg(not(feature = "writing-mode"))]
                 {
@@ -1252,19 +1266,16 @@ pub(crate) fn stroke_text<'a>(
                     });
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
-                    scene.draw_glyphs(
-                        font,
+                    glyph_batches.push(GlyphBatch {
+                        font: font.clone(),
                         font_size,
-                        !FONT_EMBOLDEN_ENABLED, // hint
-                        normalized_coords,
+                        normalized_coords: normalized_coords.to_vec(),
                         embolden,
-                        Fill::NonZero,
-                        &anyrender::Paint::from(text_color),
-                        1.0, // alpha
+                        paint: anyrender::Paint::from(text_color),
                         transform,
                         glyph_xform,
-                        glyphs,
-                    );
+                        glyphs: glyphs.collect(),
+                    });
                 }
 
                 // Accumulate this run's contribution to each decorating box on its ancestor
@@ -1343,6 +1354,23 @@ pub(crate) fn stroke_text<'a>(
             line.metrics(),
             vertical.as_ref(),
         );
+
+        // The line's text, over its decorations.
+        for batch in glyph_batches.drain(..) {
+            scene.draw_glyphs(
+                &batch.font,
+                batch.font_size,
+                !FONT_EMBOLDEN_ENABLED, // hint
+                &batch.normalized_coords,
+                batch.embolden,
+                Fill::NonZero,
+                &batch.paint,
+                1.0, // alpha
+                batch.transform,
+                batch.glyph_xform,
+                batch.glyphs.into_iter(),
+            );
+        }
     }
 }
 
