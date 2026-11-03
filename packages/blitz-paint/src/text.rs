@@ -696,6 +696,8 @@ fn resolve_shadows(itext: &style::properties::style_structs::InheritedText) -> V
 /// are queued with what they need and issued after `flush_line_decorations`.
 struct GlyphBatch {
     font: parley::FontData,
+    /// The colour the glyphs are painted in, kept so a blurred copy can fade it.
+    color: Color,
     /// The blur radius to draw this batch through, or 0 for sharp glyphs.
     blur: f64,
     font_size: f32,
@@ -917,19 +919,51 @@ fn draw_glyph_batches(scene: &mut impl PaintScene, batches: impl Iterator<Item =
             );
         });
 
-        scene.draw_glyphs(
-            &batch.font,
-            batch.font_size,
-            !FONT_EMBOLDEN_ENABLED, // hint
-            &batch.normalized_coords,
-            batch.embolden,
-            Fill::NonZero,
-            &batch.paint,
-            1.0, // alpha
-            batch.transform,
-            batch.glyph_xform,
-            batch.glyphs.into_iter(),
-        );
+        // The rasterizer cannot blur a layer yet (its `filters` feature panics on the
+        // primitives it has not implemented), so a shadow with a radius is drawn as a small
+        // grid of offset copies: nine of them at a ninth of the alpha read as a blur at the
+        // sizes text shadows use.
+        let copies: &[(f64, f64, f32)] = if batch.blur > 0.0 {
+            &[
+                (-1.0, -1.0, 1.0 / 9.0),
+                (0.0, -1.0, 1.0 / 9.0),
+                (1.0, -1.0, 1.0 / 9.0),
+                (-1.0, 0.0, 1.0 / 9.0),
+                (0.0, 0.0, 1.0 / 9.0),
+                (1.0, 0.0, 1.0 / 9.0),
+                (-1.0, 1.0, 1.0 / 9.0),
+                (0.0, 1.0, 1.0 / 9.0),
+                (1.0, 1.0, 1.0 / 9.0),
+            ]
+        } else {
+            &[(0.0, 0.0, 1.0)]
+        };
+        for (dx, dy, alpha) in copies {
+            let transform = if *dx == 0.0 && *dy == 0.0 {
+                batch.transform
+            } else {
+                batch.transform
+                    * Affine::translate((dx * batch.blur / 2.0, dy * batch.blur / 2.0))
+            };
+            let paint = if *alpha == 1.0 {
+                batch.paint.clone()
+            } else {
+                anyrender::Paint::from(batch.color.with_alpha(*alpha))
+            };
+            scene.draw_glyphs(
+                &batch.font,
+                batch.font_size,
+                !FONT_EMBOLDEN_ENABLED, // hint
+                &batch.normalized_coords,
+                batch.embolden,
+                Fill::NonZero,
+                &paint,
+                1.0, // alpha
+                transform,
+                batch.glyph_xform,
+                batch.glyphs.iter().copied(),
+            );
+        }
 
         if layer.is_some() {
             scene.pop_layer();
@@ -1764,6 +1798,7 @@ pub(crate) fn stroke_text<'a>(
                         font_size,
                         normalized_coords: normalized_coords.to_vec(),
                         embolden,
+                        color: text_color,
                         paint: anyrender::Paint::from(text_color),
                         transform: run_transform,
                         glyph_xform,
@@ -1780,7 +1815,8 @@ pub(crate) fn stroke_text<'a>(
                             font_size,
                             normalized_coords: normalized_coords.to_vec(),
                             embolden,
-                            paint: anyrender::Paint::from(text_color),
+                            color: text_color,
+                        paint: anyrender::Paint::from(text_color),
                             transform,
                             glyph_xform: Some(turned),
                             glyphs: rotated,
@@ -1814,6 +1850,7 @@ pub(crate) fn stroke_text<'a>(
                             font_size,
                             normalized_coords: normalized_coords.to_vec(),
                             embolden,
+                            color: shadow.color,
                             paint: anyrender::Paint::from(shadow.color),
                             transform: run_transform * offset,
                             glyph_xform,
@@ -1827,6 +1864,7 @@ pub(crate) fn stroke_text<'a>(
                         font_size,
                         normalized_coords: normalized_coords.to_vec(),
                         embolden,
+                        color: text_color,
                         paint: anyrender::Paint::from(text_color),
                         transform: run_transform,
                         glyph_xform,
@@ -1850,6 +1888,7 @@ pub(crate) fn stroke_text<'a>(
                         font_size,
                         normalized_coords: normalized_coords.to_vec(),
                         embolden,
+                        color: text_color,
                         paint: anyrender::Paint::from(text_color),
                         transform: run_transform,
                         glyph_xform,
