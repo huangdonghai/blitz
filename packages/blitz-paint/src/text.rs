@@ -644,7 +644,7 @@ fn glyph_advance(font: &parley::FontData, glyph_id: u32) -> f64 {
 /// the line's ascent, the same place `text-emphasis` puts its marks.
 fn run_glyphs(
     glyph_run: &parley::layout::GlyphRun<'_, TextBrush>,
-    doc: &BaseDocument,
+    annotations: &[std::ops::Range<usize>],
     ascent: f64,
     baseline: f64,
     base_centre: &mut Option<f64>,
@@ -660,10 +660,15 @@ fn run_glyphs(
             .collect::<Vec<_>>()
     };
 
-    let is_annotation = doc
-        .get_node(glyph_run.style().brush.id)
-        .and_then(|node| node.element_data())
-        .is_some_and(|element| matches!(&*element.name.local, "rt" | "rtc"));
+    let is_annotation = glyph_run
+        .visual_clusters()
+        .next()
+        .map(|cluster| cluster.text_range().start)
+        .is_some_and(|start| {
+            annotations
+                .iter()
+                .any(|range| range.start <= start && start < range.end)
+        });
     if !is_annotation {
         let mut pen = f64::from(glyph_run.offset());
         let mut last = None;
@@ -1219,7 +1224,16 @@ pub(crate) fn stroke_text<'a>(
         // annotation is drawn over it.
         let mut base_centre: Option<f64> = None;
 
-        for item in line.items() {
+        // An annotation is text the layout recorded as taking no room in the line: a `<rt>` element
+    // or an emphasis mark, both of which are drawn over the character they belong to.
+    let annotations = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|element| element.inline_layout_data.as_ref())
+        .map(|data| data.ruby_ranges.clone())
+        .unwrap_or_default();
+
+    for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
                 let run = glyph_run.run();
                 let font = run.font();
@@ -1466,7 +1480,7 @@ pub(crate) fn stroke_text<'a>(
                 } else {
                     let glyphs = run_glyphs(
                         &glyph_run,
-                        doc,
+                        &annotations,
                         f64::from(metrics.ascent),
                         f64::from(glyph_run.baseline()),
                         &mut base_centre,
@@ -1487,7 +1501,7 @@ pub(crate) fn stroke_text<'a>(
                 {
                     let glyphs = run_glyphs(
                         &glyph_run,
-                        doc,
+                        &annotations,
                         f64::from(metrics.ascent),
                         f64::from(glyph_run.baseline()),
                         &mut base_centre,
@@ -1528,70 +1542,6 @@ pub(crate) fn stroke_text<'a>(
                 // the spaces between two words stay covered. L4 spells the trimmed set out as
                 // `text-decoration-skip-spaces`, whose L3 default is this.
                 let (ink_start, ink_end) = ink_extent(&glyph_run, layout_text);
-                // `text-emphasis`: a mark over (or under) every character of the box. It is
-                // drawn as a glyph at half the size (CSS Text Decoration 3 5), centred on the
-                // character it belongs to, which is also how the ruby annotations that stand in
-                // for it on a reference page are placed.
-                if let Some(mark) = stack.last().and_then(|entry| entry.emphasis) {
-                    let mark_size = font_size * 0.5;
-                    let mut pen = f64::from(glyph_run.offset());
-                    let mut glyphs = Vec::new();
-                    for cluster in glyph_run.visual_clusters() {
-                        let advance = f64::from(cluster.advance());
-                        let centre = pen + advance / 2.0;
-                        pen += advance;
-                        let is_space = layout_text
-                            .get(cluster.text_range())
-                            .is_some_and(|slice| slice.chars().all(char::is_whitespace));
-                        if is_space {
-                            continue;
-                        }
-                        let Some((glyph_id, advance_ratio, _x_min, y_min, _x_max, y_max)) =
-                            emphasis_glyph(emphasis_metrics, font, mark.glyph)
-                        else {
-                            continue;
-                        };
-
-                        let baseline = f64::from(glyph_run.baseline());
-                        // The mark's box is centred on the edge of the text's ascent (and of
-                        // its descent for `under`), which is where Chrome puts it.
-                        let half = f64::from(mark_size) / 2.0;
-                        let (near, far) = if mark.over {
-                            (
-                                baseline - f64::from(metrics.ascent) - half,
-                                baseline - f64::from(metrics.ascent) + half,
-                            )
-                        } else {
-                            (
-                                baseline + f64::from(metrics.descent) - half,
-                                baseline + f64::from(metrics.descent) + half,
-                            )
-                        };
-                        let ink_centre = (near + far) / 2.0;
-                        // `draw_glyphs` places a glyph by its baseline, and the mark's ink is
-                        // centred on `ink_centre`.
-                        let mark_baseline = ink_centre
-                            + f64::from(y_min + y_max) / 2.0 * f64::from(mark_size);
-                        glyphs.push(anyrender::Glyph {
-                            id: glyph_id as _,
-                            x: (centre - f64::from(advance_ratio * mark_size) / 2.0) as f32,
-                            y: mark_baseline as f32,
-                        });
-                    }
-                    if !glyphs.is_empty() {
-                        glyph_batches.push(GlyphBatch {
-                            font: font.clone(),
-                            font_size: mark_size,
-                            normalized_coords: bytemuck::cast_slice(run.normalized_coords())
-                                .to_vec(),
-                            embolden: kurbo::Vec2::default(),
-                            paint: anyrender::Paint::from(mark.color),
-                            transform,
-                            glyph_xform,
-                            glyphs,
-                        });
-                    }
-                }
 
 
 

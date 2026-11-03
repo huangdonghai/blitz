@@ -1045,6 +1045,32 @@ struct RubyBuild {
     ranges: Vec<std::ops::Range<usize>>,
 }
 
+/// The character an element's `text-emphasis-style` asks for, if any.
+///
+/// The shapes are the ones CSS Text Decoration 3 5.5 names, so the mark is a glyph like any
+/// other and is shaped with the page's own font fallback.
+fn emphasis_char(styles: &style::properties::ComputedValues) -> Option<char> {
+    use style::values::computed::TextEmphasisStyle;
+    use style::values::specified::text::{TextEmphasisFillMode, TextEmphasisShapeKeyword};
+
+    match &styles.get_inherited_text().text_emphasis_style {
+        TextEmphasisStyle::None => None,
+        TextEmphasisStyle::String(string) => string.chars().next(),
+        TextEmphasisStyle::Keyword { fill, shape } => Some(match (fill, shape) {
+            (TextEmphasisFillMode::Filled, TextEmphasisShapeKeyword::Dot) => '\u{2022}',
+            (TextEmphasisFillMode::Open, TextEmphasisShapeKeyword::Dot) => '\u{25E6}',
+            (TextEmphasisFillMode::Filled, TextEmphasisShapeKeyword::Circle) => '\u{25CF}',
+            (TextEmphasisFillMode::Open, TextEmphasisShapeKeyword::Circle) => '\u{25CB}',
+            (TextEmphasisFillMode::Filled, TextEmphasisShapeKeyword::DoubleCircle) => '\u{25C9}',
+            (TextEmphasisFillMode::Open, TextEmphasisShapeKeyword::DoubleCircle) => '\u{25CE}',
+            (TextEmphasisFillMode::Filled, TextEmphasisShapeKeyword::Triangle) => '\u{25B2}',
+            (TextEmphasisFillMode::Open, TextEmphasisShapeKeyword::Triangle) => '\u{25B3}',
+            (TextEmphasisFillMode::Filled, TextEmphasisShapeKeyword::Sesame) => '\u{FE45}',
+            (TextEmphasisFillMode::Open, TextEmphasisShapeKeyword::Sesame) => '\u{FE46}',
+        }),
+    }
+}
+
 pub(crate) fn build_inline_layout_into(
     nodes: &crate::NodeTree,
     layout_ctx: &mut LayoutContext<TextBrush>,
@@ -1119,6 +1145,7 @@ pub(crate) fn build_inline_layout_into(
             before_id,
             &text_transform,
             &mut ruby,
+            scale,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -1129,6 +1156,7 @@ pub(crate) fn build_inline_layout_into(
             child_id,
             &text_transform,
             &mut ruby,
+            scale,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1139,6 +1167,7 @@ pub(crate) fn build_inline_layout_into(
             after_id,
             &text_transform,
             &mut ruby,
+            scale,
         );
     }
 
@@ -1154,6 +1183,7 @@ pub(crate) fn build_inline_layout_into(
         node_id: NodeId,
         parent_text_transform: &CaseTransform,
         ruby: &mut RubyBuild,
+        scale: f32,
     ) {
         let is_annotation = nodes[node_id]
             .element_data()
@@ -1166,6 +1196,7 @@ pub(crate) fn build_inline_layout_into(
             node_id,
             parent_text_transform,
             ruby,
+            scale,
         );
         if let Some(start) = start {
             ruby.ranges.push(start..ruby.text_len);
@@ -1179,6 +1210,7 @@ pub(crate) fn build_inline_layout_into(
         node_id: NodeId,
         parent_text_transform: &CaseTransform,
         ruby: &mut RubyBuild,
+        scale: f32,
     ) {
         let node = &nodes[node_id];
 
@@ -1242,6 +1274,7 @@ pub(crate) fn build_inline_layout_into(
                                 child_id,
                                 &text_transform,
                                 ruby,
+                                scale,
                             );
                         }
                         builder.pop_style_span();
@@ -1299,6 +1332,7 @@ pub(crate) fn build_inline_layout_into(
                                     before_id,
                                     &text_transform,
                                     ruby,
+                                    scale,
                                 );
                             }
 
@@ -1310,6 +1344,7 @@ pub(crate) fn build_inline_layout_into(
                                     child_id,
                                     &text_transform,
                                     ruby,
+                                    scale,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1320,6 +1355,7 @@ pub(crate) fn build_inline_layout_into(
                                     after_id,
                                     &text_transform,
                                     ruby,
+                                    scale,
                                 );
                             }
 
@@ -1354,8 +1390,44 @@ pub(crate) fn build_inline_layout_into(
 
                 let text =
                     text_transformer.transform(&data.content, parent_text_transform, builder);
-                builder.push_text(text);
-                ruby.text_len += text.len();
+                // A text node has no computed style of its own; the emphasis it draws is the
+                // one its parent element inherits.
+                let inherited = node.parent.and_then(|parent| nodes[parent].primary_styles());
+                let emphasis_style = inherited.as_deref();
+                let emphasis = emphasis_style
+                    .filter(|style| !style.clone_display().is_contents())
+                    .and_then(|style| emphasis_char(style));
+                let Some(mark) = emphasis else {
+                    builder.push_text(text);
+                    ruby.text_len += text.len();
+                    return;
+                };
+
+                // `text-emphasis` puts a mark over every character of the box. The mark is
+                // shaped like text at half the size, in its own span so the shaper picks the
+                // font for it, and its bytes are recorded as annotation text: it takes no room
+                // in the line and is drawn over the character it belongs to.
+                let size = emphasis_style
+                    .map(|style| style.get_font().font_size.computed_size().px())
+                    .unwrap_or(16.0)
+                    * scale;
+                for character in text.chars() {
+                    let mut scratch = [0u8; 4];
+                    let piece = character.encode_utf8(&mut scratch);
+                    builder.push_text(piece);
+                    ruby.text_len += piece.len();
+
+                    let mut scratch = [0u8; 4];
+                    let mark = mark.encode_utf8(&mut scratch);
+                    builder.push_style_modification_span(&[
+                        parley::StyleProperty::FontSize(size * 0.5),
+                    ]);
+                    let start = ruby.text_len;
+                    builder.push_text(mark);
+                    ruby.text_len += mark.len();
+                    builder.pop_style_span();
+                    ruby.ranges.push(start..ruby.text_len);
+                }
             }
             NodeData::Comment { .. } => {
                 // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
