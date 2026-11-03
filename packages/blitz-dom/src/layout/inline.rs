@@ -26,6 +26,34 @@ use crate::node::{TextOrientation, VerticalTextPaint};
 use crate::layout::LayoutPassState;
 use crate::stylo_to_parley;
 
+/// Make Parley advance upright clusters by their vertical metrics.
+///
+/// A vertical writing mode advances upright text down the column by the font's vertical
+/// metrics, which are not the horizontal advances shaping produces (a CJK font may set a
+/// glyph's `hmtx` advance below one em while its `vmtx` advance is one em, and upright Latin
+/// is an em tall but half an em wide). Line breaking has to use them, or a full line paints
+/// past the end of its column. `text-orientation` decides which clusters are upright:
+/// `sideways` rotates all of them, `upright` keeps all of them upright, and the initial
+/// `mixed` follows UAX #50.
+#[cfg(feature = "writing-mode")]
+fn set_vertical_advances(
+    layout: &mut parley::layout::Layout<crate::node::TextBrush>,
+    text: &str,
+    sideways: bool,
+    force_upright: bool,
+) {
+    use icu_properties::{CodePointMapData, props::VerticalOrientation};
+
+    let orientation = CodePointMapData::<VerticalOrientation>::new();
+    layout.set_vertical_advances(text, move |character| {
+        if sideways {
+            false
+        } else {
+            force_upright || orientation.get(character) != VerticalOrientation::Rotated
+        }
+    });
+}
+
 /// Subtract a child's margins from the definite axes of the available space it is laid out in.
 /// Taffy's convention is that the parent subtracts a child's margins from the available space
 /// before passing it to the child, and that the child does not subtract them again.
@@ -672,6 +700,14 @@ impl LayoutPassState<'_> {
         {
             let wm = self.layout_wm_of(node_id);
             inline_layout.layout.set_vertical(wm.is_vertical());
+            if wm.is_vertical() {
+                set_vertical_advances(
+                    &mut inline_layout.layout,
+                    &inline_layout.text,
+                    wm.is_sideways(),
+                    wm.is_upright(),
+                );
+            }
         }
 
         #[cfg(not(feature = "floats"))]
@@ -692,6 +728,14 @@ impl LayoutPassState<'_> {
             {
                 let wm = self.layout_wm_of(node_id);
                 inline_layout.layout.set_vertical(wm.is_vertical());
+                if wm.is_vertical() {
+                    set_vertical_advances(
+                        &mut inline_layout.layout,
+                        &inline_layout.text,
+                        wm.is_sideways(),
+                        wm.is_upright(),
+                    );
+                }
             }
             let mut breaker = inline_layout.layout.break_lines();
             let initial_slot = block_ctx.find_content_slot(0.0, Clear::None, None);
