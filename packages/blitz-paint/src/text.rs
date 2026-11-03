@@ -1078,7 +1078,15 @@ fn flush_line_decorations(
             } else {
                 geom.underline_offset
             };
-            let offset = base_offset - extra_underline_offset as f32;
+            // In a sideways writing mode the block axis points the other way, so an explicit
+            // offset that moves the line away from the text has to be applied with the sign
+            // the mirrored axis expects.
+            let sideways = vertical.is_some_and(|v| v.text_orientation == TextOrientation::Sideways);
+            let offset = if sideways {
+                base_offset + extra_underline_offset as f32
+            } else {
+                base_offset - extra_underline_offset as f32
+            };
 
             // A `double` underline extends downward, away from the text.
             draw_decoration_line(
