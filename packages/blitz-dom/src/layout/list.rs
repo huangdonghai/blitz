@@ -16,7 +16,7 @@ pub(super) const BULLET_FONT_FAMILY: &str = "Bullet, monospace, sans-serif";
 
 pub(super) fn collect_list_item_children(
     doc: &mut BaseDocument,
-    index: &mut usize,
+    index: &mut i64,
     reversed: bool,
     node_id: NodeId,
 ) {
@@ -44,7 +44,7 @@ pub(super) fn collect_list_item_children(
 fn node_list_item_child(
     doc: &mut BaseDocument,
     child_id: NodeId,
-    index: usize,
+    index: i64,
 ) -> Option<ListItemLayout> {
     let node = &doc.nodes[child_id];
 
@@ -113,7 +113,7 @@ fn node_list_item_child(
 }
 
 // Determine the marker to render for a given list style type
-fn marker_for_style(list_style_type: ListStyleType, index: usize) -> Option<Marker> {
+fn marker_for_style(list_style_type: ListStyleType, index: i64) -> Option<Marker> {
     Some(match list_style_type.0 {
         CounterStyle::None => return None,
         CounterStyle::Name(name) => match &*name.0 {
@@ -144,7 +144,7 @@ fn marker_for_style(list_style_type: ListStyleType, index: usize) -> Option<Mark
                 Marker::Char('•')
             } else {
                 // Cycle through symbols based on index: 1st, 2nd, 1st, 2nd, etc.
-                let idx = if len > 1 { index % len } else { 0 };
+                let idx = if len > 1 { index.rem_euclid(len as i64) as usize } else { 0 };
                 // Symbol is String or Ident variant, extract the string value
                 let sym = &syms[idx];
                 let marker_str = match sym {
@@ -172,14 +172,32 @@ const ALPHABET: [char; 26] = [
 ];
 
 // Construct alphanumeric marker from index, appending characters when index exceeds powers of 26
-fn build_alpha_marker(index: usize, str: &mut String) {
-    let rem = index % 26;
-    let sym = ALPHABET[rem];
-    str.insert(0, sym);
-    let rest = (index - rem) as i64 / 26 - 1;
-    if rest >= 0 {
-        build_alpha_marker(rest as usize, str);
+/// Write the alphabetic form of an ordinal: `a`, `b`, ... `z`, `aa`, `ab`.
+///
+/// A negative ordinal takes the counter style's `negative` prefix, which is a hyphen until a
+/// page says otherwise.
+fn build_alpha_marker(index: i64, output: &mut String) {
+    if index < 0 {
+        // The sequence reads ... `-b`, `-a`, `a`, `b`, ... so a negative ordinal takes the
+        // prefix and the alphabetic form of what is left once it is counted back to zero.
+        output.push('-');
+        push_alpha(index.unsigned_abs().saturating_sub(1), output);
+    } else {
+        push_alpha(index as u64, output);
     }
+}
+
+fn push_alpha(mut index: u64, output: &mut String) {
+    let mut text = String::new();
+    loop {
+        text.insert(0, ALPHABET[(index % 26) as usize]);
+        let quotient = index / 26;
+        if quotient == 0 {
+            break;
+        }
+        index = quotient - 1;
+    }
+    output.push_str(&text);
 }
 
 #[cfg(test)]
@@ -221,6 +239,20 @@ mod tests {
         assert_eq!(result_2, Some(Marker::String("b. ".to_string())));
         assert_eq!(result_extended_1, Some(Marker::String("aa. ".to_string())));
         assert_eq!(result_extended_2, Some(Marker::String("ab. ".to_string())));
+    }
+
+    #[test]
+    fn test_marker_for_ordinals_below_one() {
+        // A list may be numbered from zero or below: `<ol start="0">` hands its first item the
+        // ordinal -1, whose marker has to read “0. ” rather than underflow the counter.
+        assert_eq!(
+            marker_for_style(list_style("decimal"), -1),
+            Some(Marker::String("0. ".to_string()))
+        );
+        assert_eq!(
+            marker_for_style(list_style("lower-alpha"), -1),
+            Some(Marker::String("-a. ".to_string()))
+        );
     }
 
     #[test]

@@ -491,10 +491,14 @@ fn collect_layout_children_with_wrap(
         }
 
         //Only ol tags have start and reversed attributes
+        //
+        // `start` is a valid integer and may be zero or negative (`<ol start="-2">` numbers its
+        // items from minus two), so the ordinal is signed: reading it as a `usize` and taking
+        // one off made `<ol start="0">` an underflow, which is a panic in debug builds.
         let (mut index, reversed) = if tag_name == "ol" {
             (
                 el.attr_parsed(local_name!("start"))
-                    .map(|start: usize| start - 1)
+                    .map(|start: i64| start.saturating_sub(1))
                     .unwrap_or(0),
                 el.attr_parsed(local_name!("reversed")).unwrap_or(false),
             )
