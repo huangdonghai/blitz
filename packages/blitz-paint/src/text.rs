@@ -267,6 +267,15 @@ struct EmphasisMark {
 /// An element on the current ancestor path (inline root -> run node), caching the
 /// values resolved from its computed style so descending into the same node across
 /// consecutive runs doesn't re-resolve them.
+/// One `text-shadow`: the text drawn again behind itself, offset and tinted.
+#[derive(Clone, Copy)]
+pub(crate) struct TextShadow {
+    dx: f64,
+    dy: f64,
+    blur: f64,
+    color: Color,
+}
+
 struct DecorationStackEntry {
     node_id: NodeId,
     /// This node's (inherited) text colour, used for the glyphs of runs whose
@@ -277,6 +286,8 @@ struct DecorationStackEntry {
     /// The emphasis mark this node draws over its own text (`text-emphasis` inherits, so the
     /// innermost node of a run carries the mark that applies to it).
     emphasis: Option<EmphasisMark>,
+    /// The text shadows this node asks for (`text-shadow` inherits).
+    shadows: Vec<TextShadow>,
 }
 
 /// Resolve the cached style values for a single node into a [`DecorationStackEntry`].
@@ -287,6 +298,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             text_color: Color::BLACK,
             decoration: None,
             emphasis: None,
+            shadows: Vec::new(),
         };
     };
 
@@ -330,6 +342,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
         node_id,
         text_color,
         emphasis: emphasis_mark(itext, text_color),
+        shadows: resolve_shadows(itext),
         decoration,
     }
 }
@@ -594,6 +607,22 @@ fn emphasis_mark(
         color,
         over: !itext.text_emphasis_position.contains(TextEmphasisPosition::UNDER),
     })
+}
+
+/// The `text-shadow` list of a box, resolved to offsets and colours.
+fn resolve_shadows(itext: &style::properties::style_structs::InheritedText) -> Vec<TextShadow> {
+    let current = itext.color;
+    itext
+        .text_shadow
+        .0
+        .iter()
+        .map(|shadow| TextShadow {
+            dx: f64::from(shadow.horizontal.px()),
+            dy: f64::from(shadow.vertical.px()),
+            blur: f64::from(shadow.blur.px()),
+            color: shadow.color.resolve_to_absolute(&current).as_color_color(),
+        })
+        .collect()
 }
 
 /// Glyphs waiting for their line's decorations to be painted.
@@ -1486,6 +1515,27 @@ pub(crate) fn stroke_text<'a>(
                         &mut base_centre,
                     );
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
+
+                    // `text-shadow`: the same glyphs drawn behind the text, offset and tinted.
+                    // The first shadow of a list is painted last so that it ends up on top.
+                    let shadows = stack
+                        .last()
+                        .map(|entry| entry.shadows.clone())
+                        .unwrap_or_default();
+                    for shadow in shadows.iter().rev() {
+                        let offset = Affine::translate((shadow.dx * scale, shadow.dy * scale));
+                        glyph_batches.push(GlyphBatch {
+                            font: font.clone(),
+                            font_size,
+                            normalized_coords: normalized_coords.to_vec(),
+                            embolden,
+                            paint: anyrender::Paint::from(shadow.color),
+                            transform: transform * offset,
+                            glyph_xform,
+                            glyphs: glyphs.clone(),
+                        });
+                    }
+
                     glyph_batches.push(GlyphBatch {
                         font: font.clone(),
                         font_size,
