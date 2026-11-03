@@ -435,6 +435,8 @@ struct LineDecoration {
     /// Geometry from the first run the box covers (fallback when it has no own text on
     /// this line, e.g. it only wraps differently-sized descendants).
     first: Option<DecorationRunGeometry>,
+    /// The `text-shadow` layers of the box: a shadow is painted under the decoration too.
+    shadows: Vec<TextShadow>,
     /// Where `position: relative` moves the box's painting, in CSS pixels.
     offset: (f32, f32),
 }
@@ -1036,7 +1038,6 @@ fn flush_line_decorations(
         if width <= 0.0 {
             continue;
         }
-        let brush = anyrender::Paint::from(deco.color);
         let transform = if acc.offset == (0.0, 0.0) {
             transform
         } else {
@@ -1079,6 +1080,20 @@ fn flush_line_decorations(
             inset_end = 0.0;
         }
 
+        // A `text-shadow` is painted under the decoration as well as under the text
+        // (the WPT page says so in a comment): each shadow layer draws the same lines,
+        // offset and tinted, and the box's own colour comes last.
+        let mut passes: Vec<Option<TextShadow>> =
+            acc.shadows.iter().rev().copied().map(Some).collect();
+        passes.push(None);
+        for shadow in passes {
+            let brush = anyrender::Paint::from(shadow.map_or(deco.color, |shadow| shadow.color));
+            let transform = match shadow {
+                Some(shadow) => {
+                    transform * Affine::translate((shadow.dx * scale, shadow.dy * scale))
+                }
+                None => transform,
+            };
         if deco.line.contains(TextDecorationLine::UNDERLINE) {
             let size = decoration_size(
                 &deco.thickness,
@@ -1226,6 +1241,7 @@ fn flush_line_decorations(
             v.text_orientation != TextOrientation::Sideways && deco.underline_right
         }),
             );
+        }
         }
     }
 }
@@ -1847,6 +1863,10 @@ pub(crate) fn stroke_text<'a>(
                                     stack.iter().map(|e| e.relative_offset.0).sum(),
                                     stack.iter().map(|e| e.relative_offset.1).sum(),
                                 ),
+                                shadows: stack
+                                    .iter()
+                                    .flat_map(|entry| entry.shadows.iter().copied())
+                                    .collect(),
                             });
                             deco_boxes.len() - 1
                         }
