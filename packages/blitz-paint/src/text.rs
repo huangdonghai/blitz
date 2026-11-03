@@ -396,6 +396,7 @@ pub(crate) struct DrawTextContext {
     path_scratch: Vec<NodeId>,
     deco_boxes: Vec<LineDecoration>,
     glyph_batches: Vec<GlyphBatch>,
+    shadow_batches: Vec<GlyphBatch>,
     win_ascent_ratios: WinAscentCache,
     vertical_metrics: VerticalMetricsCache,
     emphasis_metrics: EmphasisMetricsCache,
@@ -811,6 +812,25 @@ fn decoration_reach(doc: &BaseDocument, inline_root_id: NodeId, scale: f64) -> f
     reach
 }
 
+/// Draw a queue of glyph batches.
+fn draw_glyph_batches(scene: &mut impl PaintScene, batches: impl Iterator<Item = GlyphBatch>) {
+    for batch in batches {
+        scene.draw_glyphs(
+            &batch.font,
+            batch.font_size,
+            !FONT_EMBOLDEN_ENABLED, // hint
+            &batch.normalized_coords,
+            batch.embolden,
+            Fill::NonZero,
+            &batch.paint,
+            1.0, // alpha
+            batch.transform,
+            batch.glyph_xform,
+            batch.glyphs.into_iter(),
+        );
+    }
+}
+
 /// Paint the decorations accumulated for one line, one line per decorating box.
 #[allow(clippy::too_many_arguments)]
 fn flush_line_decorations(
@@ -1176,6 +1196,7 @@ pub(crate) fn stroke_text<'a>(
         path_scratch,
         deco_boxes,
         glyph_batches,
+        shadow_batches,
         win_ascent_ratios,
         vertical_metrics,
         emphasis_metrics,
@@ -1248,6 +1269,7 @@ pub(crate) fn stroke_text<'a>(
 
         // Glyphs of this line, drawn once its decorations are in the scene.
         glyph_batches.clear();
+        shadow_batches.clear();
 
         // Where the last ordinary character of this line sits along the inline axis: a ruby
         // annotation is drawn over it.
@@ -1524,7 +1546,7 @@ pub(crate) fn stroke_text<'a>(
                         .unwrap_or_default();
                     for shadow in shadows.iter().rev() {
                         let offset = Affine::translate((shadow.dx * scale, shadow.dy * scale));
-                        glyph_batches.push(GlyphBatch {
+                        shadow_batches.push(GlyphBatch {
                             font: font.clone(),
                             font_size,
                             normalized_coords: normalized_coords.to_vec(),
@@ -1638,6 +1660,9 @@ pub(crate) fn stroke_text<'a>(
             }
         }
 
+        // `text-shadow` sits under the decorations, which sit under the text.
+        draw_glyph_batches(scene, shadow_batches.drain(..));
+
         flush_line_decorations(
             scene,
             transform,
@@ -1650,21 +1675,7 @@ pub(crate) fn stroke_text<'a>(
         );
 
         // The line's text, over its decorations.
-        for batch in glyph_batches.drain(..) {
-            scene.draw_glyphs(
-                &batch.font,
-                batch.font_size,
-                !FONT_EMBOLDEN_ENABLED, // hint
-                &batch.normalized_coords,
-                batch.embolden,
-                Fill::NonZero,
-                &batch.paint,
-                1.0, // alpha
-                batch.transform,
-                batch.glyph_xform,
-                batch.glyphs.into_iter(),
-            );
-        }
+        draw_glyph_batches(scene, glyph_batches.drain(..));
     }
 }
 
