@@ -1,4 +1,5 @@
 use anyrender::PaintScene;
+use anyrender::filters::{Filter, FilterEffect};
 use blitz_dom::{
     BaseDocument, NodeId, node::TextBrush, node::TextOrientation, node::VerticalTextPaint,
     util::ToColorColor,
@@ -6,7 +7,7 @@ use blitz_dom::{
 use icu_properties::{CodePointMapData, props::VerticalOrientation};
 use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
 use parley::{Affinity, Cursor, Layout, Line, LineMetrics, PositionedLayoutItem, Selection};
-use peniko::Fill;
+use peniko::{Fill, Mix};
 use std::collections::HashMap;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
 use style::values::computed::{TextEmphasisPosition, TextEmphasisStyle};
@@ -635,6 +636,8 @@ fn resolve_shadows(itext: &style::properties::style_structs::InheritedText) -> V
 /// are queued with what they need and issued after `flush_line_decorations`.
 struct GlyphBatch {
     font: parley::FontData,
+    /// The blur radius to draw this batch through, or 0 for sharp glyphs.
+    blur: f64,
     font_size: f32,
     normalized_coords: Vec<i16>,
     embolden: kurbo::Vec2,
@@ -813,8 +816,47 @@ fn decoration_reach(doc: &BaseDocument, inline_root_id: NodeId, scale: f64) -> f
 }
 
 /// Draw a queue of glyph batches.
+///
+/// A batch with a blur radius is drawn through a filter layer: `text-shadow`'s radius is the
+/// diameter of the blur, while the filter takes the standard deviation, half of it.
 fn draw_glyph_batches(scene: &mut impl PaintScene, batches: impl Iterator<Item = GlyphBatch>) {
     for batch in batches {
+        let layer = (batch.blur > 0.0).then(|| {
+            // A layer's bounds have to cover the blurred result, which reaches a radius past
+            // the glyphs themselves.
+            let size = f64::from(batch.font_size);
+            let reach = size + batch.blur;
+            let mut min_x = f64::MAX;
+            let mut min_y = f64::MAX;
+            let mut max_x = f64::MIN;
+            let mut max_y = f64::MIN;
+            for glyph in &batch.glyphs {
+                let x = f64::from(glyph.x);
+                let y = f64::from(glyph.y);
+                min_x = min_x.min(x);
+                max_x = max_x.max(x + size);
+                min_y = min_y.min(y);
+                max_y = max_y.max(y + size);
+            }
+            let bounds = kurbo::Rect::new(
+                min_x - reach,
+                min_y - reach,
+                max_x + reach,
+                max_y + reach,
+            );
+            let filter =
+                Filter::linear_list(std::iter::once(FilterEffect::blur((batch.blur / 2.0) as f32)));
+            scene.push_layer(
+                Fill::NonZero,
+                Mix::Normal,
+                1.0,
+                batch.transform,
+                &bounds,
+                Some(std::sync::Arc::new(filter)),
+                None,
+            );
+        });
+
         scene.draw_glyphs(
             &batch.font,
             batch.font_size,
@@ -828,6 +870,10 @@ fn draw_glyph_batches(scene: &mut impl PaintScene, batches: impl Iterator<Item =
             batch.glyph_xform,
             batch.glyphs.into_iter(),
         );
+
+        if layer.is_some() {
+            scene.pop_layer();
+        }
     }
 }
 
@@ -1499,6 +1545,7 @@ pub(crate) fn stroke_text<'a>(
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
                     glyph_batches.push(GlyphBatch {
+                        blur: 0.0,
                         font: font.clone(),
                         font_size,
                         normalized_coords: normalized_coords.to_vec(),
@@ -1514,6 +1561,7 @@ pub(crate) fn stroke_text<'a>(
                         let turned = Affine::rotate(std::f64::consts::FRAC_PI_2)
                             * glyph_xform.unwrap_or(Affine::IDENTITY);
                         glyph_batches.push(GlyphBatch {
+                            blur: 0.0,
                             font: font.clone(),
                             font_size,
                             normalized_coords: normalized_coords.to_vec(),
@@ -1547,6 +1595,7 @@ pub(crate) fn stroke_text<'a>(
                     for shadow in shadows.iter().rev() {
                         let offset = Affine::translate((shadow.dx * scale, shadow.dy * scale));
                         shadow_batches.push(GlyphBatch {
+                            blur: shadow.blur * scale,
                             font: font.clone(),
                             font_size,
                             normalized_coords: normalized_coords.to_vec(),
@@ -1559,6 +1608,7 @@ pub(crate) fn stroke_text<'a>(
                     }
 
                     glyph_batches.push(GlyphBatch {
+                        blur: 0.0,
                         font: font.clone(),
                         font_size,
                         normalized_coords: normalized_coords.to_vec(),
@@ -1581,6 +1631,7 @@ pub(crate) fn stroke_text<'a>(
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
                     glyph_batches.push(GlyphBatch {
+                        blur: 0.0,
                         font: font.clone(),
                         font_size,
                         normalized_coords: normalized_coords.to_vec(),
