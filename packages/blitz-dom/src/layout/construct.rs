@@ -1190,7 +1190,7 @@ pub(crate) fn build_inline_layout_into(
         let is_annotation = nodes[node_id]
             .element_data()
             .is_some_and(|element| matches!(&*element.name.local, "rt" | "rtc"));
-        let start = is_annotation.then_some(ruby.text_len);
+        let start = is_annotation.then(|| builder.text().len());
         build_inline_layout_node(
             builder,
             text_transformer,
@@ -1201,7 +1201,7 @@ pub(crate) fn build_inline_layout_into(
             scale,
         );
         if let Some(start) = start {
-            ruby.ranges.push(start..ruby.text_len);
+            ruby.ranges.push(start..builder.text().len());
         }
     }
 
@@ -1449,13 +1449,13 @@ pub(crate) fn build_inline_layout_into(
                     builder.push_style_modification_span(&[
                         parley::StyleProperty::FontSize(size * 0.5),
                     ]);
-                    let start = ruby.text_len;
+                    let start = builder.text().len();
                     builder.push_text(mark);
-                    ruby.text_len += mark.len();
                     builder.pop_style_span();
-                    ruby.ranges.push(start..ruby.text_len);
+                    let end = builder.text().len();
+                    ruby.ranges.push(start..end);
                     if let Some(color) = emphasis_color {
-                        ruby.emphasis.push((start..ruby.text_len, color));
+                        ruby.emphasis.push((start..end, color));
                     }
                 }
             }
