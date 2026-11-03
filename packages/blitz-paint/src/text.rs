@@ -478,6 +478,45 @@ fn draw_decoration_line(
 }
 
 
+/// How far past its line box the ink of a decorated line can reach, in device pixels.
+///
+/// The thickest decoration in the inline root's subtree, plus the largest underline offset and
+/// a line's worth for the lines on the other side of the baseline. `text-decoration-*` do not
+/// inherit, so the subtree is walked rather than the root's own style consulted.
+fn decoration_reach(doc: &BaseDocument, inline_root_id: NodeId, scale: f64) -> f64 {
+    let drawn = TextDecorationLine::UNDERLINE
+        | TextDecorationLine::OVERLINE
+        | TextDecorationLine::LINE_THROUGH;
+    let mut reach: f64 = 0.0;
+    let mut pending = vec![inline_root_id];
+    while let Some(node_id) = pending.pop() {
+        let Some(node) = doc.get_node(node_id) else { continue };
+        pending.extend(node.children.iter().copied());
+
+        let Some(styles) = node.primary_styles() else { continue };
+        let text = styles.get_text();
+        if !text.text_decoration_line.intersects(drawn) || styles.clone_display().is_contents() {
+            continue;
+        }
+        let css_font_size = styles.get_font().font_size.computed_size().px() as f64;
+        let thickness =
+            f64::from(decoration_size(
+                &text.text_decoration_thickness,
+                (css_font_size / 10.0) as f32,
+                css_font_size,
+                scale,
+            ));
+        let offset = styles
+            .get_inherited_text()
+            .text_underline_offset
+            .non_auto()
+            .map(|lp| f64::from(lp.resolve(Length::new(css_font_size as f32)).px()) * scale)
+            .unwrap_or(0.0);
+        reach = reach.max(thickness + offset.abs() + css_font_size * scale);
+    }
+    reach
+}
+
 /// Paint the decorations accumulated for one line, one line per decorating box.
 #[allow(clippy::too_many_arguments)]
 fn flush_line_decorations(
@@ -887,7 +926,12 @@ pub(crate) fn stroke_text<'a>(
         // origin outside the em box), so cull with a line's worth of slack.
         let extent = line_extent(&line, vertical.as_ref());
         let slack = f64::from(line.metrics().line_height).max(1.0);
-        let extent = extent.inflate(slack, slack);
+        // A decoration is as thick as `text-decoration-thickness` says and can be pushed away
+        // from the baseline, so the ink of a line reaches past the line box: a 4em underline in
+        // a 1em `overflow: hidden` box paints inside the box although the line itself sits
+        // above it. Culling on the line box alone dropped those pixels entirely.
+        let reach = slack + decoration_reach(doc, inline_root_id, scale);
+        let extent = extent.inflate(reach, reach);
         if extent.x1 < cull_rect.x0
             || extent.x0 > cull_rect.x1
             || extent.y1 < cull_rect.y0

@@ -420,10 +420,29 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
         // also culls elements scrolled out of view inside a clipping/scrolling container.
-        if screen_bbox.x1 < clip_rect.x0
-            || screen_bbox.x0 > clip_rect.x1
-            || screen_bbox.y1 < clip_rect.y0
-            || screen_bbox.y0 > clip_rect.y1
+        //
+        // An inline root is left to the per-line cull in `text::stroke_text`, which knows how far
+        // a line's ink reaches. Its box says nothing about that: a `position: relative` offset
+        // moves text out of its box, and a decoration is as thick as the page asks (`4em` is a
+        // real value), so judging the element by its border box and scrollable overflow dropped
+        // text that does paint inside the clip. That is what a WPT case with a thick underline
+        // inside `overflow: hidden` was catching.
+        let cull_by_box = !node.flags.is_inline_root();
+        if std::env::var_os("CUOTUO_DEBUG_CULL").is_some() {
+            eprintln!(
+                "node {:?} inline_root={} cull_by_box={} bbox={:?} clip={:?}",
+                node.id,
+                node.flags.is_inline_root(),
+                cull_by_box,
+                screen_bbox,
+                clip_rect
+            );
+        }
+        if cull_by_box
+            && (screen_bbox.x1 < clip_rect.x0
+                || screen_bbox.x0 > clip_rect.x1
+                || screen_bbox.y1 < clip_rect.y0
+                || screen_bbox.y0 > clip_rect.y1)
         {
             return;
         }
