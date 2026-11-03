@@ -13,6 +13,7 @@ use style::properties::generated::longhands::text_decoration_style::computed_val
 use style::values::computed::{TextEmphasisPosition, TextEmphasisStyle};
 use style::values::specified::text::{TextEmphasisFillMode, TextEmphasisShapeKeyword};
 use style::values::computed::Display;
+use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::values::computed::{
     Length, LengthPercentage, TextDecorationLength, TextDecorationLine, TextUnderlinePosition,
 };
@@ -289,6 +290,39 @@ struct DecorationStackEntry {
     emphasis: Option<EmphasisMark>,
     /// The text shadows this node asks for (`text-shadow` inherits).
     shadows: Vec<TextShadow>,
+    /// Where `position: relative` moves this node's painting, in CSS pixels.
+    ///
+    /// Only an inline box's shift is left for the painter: a block's `top`/`left` is part of
+    /// the box position the layout already gave it.
+    relative_offset: (f32, f32),
+}
+
+/// The offset `position: relative` moves a box by, in CSS pixels.
+///
+/// A relatively positioned box is laid out where it would have been and painted shifted, so
+/// the shift belongs to the paint transform rather than the layout.
+fn relative_offset(styles: &style::properties::ComputedValues) -> (f32, f32) {
+    use style::properties::longhands::position::computed_value::T as PositionProperty;
+    use style::values::generics::position::GenericInset;
+
+    if !matches!(styles.clone_position(), PositionProperty::Relative) {
+        return (0.0, 0.0);
+    }
+    let position = styles.get_position();
+    let base = styles.get_font().font_size.computed_size().px();
+    let resolve = |value: &GenericInset<_, style::values::computed::LengthPercentage>| match value {
+        GenericInset::LengthPercentage(length) => {
+            Some(length.resolve(style::values::computed::Length::new(base)).px())
+        }
+        _ => None,
+    };
+    let dx = resolve(&position.left)
+        .or_else(|| resolve(&position.right).map(|value| -value))
+        .unwrap_or(0.0);
+    let dy = resolve(&position.top)
+        .or_else(|| resolve(&position.bottom).map(|value| -value))
+        .unwrap_or(0.0);
+    (dx, dy)
 }
 
 /// Resolve the cached style values for a single node into a [`DecorationStackEntry`].
@@ -300,6 +334,7 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             decoration: None,
             emphasis: None,
             shadows: Vec::new(),
+            relative_offset: (0.0, 0.0),
         };
     };
 
@@ -344,6 +379,13 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
         text_color,
         emphasis: emphasis_mark(itext, text_color),
         shadows: resolve_shadows(itext),
+        relative_offset: if styles.clone_display().outside() == DisplayOutside::Inline
+            && styles.clone_display().inside() == DisplayInside::Flow
+        {
+            relative_offset(&styles)
+        } else {
+            (0.0, 0.0)
+        },
         decoration,
     }
 }
@@ -387,6 +429,8 @@ struct LineDecoration {
     /// Geometry from the first run the box covers (fallback when it has no own text on
     /// this line, e.g. it only wraps differently-sized descendants).
     first: Option<DecorationRunGeometry>,
+    /// Where `position: relative` moves the box's painting, in CSS pixels.
+    offset: (f32, f32),
 }
 
 /// Reusable scratch storage for drawing text across all inline formatting contexts in a
@@ -976,6 +1020,15 @@ fn flush_line_decorations(
             continue;
         }
         let brush = anyrender::Paint::from(deco.color);
+        let transform = if acc.offset == (0.0, 0.0) {
+            transform
+        } else {
+            transform
+                * Affine::translate((
+                    f64::from(acc.offset.0) * scale,
+                    f64::from(acc.offset.1) * scale,
+                ))
+        };
 
         // `text-decoration-inset` shortens (or, when negative, extends) the line from the
         // inline-start/end edges. Percentages resolve against the decoration line length
@@ -1392,6 +1445,20 @@ pub(crate) fn stroke_text<'a>(
                 // inherits, so the innermost inline element already carries the right value.
                 let text_color = stack.last().map(|e| e.text_color).unwrap_or(Color::BLACK);
 
+                // `position: relative` shifts a box's painting without moving its layout, and
+                // the shifts of nested boxes add up.
+                let (rel_dx, rel_dy) = stack.iter().fold((0.0f64, 0.0f64), |(dx, dy), entry| {
+                    (
+                        dx + f64::from(entry.relative_offset.0),
+                        dy + f64::from(entry.relative_offset.1),
+                    )
+                });
+                let run_transform = if rel_dx == 0.0 && rel_dy == 0.0 {
+                    transform
+                } else {
+                    transform * Affine::translate((rel_dx * scale, rel_dy * scale))
+                };
+
                 let embolden = if FONT_EMBOLDEN_ENABLED {
                     let fs = font_size as f64 / scale;
                     kurbo::Vec2::new((0.015125 * fs).min(0.3), (0.0121 * fs).min(0.3))
@@ -1551,7 +1618,7 @@ pub(crate) fn stroke_text<'a>(
                         normalized_coords: normalized_coords.to_vec(),
                         embolden,
                         paint: anyrender::Paint::from(text_color),
-                        transform,
+                        transform: run_transform,
                         glyph_xform,
                         glyphs: upright,
                     });
@@ -1601,7 +1668,7 @@ pub(crate) fn stroke_text<'a>(
                             normalized_coords: normalized_coords.to_vec(),
                             embolden,
                             paint: anyrender::Paint::from(shadow.color),
-                            transform: transform * offset,
+                            transform: run_transform * offset,
                             glyph_xform,
                             glyphs: glyphs.clone(),
                         });
@@ -1614,7 +1681,7 @@ pub(crate) fn stroke_text<'a>(
                         normalized_coords: normalized_coords.to_vec(),
                         embolden,
                         paint: anyrender::Paint::from(text_color),
-                        transform,
+                        transform: run_transform,
                         glyph_xform,
                         glyphs,
                     });
@@ -1637,7 +1704,7 @@ pub(crate) fn stroke_text<'a>(
                         normalized_coords: normalized_coords.to_vec(),
                         embolden,
                         paint: anyrender::Paint::from(text_color),
-                        transform,
+                        transform: run_transform,
                         glyph_xform,
                         glyphs: glyphs.collect(),
                     });
@@ -1684,6 +1751,10 @@ pub(crate) fn stroke_text<'a>(
                                 last_ink_end: None,
                                 own: None,
                                 first: None,
+                                offset: (
+                                    stack.iter().map(|e| e.relative_offset.0).sum(),
+                                    stack.iter().map(|e| e.relative_offset.1).sum(),
+                                ),
                             });
                             deco_boxes.len() - 1
                         }
