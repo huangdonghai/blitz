@@ -58,8 +58,9 @@ pub(crate) struct Edge {
 }
 
 /// A stretch of the flow that no break may fall inside: a line box, an atomic inline box, a
-/// replaced element. A column has to be tall enough to hold the tallest of them, which is what
-/// stops balancing from cutting a single line into slivers.
+/// replaced element, a box with `break-inside: avoid`. A column has to be tall enough to hold the
+/// tallest of them, which is what stops balancing from cutting a single line into slivers, and a
+/// fragmentainer that cannot hold one carries it to the next rather than slicing it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Unit {
     pub(crate) start: f32,
@@ -521,9 +522,22 @@ impl<'a> Planner<'a> {
             ) || styles.get_box().overflow_x != Overflow::Visible
                 || styles.get_box().overflow_y != Overflow::Visible
                 || is_multicol(&styles);
+            let scroll_container = styles.get_box().overflow_x != Overflow::Visible
+                || styles.get_box().overflow_y != Overflow::Visible;
             let breakable_inside = breakable
                 && !avoids_inside(styles.clone_break_inside())
                 && !own_fragmentainer;
+            // A box the author asked not to be broken, and a box that scrolls or clips its
+            // overflow, are carried whole into a fragmentainer rather than cut: the scrollport is
+            // one box that cannot be in two places at once (`multicol-overflow-clip-auto-sized`).
+            // A flex, grid or table container is not: Chrome breaks those item by item, and
+            // treating them as unbreakable makes the columns around them too tall.
+            if scroll_container || avoids_inside(styles.clone_break_inside()) {
+                self.units.push(Unit {
+                    start: outer_top,
+                    end: outer_bottom,
+                });
+            }
             // A line box ends where the flow may be cut (CSS Break 3 §4.1): a text block taller
             // than the fragmentainer is otherwise cut rather than carried on.
             self.line_edges(child, top, breakable_inside);
@@ -634,8 +648,21 @@ impl<'a> Planner<'a> {
     /// Cut the recorded flow into fragmentainers `extent` deep.
     fn bands(mut self, start: f32, extent: f32, cross: f32, content_end: f32) -> ThinVec<Band> {
         self.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
-        cut_bands(&self.edges, start, extent, cross, content_end)
+        self.units.sort_by(|a, b| a.start.total_cmp(&b.start));
+        cut_bands(&self.edges, &self.units, start, extent, cross, content_end)
     }
+}
+
+/// The flow cannot be cut inside a box that must stay whole, so the box is carried to the next
+/// fragmentainer when it fits there (CSS Break 3 §3.2: a forced break is placed at the last legal
+/// break point before it). A box too tall for an empty fragmentainer is cut anyway — clipping it is
+/// the only way the flow can go on — and a box that already starts at the fragmentainer's start
+/// has nowhere later to go.
+fn carry_before(units: &[Unit], limit: f32, cursor: f32, extent: f32) -> Option<f32> {
+    units
+        .iter()
+        .find(|unit| unit.start > cursor && unit.start < limit && unit.end > limit && unit.height() <= extent)
+        .map(|unit| unit.start)
 }
 
 /// Place the cuts: fill one fragmentainer, then start the next at the cut.
@@ -646,6 +673,7 @@ impl<'a> Planner<'a> {
 /// taller than the page asks for.
 pub(crate) fn cut_bands(
     edges: &[Edge],
+    units: &[Unit],
     start: f32,
     extent: f32,
     cross: f32,
@@ -685,7 +713,12 @@ pub(crate) fn cut_bands(
         let cut = match forced {
             Some(at) => at,
             None if content_end <= limit => content_end,
-            None => legal.unwrap_or(limit),
+            None => match legal {
+                Some(at) => at,
+                // Nothing in this fragmentainer may be cut at, so a box that must stay whole is
+                // carried to the next one instead of being sliced here.
+                None => carry_before(units, limit, cursor, extent).unwrap_or(limit),
+            },
         };
         // The last fragmentainer is a whole page box: content may hang below the flow's own end
         // line (an out-of-flow box does), and the page it belongs to is still printed.
@@ -727,6 +760,7 @@ pub(crate) fn edges_of(
     planner.line_edges(&doc.nodes[container_id], 0.0, true);
     planner.walk(container_id, Point::ZERO, basis, true, &PageName::Auto);
     planner.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
+    planner.units.sort_by(|a, b| a.start.total_cmp(&b.start));
     let end = planner.extent;
     (planner.edges, planner.units, end)
 }
@@ -744,7 +778,7 @@ mod tests {
     #[test]
     fn one_page_when_it_fits() {
         let edges = [edge(0.0, Rank::Legal), edge(26.0, Rank::Legal)];
-        let bands = cut_bands(&edges, 0.0, 600.0, 800.0, 120.0);
+        let bands = cut_bands(&edges, &[], 0.0, 600.0, 800.0, 120.0);
         assert_eq!(bands.len(), 1);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 600.0));
     }
@@ -757,7 +791,7 @@ mod tests {
             edge(44.0, Rank::Forced),
             edge(62.0, Rank::Legal),
         ];
-        let bands = cut_bands(&edges, 0.0, 600.0, 800.0, 200.0);
+        let bands = cut_bands(&edges, &[], 0.0, 600.0, 800.0, 200.0);
         assert_eq!(bands.len(), 1 + 1);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 44.0));
         assert_eq!((bands[1].start, bands[1].end), (44.0, 644.0));
@@ -767,7 +801,7 @@ mod tests {
     #[test]
     fn unforced_break_uses_the_last_legal_point() {
         let edges = [edge(26.0, Rank::Legal), edge(50.0, Rank::Legal)];
-        let bands = cut_bands(&edges, 0.0, 60.0, 800.0, 120.0);
+        let bands = cut_bands(&edges, &[], 0.0, 60.0, 800.0, 120.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 50.0));
         assert_eq!((bands[1].start, bands[1].end), (50.0, 110.0));
     }
@@ -776,9 +810,35 @@ mod tests {
     #[test]
     fn avoid_cancels_the_point_at_the_same_position() {
         let edges = [edge(26.0, Rank::Legal), edge(26.0, Rank::Forbidden)];
-        let bands = cut_bands(&edges, 0.0, 60.0, 800.0, 120.0);
+        let bands = cut_bands(&edges, &[], 0.0, 60.0, 800.0, 120.0);
         // With no legal point left, the flow is cut at the page edge rather than at 26.
         assert_eq!((bands[0].start, bands[0].end), (0.0, 60.0));
+    }
+
+    /// A box that cannot be cut is carried to the next fragmentainer when it fits there, rather
+    /// than being sliced at the edge of this one.
+    #[test]
+    fn an_unbreakable_box_is_carried() {
+        let edges = [edge(0.0, Rank::Legal), edge(12.0, Rank::Legal)];
+        let units = [Unit {
+            start: 2.0,
+            end: 12.0,
+        }];
+        let bands = cut_bands(&edges, &units, 0.0, 10.0, 800.0, 12.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 2.0));
+        assert_eq!((bands[1].start, bands[1].end), (2.0, 12.0));
+    }
+
+    /// A box too tall for an empty fragmentainer has nowhere later to go, so it is cut.
+    #[test]
+    fn too_tall_to_carry_is_cut() {
+        let edges = [edge(0.0, Rank::Legal)];
+        let units = [Unit {
+            start: 2.0,
+            end: 40.0,
+        }];
+        let bands = cut_bands(&edges, &units, 0.0, 10.0, 800.0, 40.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 10.0));
     }
 
     /// A box taller than the page has no legal point inside it: the page is filled and the rest
@@ -786,7 +846,7 @@ mod tests {
     #[test]
     fn unbreakable_box_longer_than_the_page_still_advances() {
         let edges = [edge(0.0, Rank::Legal)];
-        let bands = cut_bands(&edges, 0.0, 60.0, 800.0, 200.0);
+        let bands = cut_bands(&edges, &[], 0.0, 60.0, 800.0, 200.0);
         assert_eq!(bands.len(), 4);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 60.0));
         assert_eq!((bands[3].start, bands[3].end), (180.0, 240.0));

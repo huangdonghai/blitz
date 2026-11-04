@@ -221,7 +221,8 @@ impl LayoutPassState<'_> {
                 None if columns.sequential => flow_height,
                 None => balance(&edges, &units, flow_height, columns.count),
             };
-            let bands: ThinVec<_> = cut_bands(&edges, 0.0, height, columns.width, flow_end)
+            let bands: ThinVec<_> =
+                cut_bands(&edges, &units, 0.0, height, columns.width, flow_end)
                 .into_iter()
                 .enumerate()
                 .map(|(index, mut band)| {
@@ -351,7 +352,7 @@ impl LayoutPassState<'_> {
                 None => balance(&inside, &whole, run_height, columns.count),
             };
             for (index, mut band) in
-                cut_bands(&inside, run.start, height, columns.width, run.end)
+                cut_bands(&inside, &whole, run.start, height, columns.width, run.end)
                     .into_iter()
                     .enumerate()
             {
@@ -608,7 +609,7 @@ fn balance(edges: &[Edge], units: &[Unit], flow_height: f32, count: usize) -> f3
         if candidate < shortest {
             continue;
         }
-        if cut_bands(edges, 0.0, candidate, 0.0, flow_height).len() <= count {
+        if cut_bands(edges, units, 0.0, candidate, 0.0, flow_height).len() <= count {
             return candidate;
         }
     }
