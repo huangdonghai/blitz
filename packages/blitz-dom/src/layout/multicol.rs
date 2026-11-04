@@ -20,8 +20,9 @@ use thin_vec::ThinVec;
 use style::values::computed::length::{
     NonNegativeLengthOrAuto, NonNegativeLengthPercentageOrNormal,
 };
-use style::values::computed::{ColumnCount, LengthPercentage};
+use style::values::computed::{ColumnCount, Float, LengthPercentage, Overflow};
 use style::properties::ComputedValues;
+use style::values::specified::box_::{DisplayInside, DisplayOutside};
 
 use super::LayoutPassState;
 use super::fragmentation::{
@@ -308,10 +309,16 @@ impl LayoutPassState<'_> {
 
         let mut bands = ThinVec::new();
         let mut offset = insets.top;
+        // Where the previous run left the flow. A spanner's own margins collapse with the boxes
+        // around it, and the space they take belongs to neither run — it is the gap between them,
+        // and the runs below have to be pushed down by it.
+        let mut cursor = 0.0;
         for run in runs {
             if run.end <= run.start {
                 continue;
             }
+            offset += (run.start - cursor).max(0.0);
+            cursor = run.end;
             if run.spanned {
                 bands.push(Band {
                     start: run.start,
@@ -360,15 +367,76 @@ impl LayoutPassState<'_> {
         (bands, (offset - insets.top).max(0.0))
     }
 
-    /// Whether one of the container's own children asks to span every column.
-    ///
-    /// Only a child of the container can span: the flow of a box nested deeper belongs to the box
-    /// that holds it, and a `column-span` there does not reach out of it.
+    /// Whether one of the container's own children spans every column.
     fn holds_spanner(&self, container: crate::NodeId) -> bool {
         self.nodes[container]
             .children
             .iter()
-            .any(|child| self.nodes[*child].spans_columns())
+            .any(|child| self.spans_flow(*child))
+    }
+
+    /// Does this box span every column — itself, or because the only thing inside it does?
+    ///
+    /// A spanner cannot be lifted out of a wrapper that holds content of its own, but a wrapper
+    /// that holds nothing else is the box the columns break around, and it is as wide as the
+    /// container because the box inside it is. A wrapper with text or another box beside the
+    /// spanner wants the wrapper itself broken at the spanner, which is not done yet.
+    fn spans_flow(&self, id: crate::NodeId) -> bool {
+        let node = &self.nodes[id];
+        if node.spans_columns() {
+            return true;
+        }
+        // Only a box that takes part in its parent's block flow can be carried along: a float, an
+        // atomic inline, a box that clips or scrolls its overflow, and a flex, grid, table or
+        // multi-column container all start a formatting context of their own, and a spanner
+        // inside one of those stays inside it (`multicol-span-all-004`).
+        let in_flow = node.is_anonymous()
+            || node.primary_styles().is_some_and(|styles| {
+                let display = styles.clone_display();
+                let overflow = &styles.get_box();
+                display.outside() == DisplayOutside::Block
+                    && matches!(
+                        display.inside(),
+                        DisplayInside::Flow | DisplayInside::FlowRoot
+                    )
+                    && overflow.overflow_x == Overflow::Visible
+                    && overflow.overflow_y == Overflow::Visible
+                    && styles.clone_float() == Float::None
+                    // A transform or a filter makes the box a containing block and a stacking
+                    // context of its own, and `contain: paint|layout|content|strict` gives it an
+                    // independent formatting context; each of those is a boundary for a spanner
+                    // (`multicol-span-all-010`).
+                    && styles.get_box().transform.0.is_empty()
+                    && styles.get_effects().filter.0.is_empty()
+                    && !node
+                        .layout_style()
+                        .contain()
+                        .establishes_independent_formatting_context()
+                    && !is_multicol(&styles)
+            });
+        if !in_flow {
+            return false;
+        }
+        let mut only = None;
+        for child in node.children.iter() {
+            let child = &self.nodes[*child];
+            match &child.data {
+                crate::node::NodeData::Text(_) => {
+                    if child.text_content().trim().is_empty() {
+                        continue;
+                    }
+                    return false;
+                }
+                crate::node::NodeData::Element(_) | crate::node::NodeData::AnonymousBlock(_) => {}
+                // A comment is not content: it does not stop the box beside it from spanning.
+                _ => continue,
+            }
+            if only.is_some() {
+                return false;
+            }
+            only = Some(child.id);
+        }
+        only.is_some_and(|child| self.spans_flow(child))
     }
 
     /// Measure the boxes that span every column at the container's own width.
@@ -396,7 +464,7 @@ impl LayoutPassState<'_> {
                 .unwrap_or_default()
         };
         for id in ids {
-            if !self.nodes[id].spans_columns() {
+            if !self.spans_flow(id) {
                 continue;
             }
             let location = self.nodes[id].unrounded_layout().location;
@@ -475,9 +543,13 @@ impl LayoutPassState<'_> {
                 .layout_style()
                 .margin()
                 .resolve_or_zero(Some(basis), resolve_calc_value);
-            let end = layout.location.y + layout.size.height + margin.bottom;
-            let start = (layout.location.y - margin.top).max(runs.last().map(|run| run.end).unwrap_or(0.0));
-            let spanned = node.spans_columns();
+            // A run reaches from this child's outer top to its outer bottom. Where two children's
+            // margins collapse, the second one's outer top is where the first one's outer bottom
+            // was, so the runs do not overlap.
+            let start = (layout.location.y - margin.top)
+                .max(runs.last().map(|run| run.end).unwrap_or(0.0));
+            let end = start.max(layout.location.y + layout.size.height + margin.bottom);
+            let spanned = self.spans_flow(id);
             match runs.last_mut() {
                 Some(run) if !spanned && !run.spanned => run.end = run.end.max(end),
                 _ => runs.push(Segment {
