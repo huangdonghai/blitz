@@ -59,14 +59,37 @@ pub(crate) struct Edge {
     rank: Rank,
 }
 
+impl Rank {
+    /// What to call the rank when the bands of a flow are dumped (`CUOTUO_DEBUG_FRAGMENTATION`).
+    pub(crate) fn name(&self) -> &'static str {
+        match self {
+            Rank::Forced => "forced",
+            Rank::Legal => "legal",
+            Rank::Forbidden => "avoid",
+        }
+    }
+}
+
+impl Edge {
+    /// See [`Rank::name`].
+    pub(crate) fn rank_name(&self) -> &'static str {
+        self.rank.name()
+    }
+}
+
 /// A stretch of the flow that no break may fall inside: a line box, an atomic inline box, a
 /// replaced element, a box with `break-inside: avoid`. A column has to be tall enough to hold the
 /// tallest of them, which is what stops balancing from cutting a single line into slivers, and a
 /// fragmentainer that cannot hold one carries it to the next rather than slicing it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Unit {
+    /// Where the stretch begins. For a flex item this is the room the container left before it —
+    /// that space travels with the item — and otherwise the box's own edge.
     pub(crate) start: f32,
     pub(crate) end: f32,
+    /// Where the box itself begins. Only a flex item's differs from [`Self::start`], and whether
+    /// *some* fragmentainer could hold the box is a question about the box.
+    pub(crate) box_start: f32,
     /// Whether this is an item of a flex container. A flex item no fragmentainer can hold is
     /// broken where the band ends rather than carried on, which is *not* what a box the author
     /// asked to keep whole does (`single-line-column-flex-fragmentation-071` against
@@ -80,22 +103,30 @@ impl Unit {
         Self {
             start,
             end,
+            box_start: start,
             flex_item: false,
         }
     }
 
-    /// An item of a flex container running along the flow.
-    fn item(start: f32, end: f32) -> Self {
+    /// An item of a flex container running along the flow, with the room the container left before
+    /// it. See [`Unit::start`].
+    fn item(room: f32, start: f32, end: f32) -> Self {
         Self {
-            start,
+            start: room.min(start),
             end,
+            box_start: start,
             flex_item: true,
         }
     }
 
-    /// How tall the unit is along the flow.
+    /// How tall the unit is along the flow, the room before it included.
     pub(crate) fn height(&self) -> f32 {
         (self.end - self.start).max(0.0)
+    }
+
+    /// How tall the box itself is along the flow.
+    fn box_height(&self) -> f32 {
+        (self.end - self.box_start).max(0.0)
     }
 }
 
@@ -469,6 +500,11 @@ impl<'a> Planner<'a> {
         let Some(children) = children.as_ref() else {
             return;
         };
+        // The first item of a flex container starts at the container's own content edge; see the
+        // note on where the break between two items falls.
+        let mut first_item = true;
+        // Where the item before this one ended, which is the gap the container left before it.
+        let mut previous_item_end: Option<f32> = None;
 
         for &child_id in children.iter() {
             let child = &doc.nodes[child_id];
@@ -554,14 +590,32 @@ impl<'a> Planner<'a> {
                 self.seen_content = true;
             }
 
+            // Between two items of a flex container the break falls at the end of the one that came
+            // first: the room the container left between them is the space *before* the item that
+            // follows, so it travels with that item's fragment and the fragment above it ends where
+            // its own content stops (`flexbox-single-column-1a`, whose reference lays the gaps out
+            // as boxes for exactly that reason). The first item's edge is the container's own
+            // content edge, which is a legal point like any other box's; after the last item there
+            // is no break between items to place (`flex-item-content-overflow-002a`).
+            let legal_before = in_flow_block && !(flex_items && !first_item);
             let before = rank_between(styles.clone_break_before())
                 .or_else(|| page_change.then_some(Rank::Forced))
-                .or_else(|| in_flow_block.then_some(Rank::Legal));
+                .or_else(|| legal_before.then_some(Rank::Legal));
             if let Some(rank) = before {
                 self.push(outer_top, rank, breakable);
             }
             if let Some(rank) = rank_between(styles.clone_break_after()) {
                 self.push(outer_bottom, rank, breakable);
+            }
+            if flex_items {
+                let between_items = !matches!(
+                    rank_between(styles.clone_break_before()),
+                    Some(Rank::Forbidden)
+                );
+                if let Some(end) = previous_item_end.filter(|_| between_items) {
+                    self.push(end, Rank::Legal, breakable);
+                }
+                first_item = false;
             }
 
             // Descend only into a box that shares its parent's fragmentainer: a scroll container
@@ -604,9 +658,17 @@ impl<'a> Planner<'a> {
             }
             // A flex item is one thing the container sized and placed: where it does not fit the
             // fragmentainer, the container moves it on rather than halving it
-            // (`flexbox-unbreakable-child`).
+            // (`flexbox-unbreakable-child`). The room the container left before the item is part of
+            // what moves with it — that is why the break between two items falls at the end of the
+            // one that came first — so an item that only fits once its gap is added to it is broken
+            // where it stands rather than carried on (`flexbox-single-column-1a`).
             if flex_items {
-                self.units.push(Unit::item(outer_top, outer_bottom));
+                self.units.push(Unit::item(
+                    previous_item_end.unwrap_or(outer_top),
+                    outer_top,
+                    outer_bottom,
+                ));
+                previous_item_end = Some(outer_bottom);
             }
             // A box that clones the decoration of its fragments holds less content in each one than
             // the fragmentainer is deep, and a cut inside it moves the next band back by that much.
@@ -788,7 +850,7 @@ pub(crate) fn cut_bands(
     };
     let mut too_tall: Vec<f32> = units
         .iter()
-        .filter(|unit| unit.flex_item && unit.height() > extent && !has_inside(unit))
+        .filter(|unit| unit.flex_item && unit.box_height() > extent && !has_inside(unit))
         .map(|unit| unit.start)
         .collect();
     too_tall.sort_by(|a, b| a.total_cmp(b));
@@ -1041,7 +1103,7 @@ mod tests {
     #[test]
     fn a_box_too_tall_to_move_on_is_not_moved() {
         let edges = [edge(0.0, Rank::Legal), edge(40.0, Rank::Legal)];
-        let units = [Unit::item(40.0, 200.0)];
+        let units = [Unit::item(40.0, 40.0, 200.0)];
         let bands = cut_bands(&edges, &units, &[], 0.0, 100.0, 800.0, 200.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 100.0));
         assert_eq!((bands[1].start, bands[1].end), (100.0, 200.0));
@@ -1056,7 +1118,7 @@ mod tests {
             edge(40.0, Rank::Legal),
             edge(150.0, Rank::Legal),
         ];
-        let units = [Unit::item(40.0, 200.0)];
+        let units = [Unit::item(40.0, 40.0, 200.0)];
         let bands = cut_bands(&edges, &units, &[], 0.0, 100.0, 800.0, 200.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 40.0));
     }
@@ -1104,14 +1166,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         let dump = planner
             .edges
             .iter()
-            .map(|edge| {
-                let rank = match edge.rank {
-                    Rank::Forced => "forced",
-                    Rank::Legal => "legal",
-                    Rank::Forbidden => "avoid",
-                };
-                format!("{:.1}:{rank}", edge.at)
-            })
+            .map(|edge| format!("{:.1}:{}", edge.at, edge.rank_name()))
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!("fragmentation edges ({}): {dump}", doc.base_url());

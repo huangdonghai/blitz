@@ -259,6 +259,27 @@ impl LayoutPassState<'_> {
                     band.start, band.end, band.origin.x, band.origin.y, band.cross
                 );
             }
+            // Where the flow may be cut, and what cannot be cut at all: these two decide every
+            // band above, so a column that holds the wrong box is explained here.
+            let ranks = edges
+                .iter()
+                .map(|edge| format!("{:.1}:{}", edge.at, edge.rank_name()))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let whole = units
+                .iter()
+                .map(|unit| {
+                    format!(
+                        "{:.1}..{:.1}{}",
+                        unit.start,
+                        unit.end,
+                        if unit.flex_item { " item" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!("  edges: {ranks}");
+            eprintln!("  units: {whole}");
         }
 
         self.nodes[dom_id].break_plan = Some(Box::new(BreakPlan {
