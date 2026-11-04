@@ -891,12 +891,7 @@ impl<'a> Planner<'a> {
             if after == 0 {
                 continue;
             }
-            let rank = if after < widows || before < orphans {
-                Rank::Forbidden
-            } else {
-                Rank::Legal
-            };
-            self.push(*y, rank, true);
+            self.push(*y, line_rank(before, after, orphans, widows), true);
         }
     }
 
@@ -912,6 +907,20 @@ impl<'a> Planner<'a> {
         self.units.sort_by(|a, b| a.start.total_cmp(&b.start));
         self.spans.sort_by(|a, b| a.start.total_cmp(&b.start));
         cut_bands(&self.edges, &self.units, &self.spans, start, extent, cross, content_end)
+    }
+}
+
+/// Where a line box may be cut between, as the two counts a block carries decide it
+/// (CSS Break 3 §3.3, and §3.4 for what they mean at the end of a fragmentainer): a break leaves
+/// `before` lines behind and `after` ones to go, and neither side may be left with fewer lines than
+/// the count that speaks for it — `orphans` for the fragment the lines came out of, `widows` for the
+/// one they go to. A block's last line ends the block rather than breaking inside it, which the
+/// caller skips before ever asking.
+fn line_rank(before: usize, after: usize, orphans: usize, widows: usize) -> Rank {
+    if after < widows || before < orphans {
+        Rank::Forbidden
+    } else {
+        Rank::Legal
     }
 }
 
@@ -1101,6 +1110,53 @@ mod tests {
 
     fn edge(at: f32, rank: Rank) -> Edge {
         Edge { at, rank }
+    }
+
+    /// A twelve-line block with `orphans: 7` and `widows: 3` — `widows-orphans-014`, whose assert
+    /// asks for a break between the seventh line and the eighth. Three of its eleven interior points
+    /// satisfy both counts, and they are the ones the two numbers leave room for.
+    #[test]
+    fn two_counts_leave_only_the_middle_of_a_twelve_line_block() {
+        let legal: Vec<usize> = (1..12)
+            .filter(|before| matches!(line_rank(*before, 12 - *before, 7, 3), Rank::Legal))
+            .collect();
+        assert_eq!(legal, vec![7, 8, 9], "seven must stay behind, three must arrive");
+    }
+
+    /// With both counts at 1 every line ends a legal break; `line_rank` is asked only about interior
+    /// points, so the smallest thing it can be told about is one line on each side.
+    #[test]
+    fn a_pair_of_ones_breaks_between_every_line() {
+        for before in 1..12 {
+            assert_eq!(line_rank(before, 12 - before, 1, 1), Rank::Legal);
+        }
+        assert_eq!(line_rank(1, 1, 2, 2), Rank::Forbidden);
+    }
+
+    /// `orphans` guards the fragment the lines came out of and `widows` the one they arrive in:
+    /// moving either count moves the allowed points to the matching end of the block.
+    #[test]
+    fn orphans_guards_the_end_left_behind() {
+        assert_eq!(line_rank(2, 10, 3, 1), Rank::Forbidden, "two left, three asked for");
+        assert_eq!(line_rank(3, 9, 3, 1), Rank::Legal);
+        assert_eq!(line_rank(10, 2, 1, 3), Rank::Forbidden, "two to arrive, three asked for");
+        assert_eq!(line_rank(9, 3, 1, 3), Rank::Legal);
+    }
+
+    /// The counts decide which points exist to be cut at, and the cut then takes the last of them
+    /// before the fragmentainer's edge: twelve 26px lines in a 100px page with `orphans: 3` and
+    /// `widows: 3` can only end after the third line, because the fourth would leave too few to
+    /// arrive anywhere but the edge itself.
+    #[test]
+    fn the_cut_takes_the_last_point_both_counts_allow() {
+        let edges: Vec<Edge> = (1..12)
+            .map(|line| Edge {
+                at: line as f32 * 26.0,
+                rank: line_rank(line as usize, 12 - line as usize, 3, 3),
+            })
+            .collect();
+        let bands = cut_bands(&edges, &[], &[], 0.0, 100.0, 100.0, 312.0);
+        assert_eq!(bands[0].end, 78.0, "the last point that leaves three to arrive: {bands:?}");
     }
 
     /// A flow that fits one fragmentainer is one page, however short it is: the page box is the
