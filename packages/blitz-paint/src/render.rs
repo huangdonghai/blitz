@@ -23,7 +23,7 @@ use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
     TextNodeData,
 };
-use blitz_dom::{BaseDocument, ElementData, Node, NodeId, local_name};
+use blitz_dom::{BaseDocument, ElementData, FlowAxis, Node, NodeId, local_name};
 use blitz_traits::devtools::DevtoolSettings;
 
 use style::values::computed::{BorderCornerRadius, ColorOrAuto};
@@ -243,22 +243,24 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                 Affine::translate(scroll),
                 viewport_clip_rect,
                 false,
+                None,
             ),
             Some(plan) => {
                 // A fragmented flow is painted once per fragmentainer: the band's slice of the
                 // flow shifted to its page box and clipped to it. Shifting and clipping is all
                 // fragmentation needs of paint — a box broken across two pages loses its far-edge
                 // decorations to the clip, which is `box-decoration-break: slice`.
-                for band in plan.bands.iter() {
+                let last = plan.bands.len().saturating_sub(1);
+                for (index, band) in plan.bands.iter().enumerate() {
                     let shift = plan.translate(band);
                     let page = plan.fragment_rect(band);
-                    let clip = Rect::new(
+                    let band_rect = Rect::new(
                         page.left as f64 * self.scale,
                         page.top as f64 * self.scale,
                         page.right as f64 * self.scale,
                         page.bottom as f64 * self.scale,
-                    )
-                    .intersect(viewport_clip_rect);
+                    );
+                    let clip = band_rect.intersect(viewport_clip_rect);
                     if clip.area() <= 0.0 {
                         continue;
                     }
@@ -275,6 +277,12 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         }),
                         clip,
                         true,
+                        Some(Fragmentainer {
+                            rect: band_rect,
+                            axis: plan.axis,
+                            outer_start: index == 0,
+                            outer_end: index == last,
+                        }),
                     );
                     scene.pop_layer();
                 }
@@ -330,6 +338,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         parent_style_transform: Affine,
         clip_rect: Rect,
         band_applied: bool,
+        frag: Option<Fragmentainer>,
     ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
@@ -389,7 +398,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // The root element's overflow is propagated to the viewport (which is clipped by the
         // window/surface bounds), so the root element must not clip its own overflow.
         let is_root_element = self.root_element_id == Some(node_id);
-        let should_clip = !is_root_element
+        let mut should_clip = !is_root_element
             && (is_image
                 || is_sub_doc
                 || is_text_input
@@ -450,6 +459,21 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             * Affine::translate(box_position)
             * node.transform().as_deref().copied().unwrap_or_default()
             * combine_transform;
+
+        // A box that a fragmentainer cuts, and that asks for `box-decoration-break: clone`, is drawn
+        // as its fragment: its own border box shortened to the band, and its content moved inside
+        // the border and padding the break added.
+        let piece = clone_fragment(node, node.final_layout(), transform, frag, self.scale);
+        let transform = match &piece {
+            Some(piece) => transform.then_translate(piece.moved),
+            None => transform,
+        };
+        // A fragment cuts its own content to what stands inside the border and padding the break
+        // added, whatever the box's overflow asked for. The root element's overflow belongs to the
+        // viewport rather than to itself, and the band already cuts it.
+        if piece.is_some() && !is_root_element {
+            should_clip = true;
+        }
 
         let screen_transform = Affine::translate(Vec2 {
             x: -self.initial_x,
@@ -525,15 +549,29 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             transform,
             clip_rect,
             band_applied,
+            frag,
             custom_widget_scene,
         );
+
+        // The fragment is a box: its border box is what the band left of the original, so every
+        // decoration is drawn around it, and its content is cut to what stands inside them.
+        if let Some(piece) = &piece {
+            cx.frame = CssBox::new(
+                piece.rect,
+                cx.frame.border_width,
+                cx.frame.padding_width,
+                cx.frame.outline_width,
+                cx.frame.border_radii.clone(),
+            );
+            cx.frag = Some(piece.frag);
+        }
 
         // If this element clips its overflow it establishes a scrollport: narrow the clip
         // rectangle passed to descendants to the visible (clipped) region so that content
         // scrolled out of view is culled rather than drawn and clipped away. The box used
         // here matches the clip applied to the content below.
         let child_clip_rect = if should_clip {
-            let clip_box = if is_text_input {
+            let clip_box = if is_text_input || piece.is_some() {
                 cx.frame.content_box_path()
             } else {
                 cx.frame.padding_box_path()
@@ -628,7 +666,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         cx.stroke_devtools(scene);
 
                         // TODO: allow layers with opacity to be unclipped (overflow: visible)
-                        let clip = if is_text_input {
+                        // A fragment is cut to its own content box: the border and padding the break
+                        // cloned sit between that box and the band, and content belongs to neither.
+                        let clip = if is_text_input || piece.is_some() {
                             &cx.frame.content_box_path()
                         } else {
                             &cx.frame.padding_box_path()
@@ -654,7 +694,17 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                     x: -node.scroll_offset().x * self.scale,
                                     y: -node.scroll_offset().y * self.scale,
                                 });
-                                cx.draw_content_fragmented(scene, content_position, child_clip_rect);
+                                // The content of a fragment stands inside the border and padding
+                                // its cut added, so it slides along the flow from where the box
+                                // would have drawn it.
+                                if let Some(piece) = &piece {
+                                    cx.transform = cx.transform.then_translate(piece.shift);
+                                }
+                                cx.draw_content_fragmented(
+                                    scene,
+                                    content_position,
+                                    child_clip_rect,
+                                );
                             },
                         );
 
@@ -684,19 +734,19 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         node_id: NodeId,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        frag: Option<Fragmentainer>,
     ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
         match &node.data {
-            NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
-                self.render_element(
-                    scene,
-                    node_id,
-                    parent_style_transform,
-                    clip_rect,
-                    false,
-                )
-            }
+            NodeData::Element(_) | NodeData::AnonymousBlock(_) => self.render_element(
+                scene,
+                node_id,
+                parent_style_transform,
+                clip_rect,
+                false,
+                frag,
+            ),
             NodeData::Text(TextNodeData { .. }) => {
                 // Text nodes should never be rendered directly
                 // (they should always be rendered as part of an inline layout)
@@ -715,6 +765,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         transform: Affine,
         clip_rect: Rect,
         band_applied: bool,
+        frag: Option<Fragmentainer>,
         custom_widget_scene: Option<&'a Scene>,
     ) -> ElementCx<'dom, 'a> {
         let style = node
@@ -745,6 +796,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             transform,
             clip_rect,
             band_applied,
+            frag,
             #[cfg(feature = "svg")]
             svg: match element.image_data() {
                 Some(blitz_dom::node::ImageData::Svg(svg)) => Some(svg),
@@ -809,6 +861,9 @@ struct ElementCx<'dom, 'a> {
     /// [`ElementCx::draw_content_fragmented`]; either way the content below is drawn once per
     /// fragment, and cutting it again would move and clip it twice.
     band_applied: bool,
+    /// The fragmentainer this box's content is cut by, when the box stands in a fragmented flow.
+    /// A box that cloned its own decoration replaces it with its fragment's content box.
+    frag: Option<Fragmentainer>,
     #[cfg(feature = "svg")]
     svg: Option<&'dom blitz_dom::node::SvgImageData>,
     text_input: Option<&'dom TextInputData>,
@@ -859,26 +914,240 @@ fn text_combine_adjustment(node: &Node, scale: f64) -> Option<(f64, f64)> {
 }
 
 /// How far outside its own border box an element draws: an outline sits beyond the box by its
-/// width plus the offset that moves it out.
+/// width plus the offset that moves it out, and an outset shadow reaches by its spread plus the
+/// blur that softens it, further on the side its offset points to.
 ///
 /// A fragmentainer cuts the flow where a break falls; it does not cut the decoration of a box the
 /// break left whole, which is why Chrome shows a spanning box's outline over the gutter it would
-/// otherwise be clipped to.
-fn outline_bleed(node: &Node) -> f32 {
+/// otherwise be clipped to, and the sides of a box's shadow past the edge of the column that holds
+/// it (`box-shadow-002`). The insets are outward, in CSS pixels, and none is ever negative.
+fn decoration_bleed(node: &Node) -> Insets {
     use style::values::computed::{BorderStyle, OutlineStyle};
     let Some(styles) = node.primary_styles() else {
-        return 0.0;
+        return Insets::ZERO;
     };
+    let mut bleed = Insets::ZERO;
     let outline = styles.get_outline();
-    let OutlineStyle::BorderStyle(style) = outline.outline_style else {
-        return 0.0;
-    };
-    if matches!(style, BorderStyle::None | BorderStyle::Hidden) {
-        return 0.0;
+    if let OutlineStyle::BorderStyle(style) = outline.outline_style {
+        if !matches!(style, BorderStyle::None | BorderStyle::Hidden) {
+            let amount = (f64::from(outline.outline_width.0.to_f32_px())
+                + outline.outline_offset.to_f64_px())
+            .max(0.0);
+            bleed = widest(bleed, Insets::uniform(amount));
+        }
     }
-    let width = outline.outline_width.0.to_f32_px();
-    let offset = outline.outline_offset.to_f32_px();
-    (width + offset).max(0.0)
+    for shadow in styles
+        .get_effects()
+        .box_shadow
+        .0
+        .iter()
+        .filter(|shadow| !shadow.inset)
+    {
+        // The same reach the shadow is drawn with: a blur spreads two and a half times its radius.
+        let reach = f64::from(shadow.spread.px()) + f64::from(shadow.base.blur.px()) * 2.5;
+        let x = f64::from(shadow.base.horizontal.px());
+        let y = f64::from(shadow.base.vertical.px());
+        bleed = widest(
+            bleed,
+            Insets::new(
+                (reach - x).max(0.0),
+                (reach - y).max(0.0),
+                (reach + x).max(0.0),
+                (reach + y).max(0.0),
+            ),
+        );
+    }
+    bleed
+}
+
+/// The reach two decorations have outside the box, edge by edge.
+fn widest(one: Insets, other: Insets) -> Insets {
+    Insets::new(
+        one.x0.max(other.x0),
+        one.y0.max(other.y0),
+        one.x1.max(other.x1),
+        one.y1.max(other.y1),
+    )
+}
+
+/// Whether a box asks that the decoration of each of its fragments be drawn whole — which is why
+/// such a box may bleed past a break: wherever the band cut it, it draws its own edge there.
+fn clones_decorations(node: &Node) -> bool {
+    use style::properties::generated::longhands::box_decoration_break::computed_value::T as BoxDecorationBreak;
+    node.primary_styles().is_some_and(|styles| {
+        matches!(
+            styles.get_border().box_decoration_break,
+            BoxDecorationBreak::Clone
+        )
+    })
+}
+
+/// One fragmentainer, as the paint of the flow it holds needs to know it: where it cuts, and where
+/// the flow simply ends.
+#[derive(Clone, Copy)]
+struct Fragmentainer {
+    /// The band's own rectangle on the canvas, before any decoration is allowed past it.
+    rect: Rect,
+    /// The axis the flow advances along, which is the axis a box is cut on.
+    axis: FlowAxis,
+    /// Whether the near edge along the flow is where the flow starts, and the same at the far edge.
+    /// A box may bleed what it draws outside its border box past an end of the flow, but never past
+    /// a break, because the next fragmentainer is what lies there.
+    outer_start: bool,
+    outer_end: bool,
+}
+
+impl Fragmentainer {
+    /// The rectangle one box of the flow is cut to: the fragmentainer widened by what that box
+    /// draws outside its own border box along the cross axis, and along the flow only where the
+    /// flow ends — or, for a box that clones its decoration, wherever it was cut.
+    fn clip_for(&self, bleed: Insets, scale: f64, cloned: bool) -> Rect {
+        let Insets { x0, y0, x1, y1 } = bleed;
+        let (x0, y0, x1, y1) = (x0 * scale, y0 * scale, x1 * scale, y1 * scale);
+        let (start, end) = if cloned {
+            (true, true)
+        } else {
+            (self.outer_start, self.outer_end)
+        };
+        match self.axis {
+            FlowAxis::Y => Rect::new(
+                self.rect.x0 - x0,
+                self.rect.y0 - if start { y0 } else { 0.0 },
+                self.rect.x1 + x1,
+                self.rect.y1 + if end { y1 } else { 0.0 },
+            ),
+            // A vertical flow runs left to right for now; `vertical-rl` will ask for the other end.
+            FlowAxis::X => Rect::new(
+                self.rect.x0 - if start { x0 } else { 0.0 },
+                self.rect.y0 - y0,
+                self.rect.x1 + if end { x1 } else { 0.0 },
+                self.rect.y1 + y1,
+            ),
+        }
+    }
+}
+
+/// What one box looks like cut by a fragmentainer when it asks for `box-decoration-break: clone`:
+/// the fragment is decorated as its own box, and its content moves inside the border and padding
+/// the cut adds.
+struct Piece {
+    /// The fragment's own border box, in coordinates whose origin is the fragment's near corner.
+    rect: Rect,
+    /// How far the box's own drawing origin moves to the fragment's.
+    moved: Vec2,
+    /// How much further its content moves in from the cut, along the flow.
+    shift: Vec2,
+    /// The fragmentainer the content is cut to: the fragment's content box, because the border and
+    /// padding the clone adds at the cut sit between the fragment's own edge and its content.
+    frag: Fragmentainer,
+}
+
+/// The fragment a fragmentainer cuts out of a box that asks for its decorations cloned, or `None`
+/// when the box is drawn as itself.
+///
+/// `transform` maps the box's own coordinates — its border box standing at the origin — on to the
+/// canvas, where the band has already slid it. A box the band leaves whole needs nothing of this:
+/// its own decorations are its fragment's.
+fn clone_fragment(
+    node: &Node,
+    layout: &Layout,
+    transform: Affine,
+    frag: Option<Fragmentainer>,
+    scale: f64,
+) -> Option<Piece> {
+    if !clones_decorations(node) {
+        return None;
+    }
+    let frag = frag?;
+    // Only a box that reaches the canvas by sliding its own coordinates along it has a fragment
+    // that is a box: under a rotated or scaled ancestor the cut would have to be taken in that
+    // space rather than this one.
+    let [sx, ky, kx, sy, _, _] = transform.as_coeffs();
+    if sx != 1.0 || ky != 0.0 || kx != 0.0 || sy != 1.0 {
+        return None;
+    }
+    let on_canvas = transform.transform_rect_bbox(Rect::from_origin_size(
+        Point::ZERO,
+        Size::new(
+            layout.size.width as f64 * scale,
+            layout.size.height as f64 * scale,
+        ),
+    ));
+    let hit = on_canvas.intersect(frag.rect);
+    // A fragmentainer cuts along the flow only: a box wider than the column it stands in is not
+    // broken for that, so the cross axis keeps the box's own measure.
+    let piece = match frag.axis {
+        FlowAxis::Y => Rect::new(on_canvas.x0, hit.y0, on_canvas.x1, hit.y1),
+        FlowAxis::X => Rect::new(hit.x0, on_canvas.y0, hit.x1, on_canvas.y1),
+    };
+    // Where the band's edges fell inside the box. A break adds a border and padding to the
+    // fragment; an end of the flow adds nothing, because the box's own edge is already there.
+    let (cut_start, cut_end) = match frag.axis {
+        FlowAxis::Y => (
+            on_canvas.y0 < frag.rect.y0 - 0.5,
+            on_canvas.y1 > frag.rect.y1 + 0.5,
+        ),
+        FlowAxis::X => (
+            on_canvas.x0 < frag.rect.x0 - 0.5,
+            on_canvas.x1 > frag.rect.x1 + 0.5,
+        ),
+    };
+    // A box the band does not reach along the flow is not fragmenting here at all: some other band
+    // holds it, and this one must not draw a line where its edge clipped the box to nothing.
+    let depth = match frag.axis {
+        FlowAxis::Y => piece.height(),
+        FlowAxis::X => piece.width(),
+    };
+    if depth <= 0.5 {
+        return None;
+    }
+    if !(cut_start || cut_end) {
+        return None;
+    }
+    // The border and padding the box puts at the near end of its own extent along the flow.
+    let near = match frag.axis {
+        FlowAxis::Y => (layout.border.top + layout.padding.top) as f64 * scale,
+        FlowAxis::X => (layout.border.left + layout.padding.left) as f64 * scale,
+    };
+    // The content that stood at the flow line the cut fell on moves in by the border and padding
+    // the clone adds there — but not past the box's own edge, which already had them.
+    let into = piece.origin() - on_canvas.origin();
+    let shift = match frag.axis {
+        FlowAxis::Y => Vec2::new(0.0, into.y.min(near)),
+        FlowAxis::X => Vec2::new(into.x.min(near), 0.0),
+    };
+    let moved = piece.origin() - on_canvas.origin();
+    // The fragment's content box on the canvas: the decoration transform slides the fragment's own
+    // origin, which is where `piece` already sits.
+    let (left, top) = (
+        (layout.border.left + layout.padding.left) as f64 * scale,
+        (layout.border.top + layout.padding.top) as f64 * scale,
+    );
+    let (right, bottom) = (
+        (layout.border.right + layout.padding.right) as f64 * scale,
+        (layout.border.bottom + layout.padding.bottom) as f64 * scale,
+    );
+    let content = Rect::new(
+        piece.x0 + left,
+        piece.y0 + top,
+        piece.x1 - right,
+        piece.y1 - bottom,
+    );
+    Some(Piece {
+        rect: Rect::from_origin_size(Point::ZERO, piece.size()),
+        moved,
+        shift,
+        frag: Fragmentainer {
+            // Never wider than the band: the fragment's content box may reach past a column the box
+            // itself overflows, and its children are cut to the column, not to the box.
+            rect: content.intersect(frag.rect),
+            axis: frag.axis,
+            // An edge of the content box that is not a cut leads into the box's own padding, which
+            // its children may overflow; an edge the break put there cuts them.
+            outer_start: !cut_start,
+            outer_end: !cut_end,
+        },
+    })
 }
 
 impl ElementCx<'_, '_> {
@@ -1051,8 +1320,7 @@ impl ElementCx<'_, '_> {
             // Render inline element backgrounds (e.g. `<span style="background: ...">`)
             // behind the text and selection highlight.
             #[cfg(feature = "writing-mode")]
-            let vertical =
-                crate::text::vertical_text(self.context.dom, self.node.id, self.scale);
+            let vertical = crate::text::vertical_text(self.context.dom, self.node.id, self.scale);
             #[cfg(not(feature = "writing-mode"))]
             let vertical = None;
 
@@ -1298,7 +1566,8 @@ impl ElementCx<'_, '_> {
         };
         let base = self.transform;
         self.draw_column_rules(scene);
-        for band in plan.bands.iter() {
+        let last = plan.bands.len().saturating_sub(1);
+        for (index, band) in plan.bands.iter().enumerate() {
             let shift = plan.translate(band);
             let fragment = plan.fragment_rect(band);
             let own = Rect::new(
@@ -1309,7 +1578,8 @@ impl ElementCx<'_, '_> {
             );
             // Measured against `base`, not the running transform: the loop moves `self.transform`
             // for the band it draws, and a later band's clip would inherit the earlier shift.
-            let clip = base.transform_rect_bbox(own).intersect(clip_rect);
+            let band_rect = base.transform_rect_bbox(own);
+            let clip = band_rect.intersect(clip_rect);
             if clip.area() <= 0.0 {
                 continue;
             }
@@ -1324,15 +1594,23 @@ impl ElementCx<'_, '_> {
             scene.pop_layer();
             // Each child is cut to the fragmentainer in a layer of its own, widened by whatever it
             // draws outside its own box: a break that left the child whole must not shave the
-            // outline it draws around itself.
-            self.draw_children(scene, self.transform, clip, Some(clip));
+            // outline it draws around itself, nor the side of a shadow that reaches into the gutter.
+            let frag = Fragmentainer {
+                rect: band_rect,
+                axis: plan.axis,
+                outer_start: index == 0,
+                outer_end: index == last,
+            };
+            self.draw_children(scene, self.transform, clip_rect, Some(frag));
         }
         self.transform = base;
     }
 
     fn draw_content(&self, scene: &mut impl PaintScene, content_position: Point, clip_rect: Rect) {
         self.draw_own_content(scene, content_position);
-        self.draw_children(scene, self.transform, clip_rect, None);
+        // A box of a fragmented flow cuts its own children by the band that cuts it, so that a
+        // decoration they draw outside their boxes is not shaved by an ancestor's clip.
+        self.draw_children(scene, self.transform, clip_rect, self.frag);
     }
 
     /// What a box draws itself: its text, its replaced parts, its marker. Its children are not
@@ -1350,25 +1628,26 @@ impl ElementCx<'_, '_> {
         self.draw_marker(scene, content_position);
     }
 
-    /// One child of a fragmented box, clipped to the fragmentainer the child was shifted into.
+    /// One child of a fragmented box, cut to the fragmentainer the child stands in, widened by the
+    /// decoration that child draws outside its own border box.
     fn render_fragment_child(
         &self,
         scene: &mut impl PaintScene,
         child_id: NodeId,
         transform: Affine,
-        band_clip: Rect,
+        frag: Fragmentainer,
+        clip_rect: Rect,
     ) {
-        let bleed = outline_bleed(&self.context.dom.as_ref().tree()[child_id]) as f64 * self.scale;
-        let clip = if bleed > 0.0 {
-            band_clip.inflate(bleed, bleed)
-        } else {
-            band_clip
-        };
+        let child = &self.context.dom.as_ref().tree()[child_id];
+        let bleed = decoration_bleed(child);
+        let clip = frag
+            .clip_for(bleed, self.scale, clones_decorations(child))
+            .intersect(clip_rect);
         if clip.area() <= 0.0 {
             return;
         }
         scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-        self.render_node(scene, child_id, transform, clip);
+        self.render_node(scene, child_id, transform, clip, Some(frag));
         scene.pop_layer();
     }
 
@@ -1382,7 +1661,7 @@ impl ElementCx<'_, '_> {
         scene: &mut impl PaintScene,
         parent_style_transform: Affine,
         clip_rect: Rect,
-        band: Option<Rect>,
+        band: Option<Fragmentainer>,
     ) {
         // Negative z_index hoisted nodes
 
@@ -1395,10 +1674,16 @@ impl ElementCx<'_, '_> {
                 };
                 let transform = parent_style_transform.pre_translate(pos);
                 match band {
-                    Some(band_clip) => {
-                        self.render_fragment_child(scene, hoisted_child.node_id, transform, band_clip)
+                    Some(frag) => self.render_fragment_child(
+                        scene,
+                        hoisted_child.node_id,
+                        transform,
+                        frag,
+                        clip_rect,
+                    ),
+                    None => {
+                        self.render_node(scene, hoisted_child.node_id, transform, clip_rect, band)
                     }
-                    None => self.render_node(scene, hoisted_child.node_id, transform, clip_rect),
                 }
             }
         }
@@ -1423,10 +1708,14 @@ impl ElementCx<'_, '_> {
                     parent_style_transform
                 };
                 match band {
-                    Some(band_clip) => {
-                        self.render_fragment_child(scene, *child_id, child_transform, band_clip)
-                    }
-                    None => self.render_node(scene, *child_id, child_transform, clip_rect),
+                    Some(frag) => self.render_fragment_child(
+                        scene,
+                        *child_id,
+                        child_transform,
+                        frag,
+                        clip_rect,
+                    ),
+                    None => self.render_node(scene, *child_id, child_transform, clip_rect, band),
                 }
             }
         }
@@ -1441,10 +1730,16 @@ impl ElementCx<'_, '_> {
                 };
                 let transform = parent_style_transform.pre_translate(pos);
                 match band {
-                    Some(band_clip) => {
-                        self.render_fragment_child(scene, hoisted_child.node_id, transform, band_clip)
+                    Some(frag) => self.render_fragment_child(
+                        scene,
+                        hoisted_child.node_id,
+                        transform,
+                        frag,
+                        clip_rect,
+                    ),
+                    None => {
+                        self.render_node(scene, hoisted_child.node_id, transform, clip_rect, band)
                     }
-                    None => self.render_node(scene, hoisted_child.node_id, transform, clip_rect),
                 }
             }
         }
