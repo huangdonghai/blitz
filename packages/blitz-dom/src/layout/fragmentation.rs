@@ -323,6 +323,15 @@ fn page_box(doc: &BaseDocument) -> PageBox {
     let guard = doc.guard().read();
     let pseudos = style::stylesheets::PagePseudoClassFlags::FIRST
         | style::stylesheets::PagePseudoClassFlags::RIGHT;
+    // A page inherits from the root element (CSS Page 3 §5.1.1), which is where a page rule's
+    // `inherit` comes from — `page-margin-006-print` asks for the root's half-inch margin on every
+    // side of the paper. The root box's own containing block is the page area, so a percentage of
+    // its margin asks for the measure the page box has.
+    let root_margin = doc
+        .root_element()
+        .layout_style()
+        .margin()
+        .resolve_or_zero(Some(page.size.width), resolve_calc_value);
     // A name carries more specificity than the plain `@page`, so the unnamed rules go first and
     // the page's own name after them; within each group a `:first` or `:right` selector outranks a
     // bare one, which is what sorting by specificity does.
@@ -371,6 +380,34 @@ fn page_box(doc: &BaseDocument) -> PageBox {
                         }
                         PropertyDeclaration::Height(value) => {
                             area.height = page_edge(value, page.size.height).unwrap_or(area.height);
+                        }
+                        // A CSS-wide keyword reaches an expanded declaration block one per longhand.
+                        // `inherit` asks for the root element's margin, `initial` and `unset` for
+                        // nothing, which is what a margin starts at; a reverted page rule is not
+                        // read here, and leaves the margin as the rules before it made it.
+                        PropertyDeclaration::CSSWideKeyword(keyword) => {
+                            use style::properties::{
+                                CSSWideKeyword as Keyword, LonghandId, PropertyDeclarationId,
+                            };
+                            let PropertyDeclarationId::Longhand(id) = declaration.id() else {
+                                continue;
+                            };
+                            let (target, inherited): (&mut f32, f32) = match id {
+                                LonghandId::MarginTop => (&mut page.margin.top, root_margin.top),
+                                LonghandId::MarginRight => {
+                                    (&mut page.margin.right, root_margin.right)
+                                }
+                                LonghandId::MarginBottom => {
+                                    (&mut page.margin.bottom, root_margin.bottom)
+                                }
+                                LonghandId::MarginLeft => (&mut page.margin.left, root_margin.left),
+                                _ => continue,
+                            };
+                            *target = match keyword.keyword {
+                                Keyword::Inherit => inherited,
+                                Keyword::Initial | Keyword::Unset => 0.0,
+                                _ => continue,
+                            };
                         }
                         _ => {}
                     }
