@@ -300,12 +300,15 @@ fn window(doc: &BaseDocument) -> Size<f32> {
     }
 }
 
-/// `@page { size; margin }` as read from the document's stylesheets.
+/// The page a document starts on, as the document's `@page` rules describe it.
 ///
-/// A document with no page rules prints on the window it was given, with no margin. `:first`,
-/// `:left` and `:right` are not matched yet, so every rule that asks for the starting page's name
-/// is applied; a named page's own `size` is not sought either, because the page a document starts
-/// on is the only one whose box is resolved here.
+/// A document with no page rules prints on the window it was given, with no margin. The page's name
+/// is the name the first box of its flow asks for (CSS Page 3 §6.5), and the rules matched are the
+/// unnamed ones plus that name's, each carrying the pseudo-classes of the first page — Chrome
+/// numbers a document's first page on the right-hand side of a spread, so `:first` and `:right`
+/// both match it. Later pages are not resolved here: the page area is the containing block the
+/// whole flow is laid out in, so another page's box could only be honoured by laying the flow out
+/// again.
 fn page_box(doc: &BaseDocument) -> PageBox {
     let mut page = PageBox {
         size: window(doc),
@@ -318,41 +321,59 @@ fn page_box(doc: &BaseDocument) -> PageBox {
     };
     let mut area = Size::default();
     let guard = doc.guard().read();
-    // The unnamed `@page`, which is what a page with no name is printed on.
-    let unnamed = style::Atom::default();
-    for (data, _) in doc.stylist.iter_extra_data_origins() {
-        let Some(rules) = data.pages.rules.get(&unnamed) else {
-            continue;
-        };
-        for entry in rules.iter() {
-            let rule = entry.rule.read_with(&guard);
-            for declaration in rule.block.read_with(&guard).declarations() {
-                match declaration {
-                    PropertyDeclaration::Size(size) => apply_size(size, &mut page, doc),
-                    // A shorthand reaches a declaration block as its four longhands.
-                    PropertyDeclaration::MarginTop(value) => {
-                        page.margin.top = margin_px(value, page.size.height);
+    let pseudos = style::stylesheets::PagePseudoClassFlags::FIRST
+        | style::stylesheets::PagePseudoClassFlags::RIGHT;
+    // A name carries more specificity than the plain `@page`, so the unnamed rules go first and
+    // the page's own name after them; within each group a `:first` or `:right` selector outranks a
+    // bare one, which is what sorting by specificity does.
+    let mut keys = Vec::with_capacity(2);
+    keys.push(style::Atom::default());
+    if let Some(name) = starting_page_name(doc) {
+        keys.push(name);
+    }
+    for key in keys {
+        for (data, _) in doc.stylist.iter_extra_data_origins() {
+            let Some(rules) = data.pages.rules.get(&key) else {
+                continue;
+            };
+            let mut ordered = Vec::new();
+            for entry in rules.iter() {
+                let Some(spec) = entry.rule.read_with(&guard).match_specificity(pseudos) else {
+                    continue;
+                };
+                ordered.push((spec, entry));
+            }
+            ordered.sort_by_key(|(spec, _)| *spec);
+            for (_, entry) in ordered {
+                let rule = entry.rule.read_with(&guard);
+                for declaration in rule.block.read_with(&guard).declarations() {
+                    match declaration {
+                        PropertyDeclaration::Size(size) => apply_size(size, &mut page, doc),
+                        // A shorthand reaches a declaration block as its four longhands.
+                        PropertyDeclaration::MarginTop(value) => {
+                            page.margin.top = margin_px(value, page.size.height);
+                        }
+                        PropertyDeclaration::MarginRight(value) => {
+                            page.margin.right = margin_px(value, page.size.width);
+                        }
+                        PropertyDeclaration::MarginBottom(value) => {
+                            page.margin.bottom = margin_px(value, page.size.height);
+                        }
+                        PropertyDeclaration::MarginLeft(value) => {
+                            page.margin.left = margin_px(value, page.size.width);
+                        }
+                        // `width` and `height` in a page rule size the page *area* — the box the
+                        // content is laid out in — so the paper grows to fit them and their margins
+                        // (`page-size-013-print`, whose `size: 500px; width: 200px; height: 300px;
+                        // margin: 50px` prints on paper 300px by 400px).
+                        PropertyDeclaration::Width(value) => {
+                            area.width = page_edge(value, page.size.width).unwrap_or(area.width);
+                        }
+                        PropertyDeclaration::Height(value) => {
+                            area.height = page_edge(value, page.size.height).unwrap_or(area.height);
+                        }
+                        _ => {}
                     }
-                    PropertyDeclaration::MarginRight(value) => {
-                        page.margin.right = margin_px(value, page.size.width);
-                    }
-                    PropertyDeclaration::MarginBottom(value) => {
-                        page.margin.bottom = margin_px(value, page.size.height);
-                    }
-                    PropertyDeclaration::MarginLeft(value) => {
-                        page.margin.left = margin_px(value, page.size.width);
-                    }
-                    // `width` and `height` in a page rule size the page *area* — the box the
-                    // content is laid out in — so the paper grows to fit them and their margins
-                    // (`page-size-013-print`, whose `size: 500px; width: 200px; height: 300px;
-                    // margin: 50px` prints on paper 300px by 400px).
-                    PropertyDeclaration::Width(value) => {
-                        area.width = page_edge(value, page.size.width).unwrap_or(area.width);
-                    }
-                    PropertyDeclaration::Height(value) => {
-                        area.height = page_edge(value, page.size.height).unwrap_or(area.height);
-                    }
-                    _ => {}
                 }
             }
         }
@@ -364,6 +385,34 @@ fn page_box(doc: &BaseDocument) -> PageBox {
         page.size.height = area.height + page.margin.top + page.margin.bottom;
     }
     page
+}
+
+/// The name of the page the document starts on: the first box of its flow that asks for a page of
+/// its own, walking the flow in the order the page names are tracked in (`Planner::walk`).
+fn starting_page_name(doc: &BaseDocument) -> Option<style::Atom> {
+    page_name_in(doc, doc.root_element().id)
+}
+
+fn page_name_in(doc: &BaseDocument, node_id: NodeId) -> Option<style::Atom> {
+    let node = &doc.nodes[node_id];
+    if let Some(styles) = node.primary_styles() {
+        if let PageName::PageName(name) = styles.clone_page() {
+            return Some(name.0);
+        }
+    }
+    let children = node.layout_children.borrow();
+    let children = children.as_ref()?;
+    for child in children.iter() {
+        let id = *child;
+        let child = &doc.nodes[id];
+        if child.taffy_display() == taffy::Display::None || child.is_out_of_flow() {
+            continue;
+        }
+        if let Some(name) = page_name_in(doc, id) {
+            return Some(name);
+        }
+    }
+    None
 }
 
 /// One edge of the page area as a page rule gives it, or `None` when the rule leaves it to the
@@ -583,9 +632,12 @@ impl<'a> Planner<'a> {
                 && child.taffy_position() == taffy::Position::Static;
 
             // A named page breaks the flow where the *content* changes name (CSS Page 3 §6.5).
-            // The name of the box that holds the text is what counts, so a chain of wrappers each
+            // The name of the box that holds the text is what counts: a chain of wrappers each
             // asking for a name breaks nothing when the content inside returns to the name the
-            // flow already had — and a wrapper with no content of its own never breaks at all.
+            // flow already had (`page-name-inline-block-003`), and a box with no content of its
+            // own is not what the page is named for (`page-name-propagated-001`,
+            // `page-name-zero-height-001`) — which is why `layers-001-print`, whose named block
+            // wraps nothing but a bordered box, still prints as one page.
             let used = match styles.clone_page() {
                 PageName::Auto => inherited.clone(),
                 named => named,
