@@ -228,6 +228,10 @@ impl LayoutPassState<'_> {
                         x: insets.left + index as f32 * (columns.width + columns.gap),
                         y: insets.top,
                     };
+                    // Chrome measures a column rule by the fragmentainer's own depth: a container
+                    // that was given a height rules to that height even when balancing made the
+                    // columns shorter (multicol-rule-nested-balancing-001).
+                    band.depth = definite.unwrap_or(height);
                     band
                 })
                 .collect();
@@ -317,6 +321,7 @@ impl LayoutPassState<'_> {
                         y: offset,
                     },
                     cross: content_width,
+                    depth: run.end - run.start,
                 });
                 offset += run.end - run.start;
                 continue;
@@ -347,6 +352,7 @@ impl LayoutPassState<'_> {
                     x: insets.left + index as f32 * stride,
                     y: offset,
                 };
+                band.depth = definite.unwrap_or(height);
                 bands.push(band);
             }
             offset += height;

@@ -88,6 +88,9 @@ pub struct Band {
     /// narrower than the container that holds it, and a box that spans every column is as wide
     /// as that container again — so this is not a property of the plan.
     pub cross: f32,
+    /// How deep the fragmentainer is along the flow, whether or not the band filled it: a column
+    /// rule spans the whole fragmentainer, not the content that happens to sit in it.
+    pub depth: f32,
 }
 
 /// The cut plan of one fragmented flow.
@@ -692,6 +695,7 @@ pub(crate) fn cut_bands(
             end: if last { cursor + extent } else { cut },
             origin: Point::ZERO,
             cross,
+            depth: extent,
         });
         if last {
             break;

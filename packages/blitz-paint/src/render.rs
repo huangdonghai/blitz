@@ -1201,6 +1201,59 @@ impl ElementCx<'_, '_> {
         }
     }
 
+    /// The rule in the gutter of every column that has one.
+    ///
+    /// A rule is centred on the middle of the gutter — Chrome draws a 4px rule in a 20px gap at
+    /// x 98..102 of a column that ends at 90 — and it is as deep as the fragmentainer rather than
+    /// as deep as the content that happens to fill it. It belongs to the gutter and not to a
+    /// column, so it is drawn outside the per-band clips, which would cut it in half.
+    fn draw_column_rules(&self, scene: &mut impl PaintScene) {
+        use style::values::computed::BorderStyle;
+        // Only a multi-column container has gutters to rule; the plan of a page sequence puts
+        // its pages one below the other and its `stride` is the paper, not a column pitch.
+        if !self.node.is_multicol_box() {
+            return;
+        }
+        let column = self.style.get_column();
+        if matches!(
+            column.column_rule_style,
+            BorderStyle::None | BorderStyle::Hidden
+        ) {
+            return;
+        }
+        let width = column.column_rule_width.0.to_f32_px().max(0.0);
+        if width <= 0.0 {
+            return;
+        }
+        let color = column
+            .column_rule_color
+            .resolve_to_absolute(&self.style.clone_color())
+            .as_srgb_color();
+        if color == peniko::Color::TRANSPARENT {
+            return;
+        }
+        let Some(plan) = self.node.break_plan.as_deref() else {
+            return;
+        };
+        let left = self.frame.content_box.origin().x as f32;
+        for band in plan.bands.iter() {
+            // The leftmost fragmentainer of a row — and a box that spans every column — has no
+            // gutter to its left.
+            let gutter = plan.stride - band.cross;
+            if band.origin.x <= left + 0.5 || gutter <= 0.0 {
+                continue;
+            }
+            let centre = band.origin.x - gutter / 2.0;
+            let rect = Rect::new(
+                (centre - width / 2.0) as f64 * self.scale,
+                band.origin.y as f64 * self.scale,
+                (centre + width / 2.0) as f64 * self.scale,
+                (band.origin.y + band.depth) as f64 * self.scale,
+            );
+            scene.fill(Fill::NonZero, self.transform, color, None, &rect);
+        }
+    }
+
     /// The content of a box — its text, its replaced parts, its children — drawn once, or once
     /// per fragmentainer when the box has a break plan. A fragmented box's own background and
     /// border are *not* repeated: a multi-column container is one box with the columns inside it.
@@ -1221,6 +1274,7 @@ impl ElementCx<'_, '_> {
             return;
         };
         let base = self.transform;
+        self.draw_column_rules(scene);
         for band in plan.bands.iter() {
             let shift = plan.translate(band);
             let fragment = plan.fragment_rect(band);
