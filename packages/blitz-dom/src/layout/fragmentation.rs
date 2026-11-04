@@ -1348,7 +1348,37 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
     planner.walk(root_id, Point::ZERO, area.width, true, false, &root_page);
     // Where the content ends, and not the bottom of the first page: a flow shorter than a page
     // that asks for a break after its last box still gets one page, not two.
-    let content_end = planner.extent;
+    //
+    // The boxes anchored to this container count too. A box positioned against the page sequence is
+    // not one of the block sequence — the walk passes it by — but it stands in the flow the pages
+    // fragment, and its content is printed on as many of them as it needs: a document whose only
+    // content is a four-inch abspos box holding eight inches of green prints on the pages the green
+    // fills (`monolithic-overflow-027-print`, "four green pages", and `overflowing-block-002-print`,
+    // whose abspos content "is printed in two pages").
+    let content_end = planner.extent.max(anchored_extent(doc, root_id));
+
+    /// How far down the flow the boxes anchored to `container` reach, and their own anchored
+    /// descendants with them.
+    fn anchored_extent(doc: &BaseDocument, container: crate::NodeId) -> f32 {
+        let mut far: f32 = 0.0;
+        let hoisted = doc.nodes[container].hoisted_children.borrow();
+        for &child in hoisted.iter() {
+            let node = &doc.nodes[child];
+            let layout = node.final_layout();
+            let margin = node
+                .layout_style()
+                .margin()
+                .resolve_or_zero(None, resolve_calc_value);
+            let bottom = layout.location.y + layout.size.height + margin.bottom;
+            // Content that leaves the box travels with it, so the ink is what has to be printed.
+            let ink = layout.scrollable_overflow_rect.bottom;
+            far = far
+                .max(bottom)
+                .max(ink)
+                .max(anchored_extent(doc, node.id));
+        }
+        far
+    }
 
     #[cfg(debug_assertions)]
     if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
