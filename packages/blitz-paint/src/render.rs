@@ -989,6 +989,43 @@ enum OofChildren {
     Only,
 }
 
+/// Whether a fragmentainer left each end of this box alone: `(start whole, end whole)` along the
+/// flow. A box that begins at or after the fragmentainer's near edge, or ends at or before its far
+/// one, has that edge as its own — decoration there is the box's, not decoration a break removed.
+///
+/// The box's rect is taken the way [`clone_fragment`] takes it, from its own transform, so the
+/// comparison happens in the space the band was laid out in; a box reached through a rotated or
+/// scaled ancestor reports whole at neither end, which leaves the older, tighter clip in place.
+fn box_whole_in_band(
+    node: &Node,
+    transform: Affine,
+    frag: Fragmentainer,
+    scale: f64,
+) -> (bool, bool) {
+    let layout = node.final_layout();
+    let [sx, ky, kx, sy, _, _] = transform.as_coeffs();
+    if sx != 1.0 || ky != 0.0 || kx != 0.0 || sy != 1.0 {
+        return (false, false);
+    }
+    let on_canvas = transform.transform_rect_bbox(Rect::from_origin_size(
+        Point::ZERO,
+        Size::new(
+            layout.size.width as f64 * scale,
+            layout.size.height as f64 * scale,
+        ),
+    ));
+    match frag.axis {
+        FlowAxis::Y => (
+            on_canvas.y0 >= frag.rect.y0 - 0.5,
+            on_canvas.y1 <= frag.rect.y1 + 0.5,
+        ),
+        FlowAxis::X => (
+            on_canvas.x0 >= frag.rect.x0 - 0.5,
+            on_canvas.x1 <= frag.rect.x1 + 0.5,
+        ),
+    }
+}
+
 /// Whether a box asks that the decoration of each of its fragments be drawn whole — which is why
 /// such a box may bleed past a break: wherever the band cut it, it draws its own edge there.
 fn clones_decorations(node: &Node) -> bool {
@@ -1018,16 +1055,13 @@ struct Fragmentainer {
 
 impl Fragmentainer {
     /// The rectangle one box of the flow is cut to: the fragmentainer widened by what that box
-    /// draws outside its own border box along the cross axis, and along the flow only where the
-    /// flow ends — or, for a box that clones its decoration, wherever it was cut.
-    fn clip_for(&self, bleed: Insets, scale: f64, cloned: bool) -> Rect {
+    /// draws outside its own border box along the cross axis, and along the flow where the box's
+    /// decoration there is its own rather than decoration lost to a break — at an end of the flow,
+    /// or where the band never cut the box, or where the box clones what each fragment draws.
+    fn clip_for(&self, bleed: Insets, scale: f64, whole_start: bool, whole_end: bool) -> Rect {
         let Insets { x0, y0, x1, y1 } = bleed;
         let (x0, y0, x1, y1) = (x0 * scale, y0 * scale, x1 * scale, y1 * scale);
-        let (start, end) = if cloned {
-            (true, true)
-        } else {
-            (self.outer_start, self.outer_end)
-        };
+        let (start, end) = (self.outer_start || whole_start, self.outer_end || whole_end);
         match self.axis {
             FlowAxis::Y => Rect::new(
                 self.rect.x0 - x0,
@@ -1685,8 +1719,20 @@ impl ElementCx<'_, '_> {
     ) {
         let child = &self.context.dom.as_ref().tree()[child_id];
         let bleed = decoration_bleed(child);
+        // Where the band never cut this child, its edge along the flow is the box's own edge and not
+        // a break: an outline or shadow drawn there belongs on the canvas, even though it falls
+        // outside the fragmentainer. `multicol-span-all-children-height-001` is that case — the
+        // spanner's 1px outline vanished on the rows where its fragment begins, because the clip
+        // treated that edge as though the break had taken the decoration away with it.
+        let (whole_start, whole_end) = box_whole_in_band(child, transform, frag, self.scale);
+        let cloned = clones_decorations(child);
         let clip = frag
-            .clip_for(bleed, self.scale, clones_decorations(child))
+            .clip_for(
+                bleed,
+                self.scale,
+                cloned || whole_start,
+                cloned || whole_end,
+            )
             .intersect(clip_rect);
         if clip.area() <= 0.0 {
             return;
