@@ -970,6 +970,25 @@ fn widest(one: Insets, other: Insets) -> Insets {
     )
 }
 
+/// Whether the out-of-flow children of a box take part in a fragmentainer.
+///
+/// A box positioned against a multi-column container as a whole is not part of the flow the
+/// container cut into columns, so it belongs to no band: sliding it along with each band paints one
+/// box once per column at a different place, and clipping it to a band hides the rest of it
+/// (`nested-oofs-in-relative-multicol`, `out-of-flow-in-multicolumn-094`). Such a box is drawn
+/// against the container itself — while a box that stands inside a *fragmented* box's own flow,
+/// whose containing block is one of its bands, does move with that band and is left in place by
+/// [`OofChildren::All`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OofChildren {
+    /// Draw them with everything else, against the band the parent was drawn into.
+    All,
+    /// Leave them to the fragmented box's own pass.
+    Skip,
+    /// Draw only them, against the box as a whole.
+    Only,
+}
+
 /// Whether a box asks that the decoration of each of its fragments be drawn whole — which is why
 /// such a box may bleed past a break: wherever the band cut it, it draws its own edge there.
 fn clones_decorations(node: &Node) -> bool {
@@ -1601,16 +1620,22 @@ impl ElementCx<'_, '_> {
                 outer_start: index == 0,
                 outer_end: index == last,
             };
-            self.draw_children(scene, self.transform, clip_rect, Some(frag));
+            self.draw_children(scene, self.transform, clip_rect, Some(frag), OofChildren::Skip);
         }
+        // The boxes positioned against this container as a whole, once, where they were placed —
+        // after the bands, so that they cover the columns they are painted over as they do in
+        // Chrome. A negative-z out-of-flow child is drawn in the same pass, which is a known
+        // simplification.
         self.transform = base;
+        self.draw_children(scene, base, clip_rect, None, OofChildren::Only);
     }
 
     fn draw_content(&self, scene: &mut impl PaintScene, content_position: Point, clip_rect: Rect) {
         self.draw_own_content(scene, content_position);
         // A box of a fragmented flow cuts its own children by the band that cuts it, so that a
-        // decoration they draw outside their boxes is not shaved by an ancestor's clip.
-        self.draw_children(scene, self.transform, clip_rect, self.frag);
+        // decoration they draw outside their boxes is not shaved by an ancestor's clip. Its
+        // out-of-flow children move with it: their containing block is a fragment of this flow.
+        self.draw_children(scene, self.transform, clip_rect, self.frag, OofChildren::All);
     }
 
     /// What a box draws itself: its text, its replaced parts, its marker. Its children are not
@@ -1655,18 +1680,29 @@ impl ElementCx<'_, '_> {
     ///
     /// `band` is the fragmentainer a fragmented box is being drawn into: with one, every child is
     /// clipped to it in a layer of its own, so that a child the break left whole keeps the outline
-    /// it draws outside its own box.
+    /// it draws outside its own box. `oof` says what becomes of the children that stand outside the
+    /// flow — see [`OofChildren`].
     fn draw_children(
         &self,
         scene: &mut impl PaintScene,
         parent_style_transform: Affine,
         clip_rect: Rect,
         band: Option<Fragmentainer>,
+        oof: OofChildren,
     ) {
+        let takes_part = |child: &Node| match oof {
+            OofChildren::All => true,
+            OofChildren::Skip => !child.is_out_of_flow(),
+            OofChildren::Only => child.is_out_of_flow(),
+        };
+
         // Negative z_index hoisted nodes
 
         if let Some(hoisted) = &self.node.stacking_context {
             for hoisted_child in hoisted.neg_z_hoisted_children() {
+                if !takes_part(&self.context.dom.as_ref().tree()[hoisted_child.node_id]) {
+                    continue;
+                }
                 let position = hoisted_child.position(self.node.tree(), self.node.id);
                 let pos = kurbo::Vec2 {
                     x: position.x as f64 * self.scale,
@@ -1696,6 +1732,9 @@ impl ElementCx<'_, '_> {
                 // scroll (applied in `paint_scene`). A fixed box contained by a
                 // transformed ancestor scrolls with it like any out-of-flow box.
                 let child = &self.context.dom.as_ref().tree()[*child_id];
+                if !takes_part(child) {
+                    continue;
+                }
                 let child_transform = if child.taffy_position() == taffy::Position::Fixed
                     && Some(self.node.id) == self.context.root_element_id
                 {
@@ -1723,6 +1762,9 @@ impl ElementCx<'_, '_> {
         // Positive z_index hoisted nodes
         if let Some(hoisted) = &self.node.stacking_context {
             for hoisted_child in hoisted.pos_z_hoisted_children() {
+                if !takes_part(&self.context.dom.as_ref().tree()[hoisted_child.node_id]) {
+                    continue;
+                }
                 let position = hoisted_child.position(self.node.tree(), self.node.id);
                 let pos = kurbo::Vec2 {
                     x: position.x as f64 * self.scale,
