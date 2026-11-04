@@ -16,6 +16,8 @@
 //! whole page box whatever it holds, so paint clips to [`BreakPlan::fragment_rect`].
 
 use blitz_traits::node_id::NodeId;
+use style::computed_values::flex_direction::T as FlexDirection;
+use style::computed_values::flex_wrap::T as FlexWrap;
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
 use style::values::computed::length::NonNegativeLengthOrAuto;
@@ -65,9 +67,32 @@ pub(crate) struct Edge {
 pub(crate) struct Unit {
     pub(crate) start: f32,
     pub(crate) end: f32,
+    /// Whether this is an item of a flex container. A flex item no fragmentainer can hold is
+    /// broken where the band ends rather than carried on, which is *not* what a box the author
+    /// asked to keep whole does (`single-line-column-flex-fragmentation-071` against
+    /// `table-page-break-inside-avoid-1`).
+    pub(crate) flex_item: bool,
 }
 
 impl Unit {
+    /// A stretch of the flow that moves as one.
+    fn whole(start: f32, end: f32) -> Self {
+        Self {
+            start,
+            end,
+            flex_item: false,
+        }
+    }
+
+    /// An item of a flex container running along the flow.
+    fn item(start: f32, end: f32) -> Self {
+        Self {
+            start,
+            end,
+            flex_item: true,
+        }
+    }
+
     /// How tall the unit is along the flow.
     pub(crate) fn height(&self) -> f32 {
         (self.end - self.start).max(0.0)
@@ -426,14 +451,17 @@ impl<'a> Planner<'a> {
     /// `offset` is `parent`'s border box in flow coordinates and `inline_size` is its content
     /// inline size, which is what a percentage margin of a child resolves against. `breakable`
     /// says whether a legal cut may be recorded here at all: `false` once the walk is inside a
-    /// box that must not be cut or that fragments its own content. `inherited` is the page name
-    /// the parent's content is printed on, which a child with `page: auto` keeps.
+    /// box that must not be cut or that fragments its own content. `flex_items` says the children
+    /// are items of a flex container whose main axis runs along this flow, which the flow moves on
+    /// as a whole rather than halving. `inherited` is the page name the parent's content is printed
+    /// on, which a child with `page: auto` keeps.
     fn walk(
         &mut self,
         parent: NodeId,
         offset: Point<f32>,
         inline_size: f32,
         breakable: bool,
+        flex_items: bool,
         inherited: &PageName,
     ) {
         let doc = self.doc;
@@ -503,26 +531,25 @@ impl<'a> Planner<'a> {
                 // The break is never *at* the box: it sits on a line, and lines are what the
                 // flow breaks between. It only leaves its name behind for the next box to
                 // compare with (page-name-inline-block-002 breaks after it, -003 not between two).
-                self.units.push(Unit {
-                    start: outer_top,
-                    end: outer_bottom,
-                });
+                self.units.push(Unit::whole(outer_top, outer_bottom));
                 self.page = self.last_page_name(child_id, &used);
                 self.seen_content = true;
                 continue;
             }
             let replaced = is_replaced_element(&data.name.local);
             if replaced {
-                self.units.push(Unit {
-                    start: outer_top,
-                    end: outer_bottom,
-                });
+                self.units.push(Unit::whole(outer_top, outer_bottom));
             }
             // A block-level replaced element is content too, and it has none of its own.
             let holds_content =
                 in_flow_block && (child.flags.is_inline_root() || replaced);
-            let page_change = holds_content && self.seen_content && used != self.page;
-            if holds_content {
+            // The items of a flex container breaking along this flow take no part in the page-name
+            // sequence: Chrome lets the container ask for the page, not the items inside it, so a
+            // name on an item neither cuts the flow nor changes the name the flow goes on with
+            // (`page-name-flex-001-print`, `page-name-flex-004-print`).
+            let names_page = holds_content && !flex_items;
+            let page_change = names_page && self.seen_content && used != self.page;
+            if names_page {
                 self.page = used.clone();
                 self.seen_content = true;
             }
@@ -541,10 +568,25 @@ impl<'a> Planner<'a> {
             // scrolls instead of breaking, a flex, grid or table container and a multi-column
             // container fragment their content by their own rules, and an atomic box does not
             // break at all.
-            let own_fragmentainer = !matches!(
+            // A flex container whose main axis runs along this flow is the exception: its items
+            // stand one after another along the flow exactly as two blocks do, so the flow cuts
+            // between them and moves on item by item, which is how Chrome breaks it. Only a single
+            // line of them: a wrapping container places its lines across the flow, so an item's
+            // extent along the flow says nothing about where the line it belongs to ends.
+            let flex_along_flow = display.inside() == DisplayInside::Flex
+                && !styles
+                    .get_position()
+                    .flex_wrap
+                    .intersects(FlexWrap::WRAP | FlexWrap::WRAP_REVERSE)
+                && matches!(
+                    styles.get_position().flex_direction,
+                    FlexDirection::Column | FlexDirection::ColumnReverse
+                );
+            let own_fragmentainer = (!matches!(
                 display.inside(),
                 DisplayInside::Flow | DisplayInside::FlowRoot
-            ) || styles.get_box().overflow_x != Overflow::Visible
+            ) && !flex_along_flow)
+                || styles.get_box().overflow_x != Overflow::Visible
                 || styles.get_box().overflow_y != Overflow::Visible
                 || is_multicol(&styles);
             let scroll_container = styles.get_box().overflow_x != Overflow::Visible
@@ -558,10 +600,13 @@ impl<'a> Planner<'a> {
             // A flex, grid or table container is not: Chrome breaks those item by item, and
             // treating them as unbreakable makes the columns around them too tall.
             if scroll_container || avoids_inside(styles.clone_break_inside()) {
-                self.units.push(Unit {
-                    start: outer_top,
-                    end: outer_bottom,
-                });
+                self.units.push(Unit::whole(outer_top, outer_bottom));
+            }
+            // A flex item is one thing the container sized and placed: where it does not fit the
+            // fragmentainer, the container moves it on rather than halving it
+            // (`flexbox-unbreakable-child`).
+            if flex_items {
+                self.units.push(Unit::item(outer_top, outer_bottom));
             }
             // A box that clones the decoration of its fragments holds less content in each one than
             // the fragmentainer is deep, and a cut inside it moves the next band back by that much.
@@ -589,6 +634,7 @@ impl<'a> Planner<'a> {
                     (layout.size.width - border.left - border.right - padding.left - padding.right)
                         .max(0.0),
                     breakable_inside,
+                    flex_along_flow,
                     &used,
                 );
             }
@@ -653,10 +699,7 @@ impl<'a> Planner<'a> {
         for (index, y) in lines.iter().enumerate() {
             // A line box is the smallest thing a flow can be cut between: no break falls inside
             // one, so a fragmentainer has to be tall enough to hold the tallest of them.
-            self.units.push(Unit {
-                start: top,
-                end: *y,
-            });
+            self.units.push(Unit::whole(top, *y));
             top = *y;
             let before = index + 1;
             // The last line's bottom is where the block ends, which is the break between two
@@ -723,6 +766,33 @@ pub(crate) fn cut_bands(
     let mut bands = ThinVec::new();
     // The most fragmentainers content could need if it broke at its own edges and nowhere else.
     let limit_pages = (content_end / extent.max(1.0)).ceil() as usize + 2;
+    // Where a flex item starts that no empty fragmentainer could hold *and* that has no legal point
+    // to break at inside it. Moving such an item on wins nothing — the next fragmentainer would
+    // have to break it at its end anyway — so the point at its start is not taken and this
+    // fragmentainer is filled (`single-line-column-flex-fragmentation-071`). An item with a legal
+    // point inside it is still moved on (`flexbox-single-column-6`), and a box the author asked to
+    // keep whole is carried even when nothing could hold it (`table-page-break-inside-avoid-1`).
+    let inside: Vec<f32> = edges
+        .iter()
+        .filter(|edge| edge.rank == Rank::Legal)
+        .map(|edge| edge.at)
+        .collect();
+    let has_inside = |unit: &Unit| {
+        let from = match inside.binary_search_by(|at| at.total_cmp(&(unit.start + 0.5))) {
+            Ok(at) => at,
+            Err(at) => at,
+        };
+        inside
+            .get(from..)
+            .is_some_and(|rest| rest.first().is_some_and(|at| *at < unit.end - 0.5))
+    };
+    let mut too_tall: Vec<f32> = units
+        .iter()
+        .filter(|unit| unit.flex_item && unit.height() > extent && !has_inside(unit))
+        .map(|unit| unit.start)
+        .collect();
+    too_tall.sort_by(|a, b| a.total_cmp(b));
+    too_tall.dedup();
     let mut cursor = start;
     loop {
         let limit = cursor + extent;
@@ -740,7 +810,11 @@ pub(crate) fn cut_bands(
                     forced = Some(edge.at);
                     break;
                 }
-                Rank::Legal => legal = Some(edge.at),
+                Rank::Legal => {
+                    if too_tall.binary_search_by(|at| at.total_cmp(&edge.at)).is_err() {
+                        legal = Some(edge.at);
+                    }
+                }
                 Rank::Forbidden => {
                     // A box's start edge and the previous box's end edge are the same position,
                     // so `avoid` on the first cancels the offer of the second.
@@ -818,7 +892,7 @@ pub(crate) fn edges_of(
         seen_content: false,
     };
     planner.line_edges(&doc.nodes[container_id], 0.0, true);
-    planner.walk(container_id, Point::ZERO, basis, true, &PageName::Auto);
+    planner.walk(container_id, Point::ZERO, basis, true, false, &PageName::Auto);
     planner.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
     planner.units.sort_by(|a, b| a.start.total_cmp(&b.start));
     planner.spans.sort_by(|a, b| a.start.total_cmp(&b.start));
@@ -881,10 +955,7 @@ mod tests {
     #[test]
     fn an_unbreakable_box_is_carried() {
         let edges = [edge(0.0, Rank::Legal), edge(12.0, Rank::Legal)];
-        let units = [Unit {
-            start: 2.0,
-            end: 12.0,
-        }];
+        let units = [Unit::whole(2.0, 12.0)];
         let bands = cut_bands(&edges, &units, &[], 0.0, 10.0, 800.0, 12.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 2.0));
         assert_eq!((bands[1].start, bands[1].end), (2.0, 12.0));
@@ -894,10 +965,7 @@ mod tests {
     #[test]
     fn too_tall_to_carry_is_cut() {
         let edges = [edge(0.0, Rank::Legal)];
-        let units = [Unit {
-            start: 2.0,
-            end: 40.0,
-        }];
+        let units = [Unit::whole(2.0, 40.0)];
         let bands = cut_bands(&edges, &units, &[], 0.0, 10.0, 800.0, 40.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 10.0));
     }
@@ -965,6 +1033,33 @@ mod tests {
         assert_eq!((bands[0].start, bands[0].end), (0.0, 40.0));
         assert_eq!(bands[1].start, 40.0);
     }
+
+    /// A flex item no fragmentainer could hold, and with no legal point inside it to break at, is
+    /// broken where the band ends rather than moved on: the space it would have left behind is
+    /// filled, because the point at its start buys nothing
+    /// (`single-line-column-flex-fragmentation-071`).
+    #[test]
+    fn a_box_too_tall_to_move_on_is_not_moved() {
+        let edges = [edge(0.0, Rank::Legal), edge(40.0, Rank::Legal)];
+        let units = [Unit::item(40.0, 200.0)];
+        let bands = cut_bands(&edges, &units, &[], 0.0, 100.0, 800.0, 200.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 100.0));
+        assert_eq!((bands[1].start, bands[1].end), (100.0, 200.0));
+    }
+
+    /// An item that can be broken inside is still moved on whole when the band has no room for it:
+    /// the point at its start is a legal break like any other (`flexbox-single-column-6`).
+    #[test]
+    fn an_item_with_a_point_inside_is_still_moved() {
+        let edges = [
+            edge(0.0, Rank::Legal),
+            edge(40.0, Rank::Legal),
+            edge(150.0, Rank::Legal),
+        ];
+        let units = [Unit::item(40.0, 200.0)];
+        let bands = cut_bands(&edges, &units, &[], 0.0, 100.0, 800.0, 200.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 40.0));
+    }
 }
 
 /// Compute the page plan for the flow rooted at `root_id`, or `None` when the flow cannot be
@@ -999,7 +1094,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         page: root_page.clone(),
         seen_content: false,
     };
-    planner.walk(root_id, Point::ZERO, area.width, true, &root_page);
+    planner.walk(root_id, Point::ZERO, area.width, true, false, &root_page);
     // Where the content ends, and not the bottom of the first page: a flow shorter than a page
     // that asks for a break after its last box still gets one page, not two.
     let content_end = planner.extent;
