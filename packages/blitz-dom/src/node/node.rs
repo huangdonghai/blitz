@@ -1195,6 +1195,12 @@ impl Node {
             .unwrap_or(stylo_taffy::WritingMode::empty())
     }
 
+    /// Whether this box fragments its content into columns.
+    pub fn is_multicol_box(&self) -> bool {
+        self.primary_styles()
+            .is_some_and(|styles| crate::layout::fragmentation::is_multicol(&styles))
+    }
+
     /// Whether this box is a `text-combine-upright` composition.
     ///
     /// CSS Writing Modes 3 §9.1: the combined units advance as a single em, and

@@ -27,7 +27,7 @@ use thin_vec::ThinVec;
 
 use super::resolve_calc_value;
 use crate::layout::is_replaced_element;
-use crate::BaseDocument;
+use crate::{BaseDocument, Node};
 
 /// The physical direction a fragmented flow advances along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,8 +52,8 @@ enum Rank {
 
 /// One box edge, measured along the flow from the fragmentainer's content-box origin.
 #[derive(Clone, Copy, Debug)]
-struct Edge {
-    at: f32,
+pub(crate) struct Edge {
+    pub(crate) at: f32,
     rank: Rank,
 }
 
@@ -329,7 +329,7 @@ fn margin_px(value: &style::values::specified::Margin, basis: f32) -> f32 {
 
 /// Does this box fragment its own content into columns? Not yet, so such a box is treated as
 /// one unbreakable block.
-fn is_multicol(style: &ComputedValues) -> bool {
+pub(crate) fn is_multicol(style: &ComputedValues) -> bool {
     let column = style.get_column();
     !matches!(column.column_count, ColumnCount::Auto)
         || column.column_width != NonNegativeLengthOrAuto::auto()
@@ -358,6 +358,9 @@ fn avoids_inside(break_value: BreakWithin) -> bool {
 /// Walks a laid-out flow and records every position where it may, must, or must not be cut.
 struct Planner<'a> {
     doc: &'a BaseDocument,
+    /// Read the unrounded layout rather than the rounded one: a column asks for its flow's break
+    /// points while layout is still running, before anything has been rounded.
+    unrounded: bool,
     edges: Vec<Edge>,
     /// Farthest any box reaches along the flow.
     extent: f32,
@@ -404,7 +407,11 @@ impl<'a> Planner<'a> {
                 continue;
             }
 
-            let layout = child.final_layout();
+            let layout = if self.unrounded {
+                child.unrounded_layout()
+            } else {
+                child.final_layout()
+            };
             let top = offset.y + layout.location.y;
 
             // A percentage margin resolves against the containing block's inline size; `auto`
@@ -489,38 +496,9 @@ impl<'a> Planner<'a> {
             let breakable_inside = breakable
                 && !avoids_inside(styles.clone_break_inside())
                 && !own_fragmentainer;
-            // A line box ends where the flow may be cut (CSS Break 3 §4.1). Parley knows where
-            // its lines end; a text block taller than a page is otherwise clipped rather than
-            // carried on.
-            if breakable_inside {
-                if let Some(text) = data.inline_layout_data.as_deref() {
-                    let scale = text.layout.scale();
-                    let inset = layout.padding + layout.border;
-                    let origin = top + inset.top + text.block_offset;
-                    let widows = styles.clone_widows().max(1) as usize;
-                    let orphans = styles.clone_orphans().max(1) as usize;
-                    let lines: Vec<f32> = text
-                        .layout
-                        .lines()
-                        .map(|line| origin + line.metrics().block_max_coord / scale)
-                        .collect();
-                    for (index, y) in lines.iter().enumerate() {
-                        let before = index + 1;
-                        let after = lines.len() - before;
-                        // The last line's bottom is where the block ends, which is the break
-                        // between two blocks and not one inside this one.
-                        if after == 0 {
-                            continue;
-                        }
-                        let rank = if after < widows || before < orphans {
-                            Rank::Forbidden
-                        } else {
-                            Rank::Legal
-                        };
-                        self.push(*y, rank, true);
-                    }
-                }
-            }
+            // A line box ends where the flow may be cut (CSS Break 3 §4.1): a text block taller
+            // than the fragmentainer is otherwise cut rather than carried on.
+            self.line_edges(child, top, breakable_inside);
 
             if breakable_inside {
                 let border = layout.border;
@@ -565,6 +543,52 @@ impl<'a> Planner<'a> {
         self.last_page_name(*children, &used)
     }
 
+    /// The break points at the ends of one block's own line boxes, filtered by widows and
+    /// orphans. `top` is where the block's border box sits in the flow.
+    fn line_edges(&mut self, node: &Node, top: f32, breakable: bool) {
+        if !breakable {
+            return;
+        }
+        let Some(text) = node
+            .element_data()
+            .and_then(|data| data.inline_layout_data.as_deref())
+        else {
+            return;
+        };
+        let Some(styles) = node.primary_styles() else {
+            return;
+        };
+        let layout = if self.unrounded {
+            node.unrounded_layout()
+        } else {
+            node.final_layout()
+        };
+        let origin = top + (layout.padding.top + layout.border.top) + text.block_offset;
+        let scale = text.layout.scale();
+        let widows = styles.clone_widows().max(1) as usize;
+        let orphans = styles.clone_orphans().max(1) as usize;
+        let lines: Vec<f32> = text
+            .layout
+            .lines()
+            .map(|line| origin + line.metrics().block_max_coord / scale)
+            .collect();
+        for (index, y) in lines.iter().enumerate() {
+            let before = index + 1;
+            // The last line's bottom is where the block ends, which is the break between two
+            // blocks and not one inside this one.
+            let after = lines.len() - before;
+            if after == 0 {
+                continue;
+            }
+            let rank = if after < widows || before < orphans {
+                Rank::Forbidden
+            } else {
+                Rank::Legal
+            };
+            self.push(*y, rank, true);
+        }
+    }
+
     fn push(&mut self, at: f32, rank: Rank, breakable: bool) {
         if breakable || rank == Rank::Forced {
             self.edges.push(Edge { at, rank });
@@ -584,7 +608,7 @@ impl<'a> Planner<'a> {
 /// last legal point it can hold, and only when there is no legal point at all does the flow get
 /// cut mid-box — which clips rather than loses the content, and is what an unbreakable box
 /// taller than the page asks for.
-fn cut_bands(edges: &[Edge], extent: f32, content_end: f32) -> ThinVec<Band> {
+pub(crate) fn cut_bands(edges: &[Edge], extent: f32, content_end: f32) -> ThinVec<Band> {
     let mut bands = ThinVec::new();
     // The most pages content could need if it broke at its own edges and nowhere else.
     let limit_pages = (content_end / extent.max(1.0)).ceil() as usize + 2;
@@ -638,6 +662,31 @@ fn cut_bands(edges: &[Edge], extent: f32, content_end: f32) -> ThinVec<Band> {
         cursor = cut;
     }
     bands
+}
+
+/// The break points of one container's flow, and where that flow ends, read during layout.
+///
+/// A multi-column container needs this inside the layout pass: how tall a column has to be is
+/// decided by where its flow may be cut, and that is not known until the flow has been laid out
+/// at the column's width.
+pub(crate) fn edges_of(
+    doc: &BaseDocument,
+    container_id: crate::NodeId,
+    basis: f32,
+) -> (Vec<Edge>, f32) {
+    let mut planner = Planner {
+        doc,
+        unrounded: true,
+        edges: Vec::new(),
+        extent: 0.0,
+        page: PageName::Auto,
+        seen_content: false,
+    };
+    planner.line_edges(&doc.nodes[container_id], 0.0, true);
+    planner.walk(container_id, Point::ZERO, basis, true, &PageName::Auto);
+    planner.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
+    let end = planner.extent;
+    (planner.edges, end)
 }
 
 #[cfg(test)]
@@ -726,6 +775,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         .unwrap_or(PageName::Auto);
     let mut planner = Planner {
         doc,
+        unrounded: false,
         edges: Vec::new(),
         extent: 0.0,
         page: root_page.clone(),

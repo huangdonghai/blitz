@@ -26,6 +26,7 @@ pub(crate) mod construct;
 pub(crate) mod damage;
 pub mod fragmentation;
 pub(crate) mod inline;
+pub(crate) mod multicol;
 pub(crate) mod list;
 pub(crate) mod paint_tree;
 pub(crate) mod replaced;
@@ -578,6 +579,12 @@ impl LayoutPassState<'_> {
                         .min(output.size.height);
 
                     return output;
+                }
+
+                // A multi-column container fragments its own flow into columns, so it is laid
+                // out at a column's width rather than at the width its parent offered.
+                if node.is_multicol_box() {
+                    return self.compute_multicol_layout(node_id, inputs, block_ctx);
                 }
 
                 if node.flags.is_inline_root() {
