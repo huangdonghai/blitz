@@ -14,6 +14,31 @@
 //!
 //! A band's [`Band::end`] records where the break decision placed the cut; a fragmentainer is a
 //! whole page box whatever it holds, so paint clips to [`BreakPlan::fragment_rect`].
+//!
+//! ## What this model cannot express
+//!
+//! Laying the flow out once and cutting afterwards means the flow has **one** coordinate system,
+//! shared by every fragment. Four things in the specs ask for more, and each is a registered
+//! difference rather than an untried idea — the attempts are recorded in the commits that were
+//! reverted (`borders-003..008`, `monolithic-overflow-031/032`, `float-page-break-inside-avoid-3/4`,
+//! `multi-line-row-flex-fragmentation-068`):
+//!
+//! - content that must **move** at a break: a flex row gap truncated where a line breaks, a float
+//!   that carries the lines beside it to the next fragmentainer;
+//! - content that must advance at a **different rate** inside a box that clones its decoration,
+//!   whose fragments each pay for their own borders;
+//! - a nested flow on **its own axis**: a vertical subtree inside a horizontal document, or a
+//!   `vertical-rl` document paginating along x (`page-name-orthogonal-writing-003-print`);
+//! - an out-of-box anchored to the page sequence whose **own content** decides how many pages there
+//!   are (the extent now counts what it hoists; fragmenting that content does not).
+//!
+//! The one change that would reach all four is running the flow layout **per band** rather than once
+//! — pass one of [`multicol`](super::multicol) already measures the flow at a column's width, so the
+//! shape is: let `cut_bands` return the ranges to re-measure, re-measure each at its fragmentainer's
+//! cross size and depth, and give each fragment its own coordinates. That is a layout-architecture
+//! change, not a rule in this file, and it should be attempted with `gecko/flexbox`, `css-multicol`,
+//! `-print` and the full corpus as its gate: the model as it stands is worth 5058 pairs, and only a
+//! measurement can say whether the change keeps them.
 
 use blitz_traits::node_id::NodeId;
 use style::computed_values::flex_direction::T as FlexDirection;
