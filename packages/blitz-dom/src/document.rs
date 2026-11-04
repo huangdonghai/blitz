@@ -238,6 +238,9 @@ pub struct BaseDocument {
     pub(crate) viewport: Viewport,
     /// CSS media type used to evaluate `@media` rules.
     pub(crate) media_type: MediaType,
+    /// The paper a paged document prints on, read from `@page` before layout so that the page
+    /// area can be the root box's containing block. `None` for a document that is not paged.
+    pub(crate) page_box: Option<crate::layout::fragmentation::PageBox>,
     /// Changes to the stylist [`Device`] that have been requested since the
     /// last [`resolve`](Self::resolve), to be applied (coalesced into a single
     /// device rebuild) at the start of the next resolve.
@@ -481,6 +484,7 @@ impl BaseDocument {
             nodes_to_id,
             viewport,
             media_type,
+            page_box: None,
             pending_device_changes: DeviceChanges::empty(),
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),

@@ -108,6 +108,11 @@ impl BaseDocument {
         self.flush_pending_style_images();
         timer.record_time("pconstruct");
 
+        // The page box is read before layout: in paged media it is the page area, not the window,
+        // that is the root box's containing block.
+        self.resolve_page_box();
+        timer.record_time("page");
+
         // Next we resolve layout with the data resolved by stlist
         self.resolve_layout();
         timer.record_time("layout");
@@ -437,11 +442,20 @@ impl BaseDocument {
     /// TODO: update taffy to use an associated type instead of slab key
     /// TODO: update taffy to support traited styles so we don't even need to rely on taffy for storage
     pub fn resolve_layout(&mut self) {
-        let size = self.stylist.device().au_viewport_size();
-
-        let available_space = taffy::Size {
-            width: AvailableSpace::Definite(size.width.to_f32_px()),
-            height: AvailableSpace::Definite(size.height.to_f32_px()),
+        // A paged document is laid out for its page area; the window only says what paper it is
+        // printed on when the document asks for none.
+        let available_space = match self.page_box.map(|page| page.area()) {
+            Some(area) => taffy::Size {
+                width: AvailableSpace::Definite(area.width),
+                height: AvailableSpace::Definite(area.height),
+            },
+            None => {
+                let size = self.stylist.device().au_viewport_size();
+                taffy::Size {
+                    width: AvailableSpace::Definite(size.width.to_f32_px()),
+                    height: AvailableSpace::Definite(size.height.to_f32_px()),
+                }
+            }
         };
 
         let root_element_id = crate::taffy_node_id(self.root_element().id);

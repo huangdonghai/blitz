@@ -19,6 +19,7 @@ use blitz_traits::node_id::NodeId;
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
 use style::values::computed::length::NonNegativeLengthOrAuto;
+use style::properties::PropertyDeclaration;
 use style::values::computed::{BreakBetween, BreakWithin, ColumnCount, Float, Overflow, PageName};
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use taffy::{CoreStyle as _, Point, Rect, ResolveOrZero as _, Size};
@@ -75,6 +76,9 @@ pub struct BreakPlan {
     pub axis: FlowAxis,
     /// Content box of one fragmentainer: the page area, for paged media.
     pub fragment: Size<f32>,
+    /// Distance from one fragmentainer's origin to the next. A page box is more than the area it
+    /// holds, because a page has a margin, so this measures the paper and not the area.
+    pub stride: f32,
     pub bands: ThinVec<Band>,
 }
 
@@ -119,8 +123,8 @@ impl BreakPlan {
     pub fn canvas_extent(&self) -> f32 {
         match self.bands.last() {
             Some(last) => match self.axis {
-                FlowAxis::Y => last.origin.y + self.fragment.height,
-                FlowAxis::X => last.origin.x + self.fragment.width,
+                FlowAxis::Y => last.origin.y + self.stride,
+                FlowAxis::X => last.origin.x + self.stride,
             },
             None => 0.0,
         }
@@ -128,30 +132,198 @@ impl BreakPlan {
 }
 
 impl BaseDocument {
+    /// Read `@page` and remember the paper the document is printed on.
+    ///
+    /// This runs before layout: the page area is the root box's containing block in paged media,
+    /// so a document that asks for 5in paper has to be laid out for 5in and not for the window.
+    pub(crate) fn resolve_page_box(&mut self) {
+        self.page_box = (*self.media_type() == MediaType::print()).then(|| page_box(self));
+    }
+
     /// Compute the page bands of the root flow and hang them on the root element.
     ///
     /// Runs on every layout pass, and only under print: a screen document has no page sequence,
     /// and walking the whole flow costs a traversal nobody asked for while scrolling a page.
     pub(crate) fn resolve_fragmentation(&mut self) {
         let root_id = self.root_element().id;
-        let plan = if *self.media_type() == MediaType::print() {
+        let plan = if self.page_box.is_some() {
             page_plan(self, root_id)
         } else {
             None
         };
         self.nodes[root_id].break_plan = plan.map(Box::new);
     }
+
+    /// The size of the picture a paged document is drawn into: every page box it was cut into,
+    /// stacked. `None` for a document that is not paginated.
+    pub fn page_canvas(&self) -> Option<Size<f32>> {
+        let page = self.page_box?;
+        let plan = self.root_element().break_plan.as_deref()?;
+        Some(Size {
+            width: page.size.width,
+            height: match plan.axis {
+                FlowAxis::Y => plan.canvas_extent(),
+                FlowAxis::X => page.size.height,
+            },
+        })
+    }
 }
 
-/// The page box, in the CSS pixels layout works in.
-///
-/// `@page { size }` is not read yet, so a page is the window the document was given and its
-/// margin is nothing.
-fn page_box(doc: &BaseDocument) -> Size<f32> {
+/// The paper one page is printed on, and the margin that keeps content off its edge, in the CSS
+/// pixels layout works in.
+#[derive(Clone, Copy, Debug)]
+pub struct PageBox {
+    pub size: Size<f32>,
+    /// The margins, as insets from the page box's edge.
+    pub margin: Rect<f32>,
+}
+
+impl PageBox {
+    /// The page area: what the root box is laid out inside (CSS Page 3 §5.2).
+    pub fn area(&self) -> Size<f32> {
+        Size {
+            width: (self.size.width - self.margin.left - self.margin.right).max(1.0),
+            height: (self.size.height - self.margin.top - self.margin.bottom).max(1.0),
+        }
+    }
+
+    /// Where the page area of page `index` begins on the canvas.
+    pub fn area_origin(&self, index: usize) -> Point<f32> {
+        Point {
+            x: self.margin.left,
+            y: self.margin.top + index as f32 * self.size.height,
+        }
+    }
+}
+
+/// The window the document was given, in CSS pixels.
+fn window(doc: &BaseDocument) -> Size<f32> {
     let size = doc.stylist.device().au_viewport_size();
     Size {
         width: size.width.to_f32_px(),
         height: size.height.to_f32_px(),
+    }
+}
+
+/// `@page { size; margin }` as read from the document's stylesheets.
+///
+/// A document with no page rules prints on the window it was given, with no margin. `:first`,
+/// `:left` and `:right` are not matched yet, so every rule that asks for the starting page's name
+/// is applied; a named page's own `size` is not sought either, because the page a document starts
+/// on is the only one whose box is resolved here.
+fn page_box(doc: &BaseDocument) -> PageBox {
+    let mut page = PageBox {
+        size: window(doc),
+        margin: Rect {
+            left: 0.0,
+            right: 0.0,
+            top: 0.0,
+            bottom: 0.0,
+        },
+    };
+    let guard = doc.guard().read();
+    // The unnamed `@page`, which is what a page with no name is printed on.
+    let unnamed = style::Atom::default();
+    for (data, _) in doc.stylist.iter_extra_data_origins() {
+        let Some(rules) = data.pages.rules.get(&unnamed) else {
+            continue;
+        };
+        for entry in rules.iter() {
+            let rule = entry.rule.read_with(&guard);
+            for declaration in rule.block.read_with(&guard).declarations() {
+                match declaration {
+                    PropertyDeclaration::Size(size) => apply_size(size, &mut page, doc),
+                    // A shorthand reaches a declaration block as its four longhands.
+                    PropertyDeclaration::MarginTop(value) => {
+                        page.margin.top = margin_px(value, page.size.height);
+                    }
+                    PropertyDeclaration::MarginRight(value) => {
+                        page.margin.right = margin_px(value, page.size.width);
+                    }
+                    PropertyDeclaration::MarginBottom(value) => {
+                        page.margin.bottom = margin_px(value, page.size.height);
+                    }
+                    PropertyDeclaration::MarginLeft(value) => {
+                        page.margin.left = margin_px(value, page.size.width);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    page
+}
+
+/// `@page { size: … }`: two edges, one edge with the other left to the paper the window gives,
+/// an orientation, or a named sheet of paper.
+fn apply_size(size: &style::values::specified::PageSize, page: &mut PageBox, doc: &BaseDocument) {
+    use style::values::specified::page::PageSize as S;
+    let window = window(doc);
+    match size {
+        S::Auto => {}
+        S::Size(physical) => {
+            // `size: 500px` gives one edge and leaves the other `auto`, which is the measure the
+            // window supplies. An `auto` edge arrives as nothing, so a zero is read as `auto`.
+            let width = positive(absolute(&physical.width.0)).unwrap_or(window.width);
+            let height = positive(absolute(&physical.height.0)).unwrap_or(window.height);
+            page.size = Size { width, height };
+        }
+        S::Orientation(orientation) => {
+            use style::values::specified::page::PageSizeOrientation as O;
+            let (short, long) = (
+                page.size.width.min(page.size.height),
+                page.size.width.max(page.size.height),
+            );
+            page.size = match orientation {
+                O::Portrait => Size {
+                    width: short,
+                    height: long,
+                },
+                O::Landscape => Size {
+                    width: long,
+                    height: short,
+                },
+            };
+        }
+        S::PaperSize(paper, orientation) => {
+            let short = positive(absolute(&paper.short_edge().0.into())).unwrap_or(window.width);
+            let long = positive(absolute(&paper.long_edge().0.into())).unwrap_or(window.height);
+            let (width, height) = match orientation {
+                style::values::specified::page::PageSizeOrientation::Portrait => (short, long),
+                _ => (long, short),
+            };
+            page.size = Size { width, height };
+        }
+    }
+}
+
+/// A page-rule length in CSS pixels. A percentage of a page resolves against the edge it
+/// measures; a font- or viewport-relative length has no context to resolve against here, and
+/// asks for nothing.
+fn length(value: &style::values::specified::LengthPercentage, basis: f32) -> Option<f32> {
+    use style::values::computed::Au;
+    let computed = value.compute_without_context()?;
+    Some(computed.to_used_value(Au::from_f32_px(basis)).to_f32_px())
+}
+
+/// A page-rule length that the spec allows to be an absolute length only: a paper size name or
+/// an edge of `size`. A font- or viewport-relative length asks for nothing here.
+fn absolute(value: &style::values::specified::Length) -> Option<f32> {
+    value.to_computed_pixel_length_without_context().ok()
+}
+
+/// A measure that was actually given: `size` leaves an edge at nothing when it is `auto`.
+fn positive(value: Option<f32>) -> Option<f32> {
+    value.filter(|value| *value > 0.0)
+}
+
+/// A page-rule `margin`: `auto` on a page asks for nothing.
+fn margin_px(value: &style::values::specified::Margin, basis: f32) -> f32 {
+    match value {
+        style::values::specified::Margin::LengthPercentage(value) => {
+            length(value, basis).unwrap_or(0.0)
+        }
+        _ => 0.0,
     }
 }
 
@@ -242,8 +414,11 @@ impl<'a> Planner<'a> {
                 .margin()
                 .resolve_or_zero(Some(inline_size), resolve_calc_value);
             let outer_top = top - margin.top;
-            let outer_bottom = top + layout.size.height + margin.bottom;
-            self.extent = self.extent.max(outer_bottom);
+            let bottom = top + layout.size.height;
+            let outer_bottom = bottom + margin.bottom;
+            // How far the flow reaches is where its content ends, not where the last box's
+            // margin does: a margin left at the bottom of a fragmentainer asks for no page.
+            self.extent = self.extent.max(bottom);
 
             // Only a block-level box of the flow makes a break point. A float, an atomic inline
             // or a replaced element is cut wherever the page needs it, and no break point is
@@ -314,6 +489,39 @@ impl<'a> Planner<'a> {
             let breakable_inside = breakable
                 && !avoids_inside(styles.clone_break_inside())
                 && !own_fragmentainer;
+            // A line box ends where the flow may be cut (CSS Break 3 §4.1). Parley knows where
+            // its lines end; a text block taller than a page is otherwise clipped rather than
+            // carried on.
+            if breakable_inside {
+                if let Some(text) = data.inline_layout_data.as_deref() {
+                    let scale = text.layout.scale();
+                    let inset = layout.padding + layout.border;
+                    let origin = top + inset.top + text.block_offset;
+                    let widows = styles.clone_widows().max(1) as usize;
+                    let orphans = styles.clone_orphans().max(1) as usize;
+                    let lines: Vec<f32> = text
+                        .layout
+                        .lines()
+                        .map(|line| origin + line.metrics().block_max_coord / scale)
+                        .collect();
+                    for (index, y) in lines.iter().enumerate() {
+                        let before = index + 1;
+                        let after = lines.len() - before;
+                        // The last line's bottom is where the block ends, which is the break
+                        // between two blocks and not one inside this one.
+                        if after == 0 {
+                            continue;
+                        }
+                        let rank = if after < widows || before < orphans {
+                            Rank::Forbidden
+                        } else {
+                            Rank::Legal
+                        };
+                        self.push(*y, rank, true);
+                    }
+                }
+            }
+
             if breakable_inside {
                 let border = layout.border;
                 let padding = layout.padding;
@@ -502,8 +710,13 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         return None;
     }
 
-    let page = page_box(doc);
-    if page.height <= 1.0 {
+    let page = doc.page_box?;
+    let area = page.area();
+    #[cfg(debug_assertions)]
+    if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
+        eprintln!("page box: {:?} area {:?}", page, area);
+    }
+    if area.height <= 1.0 {
         return None;
     }
 
@@ -518,8 +731,10 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         page: root_page.clone(),
         seen_content: false,
     };
-    planner.walk(root_id, Point::ZERO, page.width, true, &root_page);
-    let content_end = planner.extent.max(page.height);
+    planner.walk(root_id, Point::ZERO, area.width, true, &root_page);
+    // Where the content ends, and not the bottom of the first page: a flow shorter than a page
+    // that asks for a break after its last box still gets one page, not two.
+    let content_end = planner.extent;
 
     #[cfg(debug_assertions)]
     if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
@@ -539,7 +754,10 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         eprintln!("fragmentation edges ({}): {dump}", doc.base_url());
     }
 
-    let bands = planner.bands(page.height, content_end);
+    let mut bands = planner.bands(area.height, content_end);
+    for (index, band) in bands.iter_mut().enumerate() {
+        band.origin = page.area_origin(index);
+    }
 
     #[cfg(debug_assertions)]
     if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
@@ -553,7 +771,8 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
 
     Some(BreakPlan {
         axis: FlowAxis::Y,
-        fragment: page,
+        fragment: area,
+        stride: page.size.height,
         bands,
     })
 }
