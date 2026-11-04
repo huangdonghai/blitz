@@ -112,13 +112,16 @@ impl LayoutPassState<'_> {
     ) -> LayoutOutput {
         let dom_id = dom_node_id(node_id);
         let parent_width = inputs.parent_size.width.unwrap_or(0.0).max(0.0);
-        let available_width = match inputs.known_dimensions.width {
-            Some(width) => width,
-            None => match inputs.available_space.width {
-                AvailableSpace::Definite(width) => width,
-                _ => parent_width,
-            },
-        };
+        // Whether the container was measured under a width that is known. An intrinsic query — the
+        // max-content or min-content measure a flex row, a float or a shrink-to-fit box asks with —
+        // is not, and reading it as the parent's width collapses the box: a flex item with
+        // `columns: 2` measured under a parent of nothing at all would ask its two columns to hold
+        // the text in one pixel each and draw none of it (`baseline-000`).
+        let definite_width = inputs.known_dimensions.width.or(match inputs.available_space.width {
+            AvailableSpace::Definite(width) => Some(width),
+            _ => None,
+        });
+        let available_width = definite_width.unwrap_or(parent_width);
 
         // What the container's own styles say, read before its content is laid out: a borrow of
         // the styles cannot outlive a pass that writes into the same tree. The insets are the
@@ -152,6 +155,33 @@ impl LayoutPassState<'_> {
         };
 
         // Pass one: this container's flow as a single column.
+        let mut columns = columns;
+        let mut content_width = content_width;
+        if definite_width.is_none() {
+            // Measured intrinsically, the container is one column of that measure (CSS Multicol 1
+            // §5): ask the flow what it needs at the incoming constraint, give every column that
+            // width, and let the box be as wide as the columns it will ask for together with the
+            // gaps between them.
+            let probe = LayoutInput {
+                known_dimensions: Size {
+                    width: None,
+                    height: definite,
+                },
+                available_space: Size {
+                    width: inputs.available_space.width,
+                    height: inputs.available_space.height,
+                },
+                ..inputs
+            };
+            let measured = if inline_root {
+                self.compute_inline_layout(dom_id, probe, None)
+            } else {
+                compute_block_layout(self, node_id, probe, None)
+            };
+            let one = (measured.size.width - insets.left - insets.right).max(1.0);
+            columns.width = one;
+            content_width = one;
+        }
         let narrow = LayoutInput {
             known_dimensions: Size {
                 width: Some(columns.width + insets.left + insets.right),
@@ -293,7 +323,15 @@ impl LayoutPassState<'_> {
         // spanner is as tall as all of its runs together.
         LayoutOutput {
             size: Size {
-                width: available_width,
+                width: if definite_width.is_some() {
+                    available_width
+                } else {
+                    // As wide as the columns it asked for, with the room between them.
+                    columns.width * columns.count as f32
+                        + columns.gap * columns.count.saturating_sub(1) as f32
+                        + insets.left
+                        + insets.right
+                },
                 height: definite.unwrap_or(height) + insets.top + insets.bottom,
             },
             ..flow
