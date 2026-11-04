@@ -26,7 +26,7 @@ use style::values::specified::box_::{DisplayInside, DisplayOutside};
 
 use super::LayoutPassState;
 use super::fragmentation::{
-    Band, BreakPlan, Edge, FlowAxis, Unit, cut_bands, edges_of, is_multicol,
+    Band, BreakPlan, CloneSpan, Edge, FlowAxis, Unit, cut_bands, edges_of, is_multicol,
 };
 use super::resolve_calc_value;
 use crate::{dom_node_id, taffy_node_id};
@@ -186,7 +186,7 @@ impl LayoutPassState<'_> {
         }
 
         let flow_height = (flow.size.height - insets.top - insets.bottom).max(0.0);
-        let (edges, units, extent) = edges_of(&*self, dom_id, columns.width);
+        let (edges, units, spans, extent) = edges_of(&*self, dom_id, columns.width);
         // The pass knows where the flow ends: its own height. `extent` only sees the blocks of the
         // flow, and a column of text has none — its lines are the container's own.
         let flow_end = flow_height.max(extent);
@@ -208,6 +208,7 @@ impl LayoutPassState<'_> {
                 &segments,
                 &edges,
                 &units,
+                &spans,
                 &columns,
                 insets,
                 content_width,
@@ -217,26 +218,26 @@ impl LayoutPassState<'_> {
         } else {
             let height = match definite {
                 Some(limit) if columns.sequential => limit,
-                Some(limit) => limit.min(balance(&edges, &units, flow_end, columns.count)),
+                Some(limit) => limit.min(balance(&edges, &units, &spans, flow_end, columns.count)),
                 None if columns.sequential => flow_height,
-                None => balance(&edges, &units, flow_height, columns.count),
+                None => balance(&edges, &units, &spans, flow_height, columns.count),
             };
             let bands: ThinVec<_> =
-                cut_bands(&edges, &units, 0.0, height, columns.width, flow_end)
-                .into_iter()
-                .enumerate()
-                .map(|(index, mut band)| {
-                    band.origin = taffy::Point {
-                        x: insets.left + index as f32 * (columns.width + columns.gap),
-                        y: insets.top,
-                    };
-                    // Chrome measures a column rule by the fragmentainer's own depth: a container
-                    // that was given a height rules to that height even when balancing made the
-                    // columns shorter (multicol-rule-nested-balancing-001).
-                    band.depth = definite.unwrap_or(height);
-                    band
-                })
-                .collect();
+                cut_bands(&edges, &units, &spans, 0.0, height, columns.width, flow_end)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, mut band)| {
+                        band.origin = taffy::Point {
+                            x: insets.left + index as f32 * (columns.width + columns.gap),
+                            y: insets.top,
+                        };
+                        // Chrome measures a column rule by the fragmentainer's own depth: a container
+                        // that was given a height rules to that height even when balancing made the
+                        // columns shorter (multicol-rule-nested-balancing-001).
+                        band.depth = definite.unwrap_or(height);
+                        band
+                    })
+                    .collect();
             (bands, height)
         };
 
@@ -289,6 +290,7 @@ impl LayoutPassState<'_> {
         segments: &[Segment],
         edges: &[Edge],
         units: &[Unit],
+        spans: &[CloneSpan],
         columns: &Columns,
         insets: Rect<f32>,
         content_width: f32,
@@ -345,16 +347,30 @@ impl LayoutPassState<'_> {
                 .filter(|unit| unit.end > run.start && unit.start < run.end)
                 .copied()
                 .collect();
+            let clones: Vec<CloneSpan> = spans
+                .iter()
+                .filter(|span| span.end > run.start && span.start < run.end)
+                .copied()
+                .collect();
             let height = match definite {
                 Some(limit) if columns.sequential => limit,
-                Some(limit) => limit.min(balance(&inside, &whole, run_height, columns.count)),
+                Some(limit) => {
+                    limit.min(balance(&inside, &whole, &clones, run_height, columns.count))
+                }
                 None if columns.sequential => run_height,
-                None => balance(&inside, &whole, run_height, columns.count),
+                None => balance(&inside, &whole, &clones, run_height, columns.count),
             };
-            for (index, mut band) in
-                cut_bands(&inside, &whole, run.start, height, columns.width, run.end)
-                    .into_iter()
-                    .enumerate()
+            for (index, mut band) in cut_bands(
+                &inside,
+                &whole,
+                &clones,
+                run.start,
+                height,
+                columns.width,
+                run.end,
+            )
+            .into_iter()
+            .enumerate()
             {
                 band.origin = taffy::Point {
                     x: insets.left + index as f32 * stride,
@@ -594,7 +610,7 @@ fn style_height(styles: &ComputedValues, inputs: LayoutInput) -> Option<f32> {
 ///
 /// The share is a floor as well as a starting point: no column is shorter than the tallest thing
 /// the flow cannot cut, which is what keeps a single line box from being balanced into slivers.
-fn balance(edges: &[Edge], units: &[Unit], flow_height: f32, count: usize) -> f32 {
+fn balance(edges: &[Edge], units: &[Unit], spans: &[CloneSpan], flow_height: f32, count: usize) -> f32 {
     let count = count.max(1);
     let tallest = units
         .iter()
@@ -609,7 +625,7 @@ fn balance(edges: &[Edge], units: &[Unit], flow_height: f32, count: usize) -> f3
         if candidate < shortest {
             continue;
         }
-        if cut_bands(edges, units, 0.0, candidate, 0.0, flow_height).len() <= count {
+        if cut_bands(edges, units, spans, 0.0, candidate, 0.0, flow_height).len() <= count {
             return candidate;
         }
     }

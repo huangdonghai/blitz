@@ -74,6 +74,23 @@ impl Unit {
     }
 }
 
+/// A box that clones the decoration of its fragments, and how much of a fragmentainer that takes
+/// off the content.
+///
+/// `box-decoration-break: clone` draws the border and padding at *every* end of every fragment, so
+/// a fragment of a box holds `depth - near - far` of content rather than the whole
+/// fragmentainer. What the band above the break could not show is not lost: the band below starts
+/// back at the flow line where the content was cut, which is why a cut inside one of these moves
+/// the next band up by the insets it added.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CloneSpan {
+    /// Where the box reaches along the flow, border box to border box.
+    pub(crate) start: f32,
+    pub(crate) end: f32,
+    /// The border and padding a fragment of this box adds at both its ends.
+    pub(crate) insets: f32,
+}
+
 /// One fragmentainer: which slice of the flow it shows, and where that slice is placed.
 #[derive(Clone, Copy, Debug)]
 pub struct Band {
@@ -377,6 +394,12 @@ fn avoids_inside(break_value: BreakWithin) -> bool {
     )
 }
 
+/// Does this box ask that each of its fragments be decorated as a box of its own?
+fn clones_decoration(styles: &ComputedValues) -> bool {
+    use style::properties::generated::longhands::box_decoration_break::computed_value::T as BoxDecorationBreak;
+    matches!(styles.get_border().box_decoration_break, BoxDecorationBreak::Clone)
+}
+
 /// Walks a laid-out flow and records every position where it may, must, or must not be cut.
 struct Planner<'a> {
     doc: &'a BaseDocument,
@@ -386,6 +409,8 @@ struct Planner<'a> {
     edges: Vec<Edge>,
     /// The stretches of this flow that cannot be cut (see [`Unit`]).
     units: Vec<Unit>,
+    /// The boxes that clone the decoration of their fragments (see [`CloneSpan`]).
+    spans: Vec<CloneSpan>,
     /// Farthest any box reaches along the flow.
     extent: f32,
     /// The page name of the content walked so far; a change forces a break (CSS Page 3 §6.5).
@@ -538,6 +563,16 @@ impl<'a> Planner<'a> {
                     end: outer_bottom,
                 });
             }
+            // A box that clones the decoration of its fragments holds less content in each one than
+            // the fragmentainer is deep, and a cut inside it moves the next band back by that much.
+            if breakable_inside && clones_decoration(&styles) {
+                self.spans.push(CloneSpan {
+                    start: top,
+                    end: bottom,
+                    insets: layout.border.top + layout.padding.top
+                        + layout.border.bottom + layout.padding.bottom,
+                });
+            }
             // A line box ends where the flow may be cut (CSS Break 3 §4.1): a text block taller
             // than the fragmentainer is otherwise cut rather than carried on.
             self.line_edges(child, top, breakable_inside);
@@ -649,7 +684,8 @@ impl<'a> Planner<'a> {
     fn bands(mut self, start: f32, extent: f32, cross: f32, content_end: f32) -> ThinVec<Band> {
         self.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
         self.units.sort_by(|a, b| a.start.total_cmp(&b.start));
-        cut_bands(&self.edges, &self.units, start, extent, cross, content_end)
+        self.spans.sort_by(|a, b| a.start.total_cmp(&b.start));
+        cut_bands(&self.edges, &self.units, &self.spans, start, extent, cross, content_end)
     }
 }
 
@@ -671,9 +707,14 @@ fn carry_before(units: &[Unit], limit: f32, cursor: f32, extent: f32) -> Option<
 /// last legal point it can hold, and only when there is no legal point at all does the flow get
 /// cut mid-box — which clips rather than loses the content, and is what an unbreakable box
 /// taller than the page asks for.
+///
+/// A cut that falls inside a box cloning the decoration of its fragments costs that box the border
+/// and padding the cut adds at both ends of the fragment, so the next band starts back by that much
+/// and the content the band had no room for goes on below rather than being lost.
 pub(crate) fn cut_bands(
     edges: &[Edge],
     units: &[Unit],
+    spans: &[CloneSpan],
     start: f32,
     extent: f32,
     cross: f32,
@@ -733,12 +774,30 @@ pub(crate) fn cut_bands(
         if last {
             break;
         }
-        cursor = cut;
+        // Only a band that filled its fragmentainer and was cut there lost content to the border and
+        // padding a cloned fragment adds: a band that ended at a legal point, or carried a whole box
+        // on, gave the next one everything it had. Every box the cut falls inside pays, and a band
+        // always moves on: a flow that cannot advance is a fragmentainer that cannot end.
+        let inset: f32 = if cut >= limit - 0.5 {
+            spans
+                .iter()
+                .filter(|span| span.start < cut - 0.5 && span.end > cut + 0.5)
+                .map(|span| span.insets)
+                .sum()
+        } else {
+            0.0
+        };
+        cursor = if inset > 0.0 {
+            (cut - inset).max(cursor + 1.0)
+        } else {
+            cut
+        };
     }
     bands
 }
 
-/// The break points of one container's flow, and where that flow ends, read during layout.
+/// The break points of one container's flow, the boxes that clone their fragments' decoration, and
+/// where that flow ends, read during layout.
 ///
 /// A multi-column container needs this inside the layout pass: how tall a column has to be is
 /// decided by where its flow may be cut, and that is not known until the flow has been laid out
@@ -747,12 +806,13 @@ pub(crate) fn edges_of(
     doc: &BaseDocument,
     container_id: crate::NodeId,
     basis: f32,
-) -> (Vec<Edge>, Vec<Unit>, f32) {
+) -> (Vec<Edge>, Vec<Unit>, Vec<CloneSpan>, f32) {
     let mut planner = Planner {
         doc,
         unrounded: true,
         edges: Vec::new(),
         units: Vec::new(),
+        spans: Vec::new(),
         extent: 0.0,
         page: PageName::Auto,
         seen_content: false,
@@ -761,8 +821,9 @@ pub(crate) fn edges_of(
     planner.walk(container_id, Point::ZERO, basis, true, &PageName::Auto);
     planner.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
     planner.units.sort_by(|a, b| a.start.total_cmp(&b.start));
+    planner.spans.sort_by(|a, b| a.start.total_cmp(&b.start));
     let end = planner.extent;
-    (planner.edges, planner.units, end)
+    (planner.edges, planner.units, planner.spans, end)
 }
 
 #[cfg(test)]
@@ -778,7 +839,7 @@ mod tests {
     #[test]
     fn one_page_when_it_fits() {
         let edges = [edge(0.0, Rank::Legal), edge(26.0, Rank::Legal)];
-        let bands = cut_bands(&edges, &[], 0.0, 600.0, 800.0, 120.0);
+        let bands = cut_bands(&edges, &[], &[], 0.0, 600.0, 800.0, 120.0);
         assert_eq!(bands.len(), 1);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 600.0));
     }
@@ -791,7 +852,7 @@ mod tests {
             edge(44.0, Rank::Forced),
             edge(62.0, Rank::Legal),
         ];
-        let bands = cut_bands(&edges, &[], 0.0, 600.0, 800.0, 200.0);
+        let bands = cut_bands(&edges, &[], &[], 0.0, 600.0, 800.0, 200.0);
         assert_eq!(bands.len(), 1 + 1);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 44.0));
         assert_eq!((bands[1].start, bands[1].end), (44.0, 644.0));
@@ -801,7 +862,7 @@ mod tests {
     #[test]
     fn unforced_break_uses_the_last_legal_point() {
         let edges = [edge(26.0, Rank::Legal), edge(50.0, Rank::Legal)];
-        let bands = cut_bands(&edges, &[], 0.0, 60.0, 800.0, 120.0);
+        let bands = cut_bands(&edges, &[], &[], 0.0, 60.0, 800.0, 120.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 50.0));
         assert_eq!((bands[1].start, bands[1].end), (50.0, 110.0));
     }
@@ -810,7 +871,7 @@ mod tests {
     #[test]
     fn avoid_cancels_the_point_at_the_same_position() {
         let edges = [edge(26.0, Rank::Legal), edge(26.0, Rank::Forbidden)];
-        let bands = cut_bands(&edges, &[], 0.0, 60.0, 800.0, 120.0);
+        let bands = cut_bands(&edges, &[], &[], 0.0, 60.0, 800.0, 120.0);
         // With no legal point left, the flow is cut at the page edge rather than at 26.
         assert_eq!((bands[0].start, bands[0].end), (0.0, 60.0));
     }
@@ -824,7 +885,7 @@ mod tests {
             start: 2.0,
             end: 12.0,
         }];
-        let bands = cut_bands(&edges, &units, 0.0, 10.0, 800.0, 12.0);
+        let bands = cut_bands(&edges, &units, &[], 0.0, 10.0, 800.0, 12.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 2.0));
         assert_eq!((bands[1].start, bands[1].end), (2.0, 12.0));
     }
@@ -837,7 +898,7 @@ mod tests {
             start: 2.0,
             end: 40.0,
         }];
-        let bands = cut_bands(&edges, &units, 0.0, 10.0, 800.0, 40.0);
+        let bands = cut_bands(&edges, &units, &[], 0.0, 10.0, 800.0, 40.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 10.0));
     }
 
@@ -846,10 +907,63 @@ mod tests {
     #[test]
     fn unbreakable_box_longer_than_the_page_still_advances() {
         let edges = [edge(0.0, Rank::Legal)];
-        let bands = cut_bands(&edges, &[], 0.0, 60.0, 800.0, 200.0);
+        let bands = cut_bands(&edges, &[], &[], 0.0, 60.0, 800.0, 200.0);
         assert_eq!(bands.len(), 4);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 60.0));
         assert_eq!((bands[3].start, bands[3].end), (180.0, 240.0));
+    }
+
+    /// A fragment of a box cloning its decoration holds less content than the fragmentainer is
+    /// deep, and the band below starts back at where this one's content was cut: `borders-008`
+    /// splits a 240px content box into three columns of 80, not of 100, 100 and 40.
+    #[test]
+    fn a_cloned_fragment_pays_for_its_own_border() {
+        let edges = [edge(0.0, Rank::Legal), edge(260.0, Rank::Legal)];
+        let spans = [CloneSpan {
+            start: 0.0,
+            end: 260.0,
+            insets: 20.0,
+        }];
+        let bands = cut_bands(&edges, &[], &spans, 0.0, 100.0, 800.0, 260.0);
+        assert_eq!(bands.len(), 3);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 100.0));
+        assert_eq!((bands[1].start, bands[1].end), (80.0, 180.0));
+        assert_eq!((bands[2].start, bands[2].end), (160.0, 260.0));
+    }
+
+    /// Every box a cut falls inside pays, but a band never starts before the content it has already
+    /// placed: a box whose border and padding fill the fragmentainer still moves the flow on rather
+    /// than cutting the same line for ever.
+    #[test]
+    fn a_cloned_band_still_advances() {
+        let edges = [edge(0.0, Rank::Legal)];
+        let spans = [CloneSpan {
+            start: 0.0,
+            end: 400.0,
+            insets: 150.0,
+        }];
+        let bands = cut_bands(&edges, &[], &spans, 0.0, 100.0, 800.0, 400.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 100.0));
+        assert_eq!((bands[1].start, bands[1].end), (1.0, 101.0));
+    }
+
+    /// A band that stopped at a legal point of its own accord gave the next one all it had, so the
+    /// cloned box whose edge it cut at takes nothing back: the flow goes on where it stopped.
+    #[test]
+    fn a_band_that_chose_its_end_does_not_step_back() {
+        let edges = [
+            edge(0.0, Rank::Legal),
+            edge(40.0, Rank::Legal),
+            edge(260.0, Rank::Legal),
+        ];
+        let spans = [CloneSpan {
+            start: 0.0,
+            end: 260.0,
+            insets: 20.0,
+        }];
+        let bands = cut_bands(&edges, &[], &spans, 0.0, 100.0, 800.0, 260.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 40.0));
+        assert_eq!(bands[1].start, 40.0);
     }
 }
 
@@ -880,6 +994,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         unrounded: false,
         edges: Vec::new(),
         units: Vec::new(),
+        spans: Vec::new(),
         extent: 0.0,
         page: root_page.clone(),
         seen_content: false,
