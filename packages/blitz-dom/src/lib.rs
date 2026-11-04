@@ -101,6 +101,7 @@ pub use markup5ever::{
     namespace_prefix, namespace_url, ns,
 };
 pub use mutator::DocumentMutator;
+pub use layout::fragmentation::{Band, BreakPlan, FlowAxis};
 pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
 pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};

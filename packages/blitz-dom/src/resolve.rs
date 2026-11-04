@@ -117,6 +117,12 @@ impl BaseDocument {
         self.resolve_transforms(root_node_id);
         timer.record_time("transform");
 
+        // Cut the flow into pages, if this document is laid out for print. Runs after layout
+        // because it reads the laid-out flow, and before the paint tree because paint is what
+        // replays the pieces.
+        self.resolve_fragmentation();
+        timer.record_time("fragment");
+
         // Build paint children / stacking contexts for damaged subtrees. Runs
         // after layout and transforms so that stacking-context roots created by
         // this frame's transforms are picked up, and before damage is cleared.

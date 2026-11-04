@@ -115,6 +115,10 @@ pub struct Node {
     /// The same as layout_children, but sorted by z-index
     pub paint_children: RefCell<Option<ThinVec<NodeId>>>,
     pub stacking_context: Option<Box<StackingContext>>,
+    /// For a box that fragments its flow (the root element under print, a multi-column
+    /// container), where its content is cut and where each piece is painted. `None` for every
+    /// other box, and for a flow that fits one fragmentainer.
+    pub break_plan: Option<Box<crate::layout::fragmentation::BreakPlan>>,
     /// The hoisted entries this node's subtree pushed into the enclosing
     /// stacking context on its last (non-skipped) paint-tree build. Replayed
     /// when the subtree is skipped as clean. Empty for stacking-context roots.
@@ -415,6 +419,7 @@ impl Node {
             anonymous_blocks: ThinVec::new(),
             paint_children: RefCell::new(None),
             stacking_context: None,
+            break_plan: None,
             sc_contribution_cache: RefCell::new(ThinVec::new()),
 
             flags: NodeFlags::empty(),
