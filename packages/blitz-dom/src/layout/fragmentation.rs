@@ -57,6 +57,22 @@ pub(crate) struct Edge {
     rank: Rank,
 }
 
+/// A stretch of the flow that no break may fall inside: a line box, an atomic inline box, a
+/// replaced element. A column has to be tall enough to hold the tallest of them, which is what
+/// stops balancing from cutting a single line into slivers.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Unit {
+    pub(crate) start: f32,
+    pub(crate) end: f32,
+}
+
+impl Unit {
+    /// How tall the unit is along the flow.
+    pub(crate) fn height(&self) -> f32 {
+        (self.end - self.start).max(0.0)
+    }
+}
+
 /// One fragmentainer: which slice of the flow it shows, and where that slice is placed.
 #[derive(Clone, Copy, Debug)]
 pub struct Band {
@@ -68,14 +84,16 @@ pub struct Band {
     /// Where [`Self::start`] sits on the canvas, relative to the fragmentainer node's own
     /// border box.
     pub origin: Point<f32>,
+    /// How wide the fragmentainer is across the flow. A page is as wide as its box; a column is
+    /// narrower than the container that holds it, and a box that spans every column is as wide
+    /// as that container again — so this is not a property of the plan.
+    pub cross: f32,
 }
 
 /// The cut plan of one fragmented flow.
 #[derive(Clone, Debug)]
 pub struct BreakPlan {
     pub axis: FlowAxis,
-    /// Content box of one fragmentainer: the page area, for paged media.
-    pub fragment: Size<f32>,
     /// Distance from one fragmentainer's origin to the next. A page box is more than the area it
     /// holds, because a page has a margin, so this measures the paper and not the area.
     pub stride: f32,
@@ -92,14 +110,14 @@ impl BreakPlan {
             FlowAxis::Y => Rect {
                 left: band.origin.x,
                 top: band.origin.y,
-                right: band.origin.x + self.fragment.width,
+                right: band.origin.x + band.cross,
                 bottom: band.origin.y + span,
             },
             FlowAxis::X => Rect {
                 left: band.origin.x,
                 top: band.origin.y,
                 right: band.origin.x + span,
-                bottom: band.origin.y + self.fragment.height,
+                bottom: band.origin.y + band.cross,
             },
         }
     }
@@ -362,6 +380,8 @@ struct Planner<'a> {
     /// points while layout is still running, before anything has been rounded.
     unrounded: bool,
     edges: Vec<Edge>,
+    /// The stretches of this flow that cannot be cut (see [`Unit`]).
+    units: Vec<Unit>,
     /// Farthest any box reaches along the flow.
     extent: f32,
     /// The page name of the content walked so far; a change forces a break (CSS Page 3 §6.5).
@@ -450,20 +470,25 @@ impl<'a> Planner<'a> {
             // edges, and its own content takes no part in the page-name sequence. What it does
             // carry is the name of the last content inside it, which is what the flow continues
             // with after it.
-            // Anything inline-level that reaches the block list is an atomic inline box:
-            // inline-block, inline-table, inline-flex, a replaced element. It is one
-            // unbreakable thing on a line, so no break of any kind is placed at its edges, and
-            // its content takes no part in the page-name sequence. What it carries is the name
-            // of the last content inside it, which is what the flow continues with.
             if !child.is_anonymous() && display.outside() == DisplayOutside::Inline {
                 // The break is never *at* the box: it sits on a line, and lines are what the
                 // flow breaks between. It only leaves its name behind for the next box to
                 // compare with (page-name-inline-block-002 breaks after it, -003 not between two).
+                self.units.push(Unit {
+                    start: outer_top,
+                    end: outer_bottom,
+                });
                 self.page = self.last_page_name(child_id, &used);
                 self.seen_content = true;
                 continue;
             }
             let replaced = is_replaced_element(&data.name.local);
+            if replaced {
+                self.units.push(Unit {
+                    start: outer_top,
+                    end: outer_bottom,
+                });
+            }
             // A block-level replaced element is content too, and it has none of its own.
             let holds_content =
                 in_flow_block && (child.flags.is_inline_root() || replaced);
@@ -572,7 +597,15 @@ impl<'a> Planner<'a> {
             .lines()
             .map(|line| origin + line.metrics().block_max_coord / scale)
             .collect();
+        let mut top = origin;
         for (index, y) in lines.iter().enumerate() {
+            // A line box is the smallest thing a flow can be cut between: no break falls inside
+            // one, so a fragmentainer has to be tall enough to hold the tallest of them.
+            self.units.push(Unit {
+                start: top,
+                end: *y,
+            });
+            top = *y;
             let before = index + 1;
             // The last line's bottom is where the block ends, which is the break between two
             // blocks and not one inside this one.
@@ -596,9 +629,9 @@ impl<'a> Planner<'a> {
     }
 
     /// Cut the recorded flow into fragmentainers `extent` deep.
-    fn bands(mut self, extent: f32, content_end: f32) -> ThinVec<Band> {
+    fn bands(mut self, start: f32, extent: f32, cross: f32, content_end: f32) -> ThinVec<Band> {
         self.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
-        cut_bands(&self.edges, extent, content_end)
+        cut_bands(&self.edges, start, extent, cross, content_end)
     }
 }
 
@@ -608,11 +641,17 @@ impl<'a> Planner<'a> {
 /// last legal point it can hold, and only when there is no legal point at all does the flow get
 /// cut mid-box — which clips rather than loses the content, and is what an unbreakable box
 /// taller than the page asks for.
-pub(crate) fn cut_bands(edges: &[Edge], extent: f32, content_end: f32) -> ThinVec<Band> {
+pub(crate) fn cut_bands(
+    edges: &[Edge],
+    start: f32,
+    extent: f32,
+    cross: f32,
+    content_end: f32,
+) -> ThinVec<Band> {
     let mut bands = ThinVec::new();
-    // The most pages content could need if it broke at its own edges and nowhere else.
+    // The most fragmentainers content could need if it broke at its own edges and nowhere else.
     let limit_pages = (content_end / extent.max(1.0)).ceil() as usize + 2;
-    let mut cursor = 0.0f32;
+    let mut cursor = start;
     loop {
         let limit = cursor + extent;
         let mut forced = None;
@@ -651,10 +690,8 @@ pub(crate) fn cut_bands(edges: &[Edge], extent: f32, content_end: f32) -> ThinVe
         bands.push(Band {
             start: cursor,
             end: if last { cursor + extent } else { cut },
-            origin: Point {
-                x: 0.0,
-                y: bands.len() as f32 * extent,
-            },
+            origin: Point::ZERO,
+            cross,
         });
         if last {
             break;
@@ -673,11 +710,12 @@ pub(crate) fn edges_of(
     doc: &BaseDocument,
     container_id: crate::NodeId,
     basis: f32,
-) -> (Vec<Edge>, f32) {
+) -> (Vec<Edge>, Vec<Unit>, f32) {
     let mut planner = Planner {
         doc,
         unrounded: true,
         edges: Vec::new(),
+        units: Vec::new(),
         extent: 0.0,
         page: PageName::Auto,
         seen_content: false,
@@ -686,7 +724,7 @@ pub(crate) fn edges_of(
     planner.walk(container_id, Point::ZERO, basis, true, &PageName::Auto);
     planner.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
     let end = planner.extent;
-    (planner.edges, end)
+    (planner.edges, planner.units, end)
 }
 
 #[cfg(test)]
@@ -702,7 +740,7 @@ mod tests {
     #[test]
     fn one_page_when_it_fits() {
         let edges = [edge(0.0, Rank::Legal), edge(26.0, Rank::Legal)];
-        let bands = cut_bands(&edges, 600.0, 120.0);
+        let bands = cut_bands(&edges, 0.0, 600.0, 800.0, 120.0);
         assert_eq!(bands.len(), 1);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 600.0));
     }
@@ -715,7 +753,7 @@ mod tests {
             edge(44.0, Rank::Forced),
             edge(62.0, Rank::Legal),
         ];
-        let bands = cut_bands(&edges, 600.0, 200.0);
+        let bands = cut_bands(&edges, 0.0, 600.0, 800.0, 200.0);
         assert_eq!(bands.len(), 1 + 1);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 44.0));
         assert_eq!((bands[1].start, bands[1].end), (44.0, 644.0));
@@ -725,7 +763,7 @@ mod tests {
     #[test]
     fn unforced_break_uses_the_last_legal_point() {
         let edges = [edge(26.0, Rank::Legal), edge(50.0, Rank::Legal)];
-        let bands = cut_bands(&edges, 60.0, 120.0);
+        let bands = cut_bands(&edges, 0.0, 60.0, 800.0, 120.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 50.0));
         assert_eq!((bands[1].start, bands[1].end), (50.0, 110.0));
     }
@@ -734,7 +772,7 @@ mod tests {
     #[test]
     fn avoid_cancels_the_point_at_the_same_position() {
         let edges = [edge(26.0, Rank::Legal), edge(26.0, Rank::Forbidden)];
-        let bands = cut_bands(&edges, 60.0, 120.0);
+        let bands = cut_bands(&edges, 0.0, 60.0, 800.0, 120.0);
         // With no legal point left, the flow is cut at the page edge rather than at 26.
         assert_eq!((bands[0].start, bands[0].end), (0.0, 60.0));
     }
@@ -744,7 +782,7 @@ mod tests {
     #[test]
     fn unbreakable_box_longer_than_the_page_still_advances() {
         let edges = [edge(0.0, Rank::Legal)];
-        let bands = cut_bands(&edges, 60.0, 200.0);
+        let bands = cut_bands(&edges, 0.0, 60.0, 800.0, 200.0);
         assert_eq!(bands.len(), 4);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 60.0));
         assert_eq!((bands[3].start, bands[3].end), (180.0, 240.0));
@@ -777,6 +815,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         doc,
         unrounded: false,
         edges: Vec::new(),
+        units: Vec::new(),
         extent: 0.0,
         page: root_page.clone(),
         seen_content: false,
@@ -804,7 +843,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         eprintln!("fragmentation edges ({}): {dump}", doc.base_url());
     }
 
-    let mut bands = planner.bands(area.height, content_end);
+    let mut bands = planner.bands(0.0, area.height, area.width, content_end);
     for (index, band) in bands.iter_mut().enumerate() {
         band.origin = page.area_origin(index);
     }
@@ -821,7 +860,6 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
 
     Some(BreakPlan {
         axis: FlowAxis::Y,
-        fragment: area,
         stride: page.size.height,
         bands,
     })

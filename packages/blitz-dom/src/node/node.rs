@@ -1201,6 +1201,13 @@ impl Node {
             .is_some_and(|styles| crate::layout::fragmentation::is_multicol(&styles))
     }
 
+    /// Whether this box spans every column of the multi-column container it belongs to.
+    pub fn spans_columns(&self) -> bool {
+        use style::properties::generated::longhands::column_span::computed_value::T as ColumnSpan;
+        self.primary_styles()
+            .is_some_and(|styles| matches!(styles.clone_column_span(), ColumnSpan::All))
+    }
+
     /// Whether this box is a `text-combine-upright` composition.
     ///
     /// CSS Writing Modes 3 §9.1: the combined units advance as a single em, and
