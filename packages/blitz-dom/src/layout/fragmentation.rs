@@ -32,6 +32,16 @@
 //! - an out-of-box anchored to the page sequence whose **own content** decides how many pages there
 //!   are (the extent now counts what it hoists; fragmenting that content does not).
 //!
+//! A fifth limit was reached from the other direction. The width a columned box reports when it is
+//! measured for its own size is the number of columns its content *needs* — four 26px lines with
+//! `widows: 2` shrink to two columns (`widows-orphans-002`), two lines shrink to one
+//! (`css-multicol/baseline-000`) — and "needs" means: fits, with every fragment ending where the
+//! flow may legally break. Deciding that is deciding which fragmentainer ends are legal, which is
+//! the question [`Rank::Forbidden`] cannot answer once asked of it alone: a point forbidden by
+//! `widows` and a point forbidden by `break-inside` arrive as the same rank. Guessing at the
+//! distinction in the balancing pass cost nine pairs and was reverted; the shrink-wrap width has to
+//! wait for the same distinction to be recorded rather than inferred.
+//!
 //! The one change that would reach all four is running the flow layout **per band** rather than once
 //! — pass one of [`multicol`](super::multicol) already measures the flow at a column's width, so the
 //! shape is: let `cut_bands` return the ranges to re-measure, re-measure each at its fragmentainer's
