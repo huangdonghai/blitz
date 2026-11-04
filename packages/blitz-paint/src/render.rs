@@ -237,7 +237,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             y: self.initial_y - (viewport_scroll.y * self.scale),
         };
         match root_element.break_plan.as_deref() {
-            None => self.render_element(scene, root_id, Affine::translate(scroll), viewport_clip_rect),
+            None => self.render_element(
+                scene,
+                root_id,
+                Affine::translate(scroll),
+                viewport_clip_rect,
+                false,
+            ),
             Some(plan) => {
                 // A fragmented flow is painted once per fragmentainer: the band's slice of the
                 // flow shifted to its page box and clipped to it. Shifting and clipping is all
@@ -268,6 +274,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                             y: scroll.y + shift.y as f64 * self.scale,
                         }),
                         clip,
+                        true,
                     );
                     scene.pop_layer();
                 }
@@ -322,6 +329,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         node_id: NodeId,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        band_applied: bool,
     ) {
         let node = &self.dom.as_ref().tree()[node_id];
 
@@ -516,6 +524,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             *node.final_layout(),
             transform,
             clip_rect,
+            band_applied,
             custom_widget_scene,
         );
 
@@ -680,7 +689,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         match &node.data {
             NodeData::Element(_) | NodeData::AnonymousBlock(_) => {
-                self.render_element(scene, node_id, parent_style_transform, clip_rect)
+                self.render_element(
+                    scene,
+                    node_id,
+                    parent_style_transform,
+                    clip_rect,
+                    false,
+                )
             }
             NodeData::Text(TextNodeData { .. }) => {
                 // Text nodes should never be rendered directly
@@ -699,6 +714,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         layout: Layout,
         transform: Affine,
         clip_rect: Rect,
+        band_applied: bool,
         custom_widget_scene: Option<&'a Scene>,
     ) -> ElementCx<'dom, 'a> {
         let style = node
@@ -728,6 +744,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             element,
             transform,
             clip_rect,
+            band_applied,
             #[cfg(feature = "svg")]
             svg: match element.image_data() {
                 Some(blitz_dom::node::ImageData::Svg(svg)) => Some(svg),
@@ -787,6 +804,11 @@ struct ElementCx<'dom, 'a> {
     /// The visible region, in screen coordinates: what descendants may be culled
     /// against (see [`ElementCx::local_cull_rect`]).
     clip_rect: Rect,
+    /// Whether the caller already placed this box in one of its fragmentainers. A page sequence
+    /// is cut by [`BlitzDomPainter::paint_scene`] and a column box by
+    /// [`ElementCx::draw_content_fragmented`]; either way the content below is drawn once per
+    /// fragment, and cutting it again would move and clip it twice.
+    band_applied: bool,
     #[cfg(feature = "svg")]
     svg: Option<&'dom blitz_dom::node::SvgImageData>,
     text_input: Option<&'dom TextInputData>,
@@ -1189,7 +1211,12 @@ impl ElementCx<'_, '_> {
         content_position: Point,
         clip_rect: Rect,
     ) {
-        let Some(plan) = self.node.break_plan.as_deref() else {
+        let plan = if self.band_applied {
+            None
+        } else {
+            self.node.break_plan.as_deref()
+        };
+        let Some(plan) = plan else {
             self.draw_content(scene, content_position, clip_rect);
             return;
         };
@@ -1203,7 +1230,9 @@ impl ElementCx<'_, '_> {
                 fragment.right as f64 * self.scale,
                 fragment.bottom as f64 * self.scale,
             );
-            let clip = self.transform.transform_rect_bbox(own).intersect(clip_rect);
+            // Measured against `base`, not the running transform: the loop moves `self.transform`
+            // for the band it draws, and a later band's clip would inherit the earlier shift.
+            let clip = base.transform_rect_bbox(own).intersect(clip_rect);
             if clip.area() <= 0.0 {
                 continue;
             }
@@ -1231,40 +1260,9 @@ impl ElementCx<'_, '_> {
         self.draw_text_input_text(scene, content_position);
         self.draw_inline_layout(scene, content_position);
         self.draw_marker(scene, content_position);
-        self.draw_children_fragmented(scene, clip_rect);
-    }
-
-    /// A fragmented box draws its children once per fragmentainer: the band's slice of the flow
-    /// shifted to where that fragmentainer sits and clipped to it. The box's own background and
-    /// border are not repeated — a multi-column container is one box with the columns inside it,
-    /// unlike the root of a page sequence, whose canvas background every page shows.
-    fn draw_children_fragmented(&self, scene: &mut impl PaintScene, clip_rect: Rect) {
-        let Some(plan) = self.node.break_plan.as_deref() else {
-            self.draw_children(scene, self.transform, clip_rect);
-            return;
-        };
-
-        for band in plan.bands.iter() {
-            let shift = plan.translate(band);
-            let page = plan.fragment_rect(band);
-            let own = Rect::new(
-                page.left as f64 * self.scale,
-                page.top as f64 * self.scale,
-                page.right as f64 * self.scale,
-                page.bottom as f64 * self.scale,
-            );
-            let clip = self.transform.transform_rect_bbox(own).intersect(clip_rect);
-            if clip.area() <= 0.0 {
-                continue;
-            }
-            let transform = self.transform.then_translate(Vec2 {
-                x: shift.x as f64 * self.scale,
-                y: shift.y as f64 * self.scale,
-            });
-            scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-            self.draw_children(scene, transform, clip);
-            scene.pop_layer();
-        }
+        // The children ride the transform of the fragment this content was cut for, which is
+        // already the box's own; only a box that fragments itself repeats them.
+        self.draw_children(scene, self.transform, clip_rect);
     }
 
     fn draw_children(
