@@ -232,15 +232,47 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // scrollports narrow this rectangle further for their descendants.
         let viewport_clip_rect = Rect::new(0.0, 0.0, self.width as f64, self.height as f64);
 
-        self.render_element(
-            scene,
-            root_id,
-            Affine::translate(Vec2 {
-                x: self.initial_x - (viewport_scroll.x * self.scale),
-                y: self.initial_y - (viewport_scroll.y * self.scale),
-            }),
-            viewport_clip_rect,
-        );
+        let scroll = Vec2 {
+            x: self.initial_x - (viewport_scroll.x * self.scale),
+            y: self.initial_y - (viewport_scroll.y * self.scale),
+        };
+        match root_element.break_plan.as_deref() {
+            None => self.render_element(scene, root_id, Affine::translate(scroll), viewport_clip_rect),
+            Some(plan) => {
+                // A fragmented flow is painted once per fragmentainer: the band's slice of the
+                // flow shifted to its page box and clipped to it. Shifting and clipping is all
+                // fragmentation needs of paint — a box broken across two pages loses its far-edge
+                // decorations to the clip, which is `box-decoration-break: slice`.
+                for band in plan.bands.iter() {
+                    let shift = plan.translate(band);
+                    let page = plan.fragment_rect(band);
+                    let clip = Rect::new(
+                        page.left as f64 * self.scale,
+                        page.top as f64 * self.scale,
+                        page.right as f64 * self.scale,
+                        page.bottom as f64 * self.scale,
+                    )
+                    .intersect(viewport_clip_rect);
+                    if clip.area() <= 0.0 {
+                        continue;
+                    }
+                    // The clip has to be a real layer: culling only drops boxes that fall
+                    // entirely outside, and a box that straddles the break line paints whole
+                    // unless it is cut.
+                    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+                    self.render_element(
+                        scene,
+                        root_id,
+                        Affine::translate(Vec2 {
+                            x: scroll.x + shift.x as f64 * self.scale,
+                            y: scroll.y + shift.y as f64 * self.scale,
+                        }),
+                        clip,
+                    );
+                    scene.pop_layer();
+                }
+            }
+        }
 
         // Render debug overlay
         if self.dom.devtools().highlight_hover {
