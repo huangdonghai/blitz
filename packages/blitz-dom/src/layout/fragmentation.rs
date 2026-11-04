@@ -998,6 +998,18 @@ pub(crate) fn cut_bands(
         // padding a cloned fragment adds: a band that ended at a legal point, or carried a whole box
         // on, gave the next one everything it had. Every box the cut falls inside pays, and a band
         // always moves on: a flow that cannot advance is a fragmentainer that cannot end.
+        //
+        // The price is paid by moving the *next* band back, not by ending this one early, which
+        // means the room between the cut and the fragmentainer's edge is shown twice: once as the
+        // content that reached there and once as the border the clone draws. Shortening the band
+        // instead — ending it at `cut - inset` so the next begins where this one's content stopped —
+        // was measured and is not the answer: the `box-decoration-break` family stands at three
+        // pairs passing and two failing either way, and `monolithic-overflow-031/032-print` stay
+        // broken. What those two need is content inside a cloning box advancing *more slowly* than
+        // the band — a box whose child overflows it paints that overflow across the following
+        // fragmentainers, at the rate the band itself advances — which one flow coordinate cannot
+        // express, since the same coordinate is the box's own content in one place and its
+        // child's overflow in another.
         let inset: f32 = if cut >= limit - 0.5 {
             spans
                 .iter()
