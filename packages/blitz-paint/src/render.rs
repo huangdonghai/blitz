@@ -858,6 +858,29 @@ fn text_combine_adjustment(node: &Node, scale: f64) -> Option<(f64, f64)> {
     (natural > one_em).then(|| (one_em / natural, -(natural - one_em) / 2.0 / scale))
 }
 
+/// How far outside its own border box an element draws: an outline sits beyond the box by its
+/// width plus the offset that moves it out.
+///
+/// A fragmentainer cuts the flow where a break falls; it does not cut the decoration of a box the
+/// break left whole, which is why Chrome shows a spanning box's outline over the gutter it would
+/// otherwise be clipped to.
+fn outline_bleed(node: &Node) -> f32 {
+    use style::values::computed::{BorderStyle, OutlineStyle};
+    let Some(styles) = node.primary_styles() else {
+        return 0.0;
+    };
+    let outline = styles.get_outline();
+    let OutlineStyle::BorderStyle(style) = outline.outline_style else {
+        return 0.0;
+    };
+    if matches!(style, BorderStyle::None | BorderStyle::Hidden) {
+        return 0.0;
+    }
+    let width = outline.outline_width.0.to_f32_px();
+    let offset = outline.outline_offset.to_f32_px();
+    (width + offset).max(0.0)
+}
+
 impl ElementCx<'_, '_> {
     /// Paint overlay scrollbar thumbs for scroll containers: `overflow:
     /// scroll`, or `auto` when the content overflows (never `hidden`/`clip`,
@@ -1297,13 +1320,24 @@ impl ElementCx<'_, '_> {
             // Culling alone cannot do this: it drops boxes that fall entirely outside the clip,
             // and a box that straddles the column edge would paint whole in both columns.
             scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-            self.draw_content(scene, content_position, clip);
+            self.draw_own_content(scene, content_position);
             scene.pop_layer();
+            // Each child is cut to the fragmentainer in a layer of its own, widened by whatever it
+            // draws outside its own box: a break that left the child whole must not shave the
+            // outline it draws around itself.
+            self.draw_children(scene, self.transform, clip, Some(clip));
         }
         self.transform = base;
     }
 
     fn draw_content(&self, scene: &mut impl PaintScene, content_position: Point, clip_rect: Rect) {
+        self.draw_own_content(scene, content_position);
+        self.draw_children(scene, self.transform, clip_rect, None);
+    }
+
+    /// What a box draws itself: its text, its replaced parts, its marker. Its children are not
+    /// part of this, because a fragmented box cuts them one by one.
+    fn draw_own_content(&self, scene: &mut impl PaintScene, content_position: Point) {
         self.draw_image(scene);
         #[cfg(feature = "svg")]
         self.draw_svg(scene);
@@ -1314,16 +1348,41 @@ impl ElementCx<'_, '_> {
         self.draw_text_input_text(scene, content_position);
         self.draw_inline_layout(scene, content_position);
         self.draw_marker(scene, content_position);
-        // The children ride the transform of the fragment this content was cut for, which is
-        // already the box's own; only a box that fragments itself repeats them.
-        self.draw_children(scene, self.transform, clip_rect);
     }
 
+    /// One child of a fragmented box, clipped to the fragmentainer the child was shifted into.
+    fn render_fragment_child(
+        &self,
+        scene: &mut impl PaintScene,
+        child_id: NodeId,
+        transform: Affine,
+        band_clip: Rect,
+    ) {
+        let bleed = outline_bleed(&self.context.dom.as_ref().tree()[child_id]) as f64 * self.scale;
+        let clip = if bleed > 0.0 {
+            band_clip.inflate(bleed, bleed)
+        } else {
+            band_clip
+        };
+        if clip.area() <= 0.0 {
+            return;
+        }
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+        self.render_node(scene, child_id, transform, clip);
+        scene.pop_layer();
+    }
+
+    /// The children of a box, in paint order.
+    ///
+    /// `band` is the fragmentainer a fragmented box is being drawn into: with one, every child is
+    /// clipped to it in a layer of its own, so that a child the break left whole keeps the outline
+    /// it draws outside its own box.
     fn draw_children(
         &self,
         scene: &mut impl PaintScene,
         parent_style_transform: Affine,
         clip_rect: Rect,
+        band: Option<Rect>,
     ) {
         // Negative z_index hoisted nodes
 
@@ -1334,12 +1393,13 @@ impl ElementCx<'_, '_> {
                     x: position.x as f64 * self.scale,
                     y: position.y as f64 * self.scale,
                 };
-                self.render_node(
-                    scene,
-                    hoisted_child.node_id,
-                    parent_style_transform.pre_translate(pos),
-                    clip_rect,
-                );
+                let transform = parent_style_transform.pre_translate(pos);
+                match band {
+                    Some(band_clip) => {
+                        self.render_fragment_child(scene, hoisted_child.node_id, transform, band_clip)
+                    }
+                    None => self.render_node(scene, hoisted_child.node_id, transform, clip_rect),
+                }
             }
         }
 
@@ -1362,7 +1422,12 @@ impl ElementCx<'_, '_> {
                 } else {
                     parent_style_transform
                 };
-                self.render_node(scene, *child_id, child_transform, clip_rect);
+                match band {
+                    Some(band_clip) => {
+                        self.render_fragment_child(scene, *child_id, child_transform, band_clip)
+                    }
+                    None => self.render_node(scene, *child_id, child_transform, clip_rect),
+                }
             }
         }
 
@@ -1374,12 +1439,13 @@ impl ElementCx<'_, '_> {
                     x: position.x as f64 * self.scale,
                     y: position.y as f64 * self.scale,
                 };
-                self.render_node(
-                    scene,
-                    hoisted_child.node_id,
-                    parent_style_transform.pre_translate(pos),
-                    clip_rect,
-                );
+                let transform = parent_style_transform.pre_translate(pos);
+                match band {
+                    Some(band_clip) => {
+                        self.render_fragment_child(scene, hoisted_child.node_id, transform, band_clip)
+                    }
+                    None => self.render_node(scene, hoisted_child.node_id, transform, clip_rect),
+                }
             }
         }
     }
