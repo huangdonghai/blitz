@@ -1455,7 +1455,13 @@ impl ElementCx<'_, '_> {
         }
     }
 
-    fn draw_marker(&self, scene: &mut impl PaintScene, pos: Point) {
+    /// The marker of a list item, outside its box.
+    ///
+    /// `at_content_edge` is for a box that columns its own content: the line the marker would lean
+    /// on belongs to a column, and the marker does not travel with it — it stands by the box's
+    /// content edge instead (`multicol-list-item-003..006`, whose marker sits at the top of a list
+    /// item whose first line is 200px down the flow).
+    fn draw_marker(&self, scene: &mut impl PaintScene, pos: Point, at_content_edge: bool) {
         if let Some(ListItemLayout {
             marker,
             position: ListItemLayoutPosition::Outside(layout),
@@ -1475,11 +1481,12 @@ impl ElementCx<'_, '_> {
                 + item_layout.border.left);
 
             // Align the marker with the baseline of the first line of text in the list item
-            let y_offset = if let Some((text_layout, first_text_line)) = &self
+            let y_offset = if let Some((text_layout, first_text_line)) = self
                 .element
                 .inline_layout_data
                 .as_ref()
                 .and_then(|text_layout| Some((text_layout, text_layout.layout.lines().next()?)))
+                .filter(|_| !at_content_edge)
             {
                 (first_text_line.metrics().baseline
                     - layout.lines().next().unwrap().metrics().baseline)
@@ -1609,7 +1616,7 @@ impl ElementCx<'_, '_> {
             // Culling alone cannot do this: it drops boxes that fall entirely outside the clip,
             // and a box that straddles the column edge would paint whole in both columns.
             scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
-            self.draw_own_content(scene, content_position);
+            self.draw_own_content(scene, content_position, false);
             scene.pop_layer();
             // Each child is cut to the fragmentainer in a layer of its own, widened by whatever it
             // draws outside its own box: a break that left the child whole must not shave the
@@ -1628,10 +1635,14 @@ impl ElementCx<'_, '_> {
         // simplification.
         self.transform = base;
         self.draw_children(scene, base, clip_rect, None, OofChildren::Only);
+        // A list item that columns its own content keeps its marker with the box, outside the first
+        // fragmentainer's edge; the band clip would cut it away, and the line it would otherwise
+        // lean on is a column's, not the box's.
+        self.draw_marker(scene, content_position, true);
     }
 
     fn draw_content(&self, scene: &mut impl PaintScene, content_position: Point, clip_rect: Rect) {
-        self.draw_own_content(scene, content_position);
+        self.draw_own_content(scene, content_position, true);
         // A box of a fragmented flow cuts its own children by the band that cuts it, so that a
         // decoration they draw outside their boxes is not shaved by an ancestor's clip. Its
         // out-of-flow children move with it: their containing block is a fragment of this flow.
@@ -1639,8 +1650,15 @@ impl ElementCx<'_, '_> {
     }
 
     /// What a box draws itself: its text, its replaced parts, its marker. Its children are not
-    /// part of this, because a fragmented box cuts them one by one.
-    fn draw_own_content(&self, scene: &mut impl PaintScene, content_position: Point) {
+    /// part of this, because a fragmented box cuts them one by one — and so is the marker of a box
+    /// that columns its own content, which stands with the box rather than in a column, so it is
+    /// drawn by the pass that ends the band loop (`with_marker` false here for such a box).
+    fn draw_own_content(
+        &self,
+        scene: &mut impl PaintScene,
+        content_position: Point,
+        with_marker: bool,
+    ) {
         self.draw_image(scene);
         #[cfg(feature = "svg")]
         self.draw_svg(scene);
@@ -1650,7 +1668,9 @@ impl ElementCx<'_, '_> {
         self.draw_input(scene);
         self.draw_text_input_text(scene, content_position);
         self.draw_inline_layout(scene, content_position);
-        self.draw_marker(scene, content_position);
+        if with_marker {
+            self.draw_marker(scene, content_position, false);
+        }
     }
 
     /// One child of a fragmented box, cut to the fragmentainer the child stands in, widened by the
