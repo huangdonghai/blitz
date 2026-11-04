@@ -757,10 +757,29 @@ impl<'a> Planner<'a> {
                     styles.get_position().flex_direction,
                     FlexDirection::Column | FlexDirection::ColumnReverse
                 );
+            // A wrapping flex container whose main axis runs *across* this flow stacks lines down
+            // it, and the flow is cut between the lines and never inside one (CSS Flexbox 1 §8: a
+            // multi-line container breaks at its line boundaries). Taffy does not tell us where its
+            // lines are, but the items it placed do: items of one line overlap along the flow, and
+            // items of the next do not, so the groups of overlapping spans are the lines. Their
+            // interiors are made unbreakable and their starts are the points the flow may cut at,
+            // exactly as an item's edges are for a single-line container; nothing inside a line is
+            // offered (`multi-line-row-flex-fragmentation-082a-print`, three pages tall here and
+            // two in its reference, because the container was cut through instead of between).
+            let lines_across_flow = display.inside() == DisplayInside::Flex
+                && styles
+                    .get_position()
+                    .flex_wrap
+                    .intersects(FlexWrap::WRAP | FlexWrap::WRAP_REVERSE)
+                && matches!(
+                    styles.get_position().flex_direction,
+                    FlexDirection::Row | FlexDirection::RowReverse
+                );
             let own_fragmentainer = (!matches!(
                 display.inside(),
                 DisplayInside::Flow | DisplayInside::FlowRoot
-            ) && !flex_along_flow)
+            ) && !flex_along_flow
+                && !lines_across_flow)
                 || styles.get_box().overflow_x != Overflow::Visible
                 || styles.get_box().overflow_y != Overflow::Visible
                 || is_multicol(&styles);
@@ -808,20 +827,86 @@ impl<'a> Planner<'a> {
             if breakable_inside {
                 let border = layout.border;
                 let padding = layout.padding;
-                self.walk(
-                    child_id,
-                    Point {
-                        x: offset.x + layout.location.x,
-                        y: top,
-                    },
-                    (layout.size.width - border.left - border.right - padding.left - padding.right)
-                        .max(0.0),
-                    breakable_inside,
-                    flex_along_flow,
-                    &used,
-                );
+                let content = Point {
+                    x: offset.x + layout.location.x,
+                    y: top,
+                };
+                let inner_inline = (layout.size.width
+                    - border.left
+                    - border.right
+                    - padding.left
+                    - padding.right)
+                    .max(0.0);
+                if lines_across_flow && breakable {
+                    self.flex_lines(child_id, content, inner_inline, &used);
+                } else {
+                    self.walk(
+                        child_id,
+                        content,
+                        inner_inline,
+                        breakable_inside && !lines_across_flow,
+                        flex_along_flow,
+                        &used,
+                    );
+                }
             }
         }
+    }
+
+    /// Record the lines of a wrapping flex container, and descend into them so that nothing inside a
+    /// line is offered as a break point. `offset` is the container's border box in flow coordinates.
+    fn flex_lines(&mut self, container: NodeId, offset: Point<f32>, inline_size: f32, inherited: &PageName) {
+        let doc = self.doc;
+        let children = doc.nodes[container].layout_children.borrow();
+        let Some(children) = children.as_ref() else {
+            return;
+        };
+        // One line's span along the flow, and the boxes that sit in it.
+        let mut lines: Vec<(f32, f32, Vec<(NodeId, Point<f32>, f32)>)> = Vec::new();
+        for &child_id in children.iter() {
+            let child = &doc.nodes[child_id];
+            if child.taffy_display() == taffy::Display::None {
+                continue;
+            }
+            let layout = if self.unrounded {
+                child.unrounded_layout()
+            } else {
+                child.final_layout()
+            };
+            let top = offset.y + layout.location.y;
+            let bottom = top + layout.size.height;
+            if bottom <= top {
+                continue;
+            }
+            match lines.last_mut() {
+                // Overlapping spans, or a line that begins where the last one ended with no room
+                // between them, belong to the same line.
+                Some(last) if last.1 >= top - 0.5 => {
+                    last.1 = last.1.max(bottom);
+                    last.2.push((child_id, layout.location, layout.size.width));
+                }
+                _ => lines.push((top, bottom, vec![(child_id, layout.location, layout.size.width)])),
+            }
+        }
+        for (index, (start, end, items)) in lines.iter().enumerate() {
+            self.units.push(Unit::whole(*start, *end));
+            // The break between two lines falls at the end of the line that came first: the room the
+            // container left between them travels with the line below, as it does between items.
+            if index > 0 {
+                self.push(*start, Rank::Legal, true);
+            }
+            for &(child_id, location, _) in items {
+                let child_offset = Point {
+                    x: offset.x + location.x,
+                    y: *start,
+                };
+                self.extent = self.extent.max(*end);
+                // A percentage margin of an item resolves against the container's content width,
+                // which is what `inline_size` is here.
+                self.walk(child_id, child_offset, inline_size, false, false, inherited);
+            }
+        }
+        self.extent = self.extent.max(lines.last().map(|line| line.1).unwrap_or(offset.y));
     }
 
     /// The page name the last content of this subtree asks for, descending without allowing any
