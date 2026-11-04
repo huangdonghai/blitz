@@ -212,7 +212,11 @@ impl LayoutPassState<'_> {
         // painted with.
         let spanned = !inline_root && self.holds_spanner(dom_id);
         if spanned {
-            self.remeasure_spanners(dom_id, content_width, columns.width);
+            // The container's own content height, which is the basis a spanner's percentage height
+            // asks for. A height given as a percentage of an auto-height container stays indefinite.
+            let container_height =
+                definite.map(|height| (height - insets.top - insets.bottom).max(0.0));
+            self.remeasure_spanners(dom_id, content_width, columns.width, container_height);
         }
 
         let flow_height = (flow.size.height - insets.top - insets.bottom).max(0.0);
@@ -526,11 +530,15 @@ impl LayoutPassState<'_> {
     /// *parent* does to a child: a box whose width is `auto` is given the container's content
     /// width less its own margins, while a table chooses its own width from the room it is given
     /// and is only told how much room that is.
+    /// `container_height` is the content height of the multi-column container, which is what a
+    /// spanner resolves a percentage height against — its containing block is the container, not a
+    /// column, and the spanner fills every column.
     fn remeasure_spanners(
         &mut self,
         container: crate::NodeId,
         content_width: f32,
         column_width: f32,
+        container_height: Option<f32>,
     ) {
         let ids: Vec<crate::NodeId> = {
             let children = self.nodes[container].layout_children.borrow();
@@ -581,7 +589,12 @@ impl LayoutPassState<'_> {
                 known_dimensions_are_definite: Size { width: true, height: true },
                 parent_size: Size {
                     width: Some(content_width),
-                    height: None,
+                    // The spanner's containing block is the multi-column container, so a height it
+                    // gives as a percentage asks for the container's content height — which the
+                    // narrow pass had already resolved. Without it the measure comes back as content
+                    // height and the re-measure silently shortens the spanner
+                    // (`multicol-span-all-children-height-001`, whose 50% of 200px came out 18px).
+                    height: container_height,
                 },
                 available_space: Size {
                     width: AvailableSpace::Definite(content_width),
