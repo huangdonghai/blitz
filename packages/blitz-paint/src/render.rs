@@ -645,17 +645,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                                     x: -node.scroll_offset().x * self.scale,
                                     y: -node.scroll_offset().y * self.scale,
                                 });
-                                cx.draw_image(scene);
-                                #[cfg(feature = "svg")]
-                                cx.draw_svg(scene);
-                                #[cfg(feature = "custom-widget")]
-                                cx.draw_custom_widget(scene);
-                                cx.draw_sub_document(scene);
-                                cx.draw_input(scene);
-                                cx.draw_text_input_text(scene, content_position);
-                                cx.draw_inline_layout(scene, content_position);
-                                cx.draw_marker(scene, content_position);
-                                cx.draw_children(scene, cx.transform, child_clip_rect);
+                                cx.draw_content_fragmented(scene, content_position, child_clip_rect);
                             },
                         );
 
@@ -1186,6 +1176,94 @@ impl ElementCx<'_, '_> {
                 self.local_cull_rect(transform),
                 &mut draw_text_context,
             );
+        }
+    }
+
+    /// The content of a box — its text, its replaced parts, its children — drawn once, or once
+    /// per fragmentainer when the box has a break plan. A fragmented box's own background and
+    /// border are *not* repeated: a multi-column container is one box with the columns inside it.
+    /// What repeats is the content, shifted and cut to each column.
+    fn draw_content_fragmented(
+        &mut self,
+        scene: &mut impl PaintScene,
+        content_position: Point,
+        clip_rect: Rect,
+    ) {
+        let Some(plan) = self.node.break_plan.as_deref() else {
+            self.draw_content(scene, content_position, clip_rect);
+            return;
+        };
+        let base = self.transform;
+        for band in plan.bands.iter() {
+            let shift = plan.translate(band);
+            let fragment = plan.fragment_rect(band);
+            let own = Rect::new(
+                fragment.left as f64 * self.scale,
+                fragment.top as f64 * self.scale,
+                fragment.right as f64 * self.scale,
+                fragment.bottom as f64 * self.scale,
+            );
+            let clip = self.transform.transform_rect_bbox(own).intersect(clip_rect);
+            if clip.area() <= 0.0 {
+                continue;
+            }
+            self.transform = base.then_translate(Vec2 {
+                x: shift.x as f64 * self.scale,
+                y: shift.y as f64 * self.scale,
+            });
+            // Culling alone cannot do this: it drops boxes that fall entirely outside the clip,
+            // and a box that straddles the column edge would paint whole in both columns.
+            scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+            self.draw_content(scene, content_position, clip);
+            scene.pop_layer();
+        }
+        self.transform = base;
+    }
+
+    fn draw_content(&self, scene: &mut impl PaintScene, content_position: Point, clip_rect: Rect) {
+        self.draw_image(scene);
+        #[cfg(feature = "svg")]
+        self.draw_svg(scene);
+        #[cfg(feature = "custom-widget")]
+        self.draw_custom_widget(scene);
+        self.draw_sub_document(scene);
+        self.draw_input(scene);
+        self.draw_text_input_text(scene, content_position);
+        self.draw_inline_layout(scene, content_position);
+        self.draw_marker(scene, content_position);
+        self.draw_children_fragmented(scene, clip_rect);
+    }
+
+    /// A fragmented box draws its children once per fragmentainer: the band's slice of the flow
+    /// shifted to where that fragmentainer sits and clipped to it. The box's own background and
+    /// border are not repeated — a multi-column container is one box with the columns inside it,
+    /// unlike the root of a page sequence, whose canvas background every page shows.
+    fn draw_children_fragmented(&self, scene: &mut impl PaintScene, clip_rect: Rect) {
+        let Some(plan) = self.node.break_plan.as_deref() else {
+            self.draw_children(scene, self.transform, clip_rect);
+            return;
+        };
+
+        for band in plan.bands.iter() {
+            let shift = plan.translate(band);
+            let page = plan.fragment_rect(band);
+            let own = Rect::new(
+                page.left as f64 * self.scale,
+                page.top as f64 * self.scale,
+                page.right as f64 * self.scale,
+                page.bottom as f64 * self.scale,
+            );
+            let clip = self.transform.transform_rect_bbox(own).intersect(clip_rect);
+            if clip.area() <= 0.0 {
+                continue;
+            }
+            let transform = self.transform.then_translate(Vec2 {
+                x: shift.x as f64 * self.scale,
+                y: shift.y as f64 * self.scale,
+            });
+            scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+            self.draw_children(scene, transform, clip);
+            scene.pop_layer();
         }
     }
 
