@@ -316,6 +316,7 @@ fn page_box(doc: &BaseDocument) -> PageBox {
             bottom: 0.0,
         },
     };
+    let mut area = Size::default();
     let guard = doc.guard().read();
     // The unnamed `@page`, which is what a page with no name is printed on.
     let unnamed = style::Atom::default();
@@ -341,12 +342,43 @@ fn page_box(doc: &BaseDocument) -> PageBox {
                     PropertyDeclaration::MarginLeft(value) => {
                         page.margin.left = margin_px(value, page.size.width);
                     }
+                    // `width` and `height` in a page rule size the page *area* — the box the
+                    // content is laid out in — so the paper grows to fit them and their margins
+                    // (`page-size-013-print`, whose `size: 500px; width: 200px; height: 300px;
+                    // margin: 50px` prints on paper 300px by 400px).
+                    PropertyDeclaration::Width(value) => {
+                        area.width = page_edge(value, page.size.width).unwrap_or(area.width);
+                    }
+                    PropertyDeclaration::Height(value) => {
+                        area.height = page_edge(value, page.size.height).unwrap_or(area.height);
+                    }
                     _ => {}
                 }
             }
         }
     }
+    if area.width > 0.0 {
+        page.size.width = area.width + page.margin.left + page.margin.right;
+    }
+    if area.height > 0.0 {
+        page.size.height = area.height + page.margin.top + page.margin.bottom;
+    }
     page
+}
+
+/// One edge of the page area as a page rule gives it, or `None` when the rule leaves it to the
+/// paper. A percentage asks for the page box's measure in the same direction, as a page margin's
+/// does; a length stands for itself.
+fn page_edge(
+    value: &style::values::specified::Size,
+    basis: f32,
+) -> Option<f32> {
+    use style::values::specified::Size as S;
+    match value {
+        S::LengthPercentage(value) => positive(length(&value.0, basis)),
+        S::Auto => None,
+        _ => None,
+    }
 }
 
 /// `@page { size: … }`: two edges, one edge with the other left to the paper the window gives,
