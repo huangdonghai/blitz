@@ -130,20 +130,34 @@
 //!
 //! What still waits behind the per-fragmentainer measure is unchanged: float carrying across columns
 //! and pages, abspos content fragmented onto the pages it spans, the flex row gap truncated at a line
-//! break, the nested writing mode (`vertical-wm-001/-002`) and vertical columns. `cut_bands` handing
-//! back the ranges to re-measure is the first step of that, and it is a larger change than anything
-//! named above.
+//! break, and the nested writing mode once its own box is measured rightly (see below). `cut_bands`
+//! handing back the ranges to re-measure is the first step of that, and it is a larger change than
+//! anything named above.
 //!
-//! The nested writing mode has one more specific gate in front of it. The walk that records a flow's
-//! edges (`walk`, reached from [`edges_of`]) asks each child whether its own block axis is the one this
-//! plan is reading; when it is not — `foreign_axis` — the child becomes a single [`Unit::whole`] and no
-//! break point inside it is offered. That is exactly right for a page name and wrong for
-//! `gecko/css-break/vertical-wm-001/-002` (7320px and 2720px), where a `vertical-lr` island inside a
-//! horizontal columned box must go on breaking while its fragmentainers stay the parent's. The plan
-//! holds one axis for the whole tree, so the change is a per-level axis, and what the engine does
-//! today is pinned on the canvas by `cuotuo-gpui probe::an_orthogonal_island_is_held_whole_by_the_parent`
-//! — ink stops at y 60 in column two with column one's remaining 40px empty. That probe must fail the
-//! day the island stops being whole; it is there to be broken, not to be edited to match.
+//! Two different things sit under "the nested writing mode", and conflating them sends a reader to the
+//! wrong branch:
+//!
+//! - **Vertical multicol** is what `gecko/css-break/vertical-wm-001/-002` (7320px, 2720px) ask for.
+//!   Their markup is `div.col.vl`: the **columned box is itself** `vertical-lr`, with
+//!   `block-size: 90px` and `inline-size: 140px`. Measured off the frame, its border box comes out
+//!   142px in *both* axes — `inline-size` became the width as well as the height, and `block-size`,
+//!   the depth a vertical flow's columns would be cut from, was never applied. So the first thing to
+//!   transpose is the container's own measure in [`multicol`](super::multicol), ahead of any question
+//!   about band axes. The logical properties *inside* that box already follow the writing mode (its
+//!   25px `border-block-start` is a vertical bar, 40px in from the edge), which is why the pair reads
+//!   as "the columns are wrong" rather than "vertical text is broken".
+//! - **The orthogonal island** — a horizontal subtree in a vertical flow, or its mirror — is the walk's
+//!   `foreign_axis`: [`edges_of`] asks each child whether its block axis is the one this plan reads,
+//!   and when it is not, the child becomes a single [`Unit::whole`] with no break point inside it.
+//!   Right for a page name, unfinished for a nested flow that should go on breaking; the plan holds
+//!   one axis for the whole tree, so the change is a per-level axis.
+//!
+//! Each is pinned by its own canvas probe, and each probe asserts what happens **today**, so neither
+//! can be quietly edited to match a change in the other:
+//! `a_vertical_columned_box_still_measures_itself_horizontally` (the 142px-in-both-axes measure) and
+//! `an_orthogonal_island_is_held_whole_by_the_parent` (ink stops at y 60 in column two, column one's
+//! remaining 40px empty). The first fails when the columned box is measured on its own axes; the
+//! second, when the island stops being whole.
 
 use blitz_traits::node_id::NodeId;
 use style::computed_values::flex_direction::T as FlexDirection;
