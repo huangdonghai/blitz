@@ -26,7 +26,7 @@ use style::values::specified::box_::{DisplayInside, DisplayOutside};
 
 use super::LayoutPassState;
 use super::fragmentation::{
-    Band, BreakPlan, CloneSpan, Edge, FlowAxis, Unit, cut_bands, edges_of, is_multicol,
+    Band, BreakPlan, CloneSpan, Edge, FlowAxis, Rank, Unit, cut_bands, edges_of, is_multicol,
 };
 use super::resolve_calc_value;
 use crate::{dom_node_id, taffy_node_id};
@@ -697,9 +697,28 @@ fn balance(edges: &[Edge], units: &[Unit], spans: &[CloneSpan], flow_height: f32
         if candidate < shortest {
             continue;
         }
-        if cut_bands(edges, units, spans, 0.0, candidate, 0.0, flow_height).len() <= count {
-            return candidate;
+        let bands = cut_bands(edges, units, spans, 0.0, candidate, 0.0, flow_height);
+        if bands.len() > count {
+            continue;
         }
+        // A height is only balanced if the flow could actually have been cut where it lands. A
+        // fragment that ends on the column's edge at a point a `widows` or `orphans` count bars means
+        // the height forced the very break the counts exist to prevent, so it is not a balanced
+        // height and the next one up is (CSS Break 3 §3.3/§3.4 read with CSS Multi-column 1 §3).
+        // Only the *count-barred* points are refused: a fragment ending where an unbreakable box
+        // bars the cut has nowhere else to go, and round 24's blunter version, which refused both,
+        // cost nine `css-multicol` pairs for that. The last band is the end of the flow, not a cut.
+        let forced_over_a_count = bands[..bands.len() - 1].iter().any(|band| {
+            edges.iter().any(|edge| {
+                edge.by_counts
+                    && edge.rank == Rank::Forbidden
+                    && (edge.at - band.end).abs() < 0.5
+            })
+        });
+        if forced_over_a_count {
+            continue;
+        }
+        return candidate;
     }
     flow_height.max(shortest)
 }

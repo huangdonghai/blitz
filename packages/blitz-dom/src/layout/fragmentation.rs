@@ -77,7 +77,7 @@ pub enum FlowAxis {
 
 /// What a position in the flow is worth as a place to cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Rank {
+pub(crate) enum Rank {
     /// `break-before`/`break-after` demands a cut here. Nothing outvotes it, not an ancestor's
     /// `break-inside: avoid` (CSS Break 3 §3.2: a forced break cannot be prevented).
     Forced,
@@ -91,7 +91,12 @@ enum Rank {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Edge {
     pub(crate) at: f32,
-    rank: Rank,
+    pub(crate) rank: Rank,
+    /// Whether it is a `widows`/`orphans` count that bars this point, rather than the content itself
+    /// (a `break-inside`, a box that cannot be cut). Balancing may have to end a fragment where the
+    /// content bars the cut — nothing else fits — but a height that forces a cut the counts forbid
+    /// is not a balanced height, and the two look identical without this.
+    pub(crate) by_counts: bool,
 }
 
 impl Rank {
@@ -1011,13 +1016,25 @@ impl<'a> Planner<'a> {
             if after == 0 {
                 continue;
             }
-            self.push(*y, line_rank(before, after, orphans, widows), true);
+            // Whether the counts bar this point is the question balancing asks: a column height that
+            // leaves a fragment fewer lines than `widows`/`orphans` demands is not a balanced one.
+            self.push_at(*y, line_rank(before, after, orphans, widows), true, true);
         }
     }
 
     fn push(&mut self, at: f32, rank: Rank, breakable: bool) {
+        self.push_at(at, rank, breakable, false);
+    }
+
+    /// As [`Self::push`], recording that a `widows`/`orphans` count is what bars the point.
+    /// Balancing asks which candidate heights would force such a cut.
+    fn push_at(&mut self, at: f32, rank: Rank, breakable: bool, by_counts: bool) {
         if breakable || rank == Rank::Forced {
-            self.edges.push(Edge { at, rank });
+            self.edges.push(Edge {
+                at,
+                rank,
+                by_counts,
+            });
         }
     }
 
@@ -1229,7 +1246,11 @@ mod tests {
     use super::*;
 
     fn edge(at: f32, rank: Rank) -> Edge {
-        Edge { at, rank }
+        Edge {
+            at,
+            rank,
+            by_counts: false,
+        }
     }
 
     /// A twelve-line block with `orphans: 7` and `widows: 3` — `widows-orphans-014`, whose assert
@@ -1273,6 +1294,7 @@ mod tests {
             .map(|line| Edge {
                 at: line as f32 * 26.0,
                 rank: line_rank(line as usize, 12 - line as usize, 3, 3),
+                by_counts: true,
             })
             .collect();
         let bands = cut_bands(&edges, &[], &[], 0.0, 100.0, 100.0, 312.0);
