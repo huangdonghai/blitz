@@ -1640,6 +1640,20 @@ impl ElementCx<'_, '_> {
             // for the band it draws, and a later band's clip would inherit the earlier shift.
             let band_rect = base.transform_rect_bbox(own);
             let clip = band_rect.intersect(clip_rect);
+            #[cfg(debug_assertions)]
+            if std::env::var_os("CUOTUO_DEBUG_PAINT").is_some() {
+                eprintln!(
+                    "paint band {index}: flow {:.1}..{:.1} clip x {:.1}..{:.1} y {:.1}..{:.1} shift ({:.1},{:.1})",
+                    band.start,
+                    band.end,
+                    clip.x0,
+                    clip.x1,
+                    clip.y0,
+                    clip.y1,
+                    shift.x,
+                    shift.y,
+                );
+            }
             if clip.area() <= 0.0 {
                 continue;
             }
