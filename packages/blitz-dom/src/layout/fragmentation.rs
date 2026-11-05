@@ -358,7 +358,10 @@ impl BaseDocument {
         let page = self.page_box?;
         let plan = self.root_element().break_plan.as_deref()?;
         Some(Size {
-            width: page.size.width,
+            width: match plan.axis {
+                FlowAxis::Y => page.size.width,
+                FlowAxis::X => plan.canvas_extent(),
+            },
             height: match plan.axis {
                 FlowAxis::Y => plan.canvas_extent(),
                 FlowAxis::X => page.size.height,
@@ -385,11 +388,18 @@ impl PageBox {
         }
     }
 
-    /// Where the page area of page `index` begins on the canvas.
-    pub fn area_origin(&self, index: usize) -> Point<f32> {
-        Point {
-            x: self.margin.left,
-            y: self.margin.top + index as f32 * self.size.height,
+    /// Where the page area of page `index` begins on the canvas. Pages stack along the axis the flow
+    /// runs along: down the paper for a horizontal flow, across it for a vertical one.
+    pub fn area_origin(&self, index: usize, axis: FlowAxis) -> Point<f32> {
+        match axis {
+            FlowAxis::Y => Point {
+                x: self.margin.left,
+                y: self.margin.top + index as f32 * self.size.height,
+            },
+            FlowAxis::X => Point {
+                x: self.margin.left + index as f32 * self.size.width,
+                y: self.margin.top,
+            },
         }
     }
 }
@@ -1528,18 +1538,41 @@ mod tests {
 /// Compute the page plan for the flow rooted at `root_id`, or `None` when the flow cannot be
 /// fragmented yet.
 fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
+    // Which way the document's own flow runs. A vertical writing mode blocks along x, so its pages
+    // are cut across the paper and stack sideways; `vertical-rl` runs *against* x and still needs
+    // the direction settled at the walk (see [`FlowAxis::along`]), so it keeps the single continuous
+    // page it has always had, while `vertical-lr` paginates.
     #[cfg(feature = "writing-mode")]
-    if doc.nodes[root_id].writing_mode().is_vertical() {
-        return None;
-    }
+    let axis = {
+        let mode = doc.nodes[root_id].writing_mode();
+        if mode.is_vertical_lr() {
+            FlowAxis::X
+        } else if mode.is_vertical() {
+            return None;
+        } else {
+            FlowAxis::Y
+        }
+    };
+    #[cfg(not(feature = "writing-mode"))]
+    let axis = FlowAxis::Y;
 
     let page = doc.page_box?;
     let area = page.area();
     #[cfg(debug_assertions)]
     if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
-        eprintln!("page box: {:?} area {:?}", page, area);
+        eprintln!("page box: {:?} area {:?} axis {:?}", page, area, axis);
     }
-    if area.height <= 1.0 {
+    // The fragmentainer's depth is the measure the flow runs along; the page's other dimension is
+    // what it crosses.
+    let depth = match axis {
+        FlowAxis::Y => area.height,
+        FlowAxis::X => area.width,
+    };
+    let cross = match axis {
+        FlowAxis::Y => area.width,
+        FlowAxis::X => area.height,
+    };
+    if depth <= 1.0 {
         return None;
     }
 
@@ -1550,7 +1583,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
     let mut planner = Planner {
         doc,
         unrounded: false,
-        axis: FlowAxis::Y,
+        axis,
         edges: Vec::new(),
         units: Vec::new(),
         spans: Vec::new(),
@@ -1558,7 +1591,13 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         page: root_page.clone(),
         seen_content: false,
     };
-    planner.walk(root_id, Point::ZERO, area.width, true, false, &root_page);
+    // A percentage asks for the container's *inline* measure: the page area's width for a horizontal
+    // flow, its height for a vertical one.
+    let inline_size = match axis {
+        FlowAxis::Y => area.width,
+        FlowAxis::X => area.height,
+    };
+    planner.walk(root_id, Point::ZERO, inline_size, true, false, &root_page);
     // Where the content ends, and not the bottom of the first page: a flow shorter than a page
     // that asks for a break after its last box still gets one page, not two.
     //
@@ -1568,11 +1607,13 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
     // content is a four-inch abspos box holding eight inches of green prints on the pages the green
     // fills (`monolithic-overflow-027-print`, "four green pages", and `overflowing-block-002-print`,
     // whose abspos content "is printed in two pages").
-    let content_end = planner.extent.max(anchored_extent(doc, root_id));
+    let content_end = planner
+        .extent
+        .max(anchored_extent(doc, root_id, axis));
 
-    /// How far down the flow the boxes anchored to `container` reach, and their own anchored
+    /// How far along the flow the boxes anchored to `container` reach, and their own anchored
     /// descendants with them.
-    fn anchored_extent(doc: &BaseDocument, container: crate::NodeId) -> f32 {
+    fn anchored_extent(doc: &BaseDocument, container: crate::NodeId, axis: FlowAxis) -> f32 {
         let mut far: f32 = 0.0;
         let hoisted = doc.nodes[container].hoisted_children.borrow();
         for &child in hoisted.iter() {
@@ -1582,13 +1623,26 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
                 .layout_style()
                 .margin()
                 .resolve_or_zero(None, resolve_calc_value);
-            let bottom = layout.location.y + layout.size.height + margin.bottom;
+            let (start, measure, end_margin, ink) = match axis {
+                FlowAxis::Y => (
+                    layout.location.y,
+                    layout.size.height,
+                    margin.bottom,
+                    layout.scrollable_overflow_rect.bottom,
+                ),
+                FlowAxis::X => (
+                    layout.location.x,
+                    layout.size.width,
+                    margin.right,
+                    layout.scrollable_overflow_rect.right,
+                ),
+            };
+            let far_edge = start + measure + end_margin;
             // Content that leaves the box travels with it, so the ink is what has to be printed.
-            let ink = layout.scrollable_overflow_rect.bottom;
             far = far
-                .max(bottom)
+                .max(far_edge)
                 .max(ink)
-                .max(anchored_extent(doc, node.id));
+                .max(anchored_extent(doc, node.id, axis));
         }
         far
     }
@@ -1604,24 +1658,33 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         eprintln!("fragmentation edges ({}): {dump}", doc.base_url());
     }
 
-    let mut bands = planner.bands(0.0, area.height, area.width, content_end);
+    let mut bands = planner.bands(0.0, depth, cross, content_end);
     for (index, band) in bands.iter_mut().enumerate() {
-        band.origin = page.area_origin(index);
+        band.origin = page.area_origin(index, axis);
     }
 
     #[cfg(debug_assertions)]
     if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
         let dump = bands
             .iter()
-            .map(|b| format!("[{:.1}..{:.1}]@{:.1}", b.start, b.end, b.origin.y))
+            .map(|b| {
+                let at = match axis {
+                    FlowAxis::Y => b.origin.y,
+                    FlowAxis::X => b.origin.x,
+                };
+                format!("[{:.1}..{:.1}]@{:.1}", b.start, b.end, at)
+            })
             .collect::<Vec<_>>()
             .join(" ");
         eprintln!("fragmentation bands: {dump} (content end {content_end:.1})");
     }
 
     Some(BreakPlan {
-        axis: FlowAxis::Y,
-        stride: page.size.height,
+        axis,
+        stride: match axis {
+            FlowAxis::Y => page.size.height,
+            FlowAxis::X => page.size.width,
+        },
         bands,
     })
 }
