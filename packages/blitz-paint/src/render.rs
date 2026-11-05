@@ -1007,8 +1007,18 @@ fn box_whole_in_band(
     if sx != 1.0 || ky != 0.0 || kx != 0.0 || sy != 1.0 {
         return (false, false);
     }
+    // The child's own place in the flow, not the container's origin: `render_node` slides a child by
+    // its `location` when it draws it, so a rect built at `Point::ZERO` answers "is this box whole in
+    // this band?" for a box sitting at the top of the container whatever child it is. That made
+    // `whole_start` false for every child below the band's near edge, and so refused the near-edge
+    // widening to the one box that needed it -- `multicol-span-all-children-height-001`'s spanner,
+    // whose 1px outline begins exactly on its band's near edge and was shaved by it.
+    let origin = Point::new(
+        layout.location.x as f64 * scale,
+        layout.location.y as f64 * scale,
+    );
     let on_canvas = transform.transform_rect_bbox(Rect::from_origin_size(
-        Point::ZERO,
+        origin,
         Size::new(
             layout.size.width as f64 * scale,
             layout.size.height as f64 * scale,
@@ -1748,6 +1758,18 @@ impl ElementCx<'_, '_> {
                 cloned || whole_end,
             )
             .intersect(clip_rect);
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CUOTUO_DEBUG_PAINT").is_some() {
+            eprintln!(
+                "  child {:?} bleed {:.1} whole ({whole_start},{whole_end}) clip x {:.1}..{:.1} y {:.1}..{:.1}",
+                child.element_data().map(|e| e.name.local.to_string()),
+                bleed.y0,
+                clip.x0,
+                clip.x1,
+                clip.y0,
+                clip.y1,
+            );
+        }
         if clip.area() <= 0.0 {
             return;
         }
