@@ -104,11 +104,16 @@ fn resolve(value: &LengthPercentage, basis: f32) -> Option<f32> {
 
 impl LayoutPassState<'_> {
     /// Lay out a multi-column container; see the module docs.
+    ///
+    /// `count_hint` is the number of columns a previous pass found its content filled. It is given
+    /// only when the container is being measured again at the width those columns get; see the
+    /// correction at the end of this function.
     pub(crate) fn compute_multicol_layout(
         &mut self,
         node_id: NodeId,
         inputs: LayoutInput,
         block_ctx: Option<&mut BlockContext<'_>>,
+        count_hint: Option<usize>,
     ) -> LayoutOutput {
         let dom_id = dom_node_id(node_id);
         let parent_width = inputs.parent_size.width.unwrap_or(0.0).max(0.0);
@@ -157,6 +162,14 @@ impl LayoutPassState<'_> {
         // Pass one: this container's flow as a single column.
         let mut columns = columns;
         let mut content_width = content_width;
+        if let Some(used) = count_hint.filter(|used| *used >= 1 && *used < columns.count) {
+            // A definite width is shared out among the columns the content fills, not among the
+            // columns the style names (`widows-orphans-002`: `columns: 4` across 792px whose two
+            // paragraphs, kept two lines each by `widows: 2`, fill two columns of 396px, not four
+            // of 198). CSS Multi-column 1 §3 balances the content into as few as it needs.
+            columns.width = (content_width - columns.gap * (used as f32 - 1.0)) / used as f32;
+            columns.count = used;
+        }
         if definite_width.is_none() {
             // Measured intrinsically, the container is one column of that measure (CSS Multicol 1
             // §5): ask the flow what it needs at the incoming constraint, give every column that
@@ -327,6 +340,40 @@ impl LayoutPassState<'_> {
         } else {
             bands.len().max(1).min(columns.count)
         };
+
+        // A box of definite width that balanced into fewer columns than it named has to be measured
+        // again, because the columns it now uses are wider and its content reflows in them: cutting
+        // the first pass's flow into wider bands would leave it laid out for the narrow ones, which
+        // is how `widows-orphans-002` came to draw two columns of 198px where its reference draws two
+        // of 396. One correction pass is enough — a second asking for fewer still is a flow whose
+        // height does not depend on the column width, and the hinted measure reports its own count.
+        //
+        // Only a horizontal flow is corrected: this module cuts bands along the flow's block axis
+        // today, so in a vertical container the band count says nothing about how many columns the
+        // content fills, and the correction collapsed `break-inside-avoid-min-block-size-2`'s three
+        // columns into one. That is the axis work the module docs record as missing, not this rule.
+        let vertical_flow = self.nodes[dom_id].primary_styles().is_some_and(|styles| {
+            use style::values::computed::WritingModeProperty as Wm;
+            matches!(
+                styles.get_inherited_box().clone_writing_mode(),
+                Wm::VerticalRl | Wm::VerticalLr | Wm::SidewaysRl | Wm::SidewaysLr
+            )
+        });
+        // At least two columns must be involved: a flow cut into a single band is not evidence that
+        // the content needs fewer columns than it names, since the single band is usually the floor
+        // that keeps a column no shorter than the tallest thing that cannot be cut at all. What that
+        // floor should be when `break-inside: avoid` merely asks is a separate question, and
+        // `break-inside-avoid-min-block-size-1` (failing before this rule too) is on its far side.
+        if count_hint.is_none()
+            && definite_width.is_some()
+            && !spanned
+            && !columns.sequential
+            && !vertical_flow
+            && used >= 2
+            && used < columns.count
+        {
+            return self.compute_multicol_layout(node_id, inputs, block_ctx, Some(used));
+        }
 
         self.nodes[dom_id].break_plan = Some(Box::new(BreakPlan {
             axis: FlowAxis::Y,

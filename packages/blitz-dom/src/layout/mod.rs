@@ -584,7 +584,7 @@ impl LayoutPassState<'_> {
                 // A multi-column container fragments its own flow into columns, so it is laid
                 // out at a column's width rather than at the width its parent offered.
                 if node.is_multicol_box() {
-                    return self.compute_multicol_layout(node_id, inputs, block_ctx);
+                    return self.compute_multicol_layout(node_id, inputs, block_ctx, None);
                 }
 
                 if node.flags.is_inline_root() {
