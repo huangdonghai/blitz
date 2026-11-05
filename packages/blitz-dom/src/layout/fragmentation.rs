@@ -82,6 +82,23 @@
 //! pairs, at 209px, 39720px and 51537px respectively, and a probe here
 //! (`percentage_heights_in_a_column_ask_for_the_container`) pins today's basis so the change cannot be
 //! made silently, in either direction.
+//!
+//! An eighth attempt narrowed **where** that parameter would have to live, and is worth reading before
+//! trying the same: rewriting a *direct child's* `parent_size.height` during
+//! [`multicol`](super::multicol)'s measure (scoped by `Node::parent`, restored straight after ✓) left all
+//! three acceptance pairs at exactly the numbers above — **inert** ✓ — because taffy's block algorithm
+//! resolves a child's percentage block size against the container's own content height, computed inside
+//! it, and that field is not the channel. The same hook did move one unrelated pair (`-007`, by 4106px ✓),
+//! so the attempt mapped the channels rather than proving nothing: `parent_size.height` reaches padding
+//! and `available_space`/`known_dimensions` reach depth, and neither reaches a child's height.
+//!
+//! Which leaves exactly two doors, and they are not equivalent. Either the block-size basis becomes a
+//! parameter of taffy's block layout — meaning a **fifth fork**, since taffy is a pinned git dependency
+//! here rather than one of the four vendored ones, and that is a decision above this file — or the flow
+//! is measured **per fragmentainer**, where the container's content height legitimately *is* the
+//! fragmentainer's depth and no new field is needed at all. The latter is why round 68's single measure
+//! clipped the flow and this attempt did nothing: two halves of one fact ✓. `cut_bands` handing back the
+//! ranges to re-measure is its first step, and the pin named above fails the day it lands ✓
 
 use blitz_traits::node_id::NodeId;
 use style::computed_values::flex_direction::T as FlexDirection;
