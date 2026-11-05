@@ -133,6 +133,17 @@
 //! break, the nested writing mode (`vertical-wm-001/-002`) and vertical columns. `cut_bands` handing
 //! back the ranges to re-measure is the first step of that, and it is a larger change than anything
 //! named above.
+//!
+//! The nested writing mode has one more specific gate in front of it. The walk that records a flow's
+//! edges (`walk`, reached from [`edges_of`]) asks each child whether its own block axis is the one this
+//! plan is reading; when it is not — `foreign_axis` — the child becomes a single [`Unit::whole`] and no
+//! break point inside it is offered. That is exactly right for a page name and wrong for
+//! `gecko/css-break/vertical-wm-001/-002` (7320px and 2720px), where a `vertical-lr` island inside a
+//! horizontal columned box must go on breaking while its fragmentainers stay the parent's. The plan
+//! holds one axis for the whole tree, so the change is a per-level axis, and what the engine does
+//! today is pinned on the canvas by `cuotuo-gpui probe::an_orthogonal_island_is_held_whole_by_the_parent`
+//! — ink stops at y 60 in column two with column one's remaining 40px empty. That probe must fail the
+//! day the island stops being whole; it is there to be broken, not to be edited to match.
 
 use blitz_traits::node_id::NodeId;
 use style::computed_values::flex_direction::T as FlexDirection;
