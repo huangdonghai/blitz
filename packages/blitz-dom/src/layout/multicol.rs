@@ -132,7 +132,7 @@ impl LayoutPassState<'_> {
         // the styles cannot outlive a pass that writes into the same tree. The insets are the
         // container's own box, which the single-column pass adds back on so that its children sit
         // the same distance from its border as they would in one column.
-        let (columns, insets, content_width, definite, inline_root, fit_content_width) = {
+        let (columns, insets, content_width, definite, inline_root, auto_width) = {
             let node = &self.nodes[dom_id];
             let Some(styles) = node.primary_styles() else {
                 return LayoutOutput::HIDDEN;
@@ -140,17 +140,19 @@ impl LayoutPassState<'_> {
             if !is_multicol(&styles) {
                 return LayoutOutput::HIDDEN;
             }
-            // A box takes a fit-content width — the width it chooses for itself, as opposed to one
-            // specified or stretched to the space — when it has no width of its own and does not
-            // stretch: out of flow, floated, or inline-level (CSS 2.1 §10.3.7). Which of the three
-            // the container's width is decides how its columns are sized, so the difference is not
-            // cosmetic: a specified or stretched width is divided among the columns the style names,
-            // while a fit-content one is the width of the columns the content actually needed.
+            // Whether the container's width came from the space rather than from the author: an auto
+            // width, whether it is stretched to the containing block or shrink-to-fit. That is the
+            // line the column division follows — a width the author gave is divided among the columns
+            // the author gave, and a width that falls out of the space is divided among the columns
+            // the content needed. Both halves are measured: `break-inside-avoid-min-block-size-1`
+            // (`inline-size: 500px`) keeps three columns of 160px with a flow that fills two, while
+            // `column-box-alignment-rtl` — an auto-width block, two short paragraphs in
+            // `column-count: 4` — asks in its own text for the used two columns to be the full width
+            // ("the first column aligned with the right side of the block, the second to its direct
+            // left"), which is the used count dividing a stretched width too, not only a
+            // shrink-to-fit one.
             use style::values::computed::Size as ComputedSize;
-            use style::values::specified::box_::DisplayOutside;
-            let fit_content_width = matches!(styles.clone_width(), ComputedSize::Auto)
-                && (node.is_out_of_flow()
-                    || styles.get_box().clone_display().outside() == DisplayOutside::Inline);
+            let auto_width = matches!(styles.clone_width(), ComputedSize::Auto);
             let style = node.layout_style();
             let padding = style
                 .padding()
@@ -167,7 +169,7 @@ impl LayoutPassState<'_> {
             let content_width = (available_width - insets.left - insets.right).max(0.0);
             let columns = Columns::measure(&styles, content_width, parent_width);
             let definite = style_height(&styles, inputs);
-            (columns, insets, content_width, definite, node.flags.is_inline_root(), fit_content_width)
+            (columns, insets, content_width, definite, node.flags.is_inline_root(), auto_width)
         };
 
         // Pass one: this container's flow as a single column.
@@ -370,16 +372,16 @@ impl LayoutPassState<'_> {
                 Wm::VerticalRl | Wm::VerticalLr | Wm::SidewaysRl | Wm::SidewaysLr
             )
         });
-        // Only a box that chooses its own width is re-measured. A width that is specified, or
-        // stretched to the space, is divided among the columns the style names even when the balanced
-        // flow fills fewer: that is `break-inside-avoid-min-block-size-1` (`columns: 3; inline-size:
-        // 500px`), whose reference keeps three columns of 160px while a flow of two fragments uses
-        // two. A fit-content box has to pick a width, and the width it picks is the columns its
-        // content needed — `widows-orphans-002` (`columns: 4`, absolutely positioned, no width) fills
-        // two columns of 396px, not four of 198px, because the counts bar the smaller fragments.
+        // Only a box whose width was not given is re-measured. A specified width is divided among the
+        // columns the style names even when the balanced flow fills fewer — `break-inside-avoid-min-
+        // block-size-1` (`columns: 3; inline-size: 500px`) keeps three columns of 160px in its
+        // reference — while an auto width, stretched to the containing block or shrink-to-fit, is
+        // divided among the columns the content needed: `widows-orphans-002` (`columns: 4`, absolutely
+        // positioned) fills two of 396px, and `column-box-alignment-rtl`, a plain auto-width block,
+        // asks in its own text that the two columns its flow fills span the whole stretched width.
         // At least two columns must be involved, for the reason in round 43's message.
         if count_hint.is_none()
-            && fit_content_width
+            && auto_width
             && !spanned
             && !columns.sequential
             && !vertical_flow
