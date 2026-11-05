@@ -316,6 +316,18 @@ impl LayoutPassState<'_> {
             eprintln!("  units: {whole}");
         }
 
+        // How many columns the flow actually filled. For a box measured for its own size that is the
+        // number it reports as its width: `columns: 4` whose content cannot be cut into four without
+        // breaking `widows` ends up two columns wide — `widows-orphans-002`, whose assert asks for the
+        // 4 X's "arranged in a 2 by 2 square" and whose reference is half as wide as we were. A flow
+        // cut by spanners has runs, not columns, in its bands, and a sequential fill can spill past
+        // the count into rows below; neither is a column count, so both keep the author's.
+        let used = if spanned {
+            columns.count
+        } else {
+            bands.len().max(1).min(columns.count)
+        };
+
         self.nodes[dom_id].break_plan = Some(Box::new(BreakPlan {
             axis: FlowAxis::Y,
             stride: columns.width + columns.gap,
@@ -330,9 +342,10 @@ impl LayoutPassState<'_> {
                 width: if definite_width.is_some() {
                     available_width
                 } else {
-                    // As wide as the columns it asked for, with the room between them.
-                    columns.width * columns.count as f32
-                        + columns.gap * columns.count.saturating_sub(1) as f32
+                    // As wide as the columns its content filled, with the room between them.
+                    let used = used as f32;
+                    columns.width * used
+                        + columns.gap * (used - 1.0).max(0.0)
                         + insets.left
                         + insets.right
                 },
