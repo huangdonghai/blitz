@@ -980,15 +980,27 @@ impl<'a> Planner<'a> {
                 || is_multicol(&styles);
             let scroll_container = styles.get_box().overflow_x != Overflow::Visible
                 || styles.get_box().overflow_y != Overflow::Visible;
+            // A box whose own block axis is not the one this flow is being measured along — the
+            // `horizontal-tb` subtree inside a `vertical-rl` document, or its mirror — cannot have
+            // its interior recorded here at all: its break points lie along an axis this walk is not
+            // reading. Until the plan can carry an axis per level (see the module docs), such a box
+            // is held whole and its content is left unmeasured; recording positions from it as if
+            // they were along this axis is what put a nested page name at the wrong place
+            // (`page-name-orthogonal-writing-001/-003-print`).
+            #[cfg(feature = "writing-mode")]
+            let foreign_axis = FlowAxis::of(child.writing_mode().is_vertical()) != self.axis;
+            #[cfg(not(feature = "writing-mode"))]
+            let foreign_axis = false;
             let breakable_inside = breakable
                 && !avoids_inside(styles.clone_break_inside())
-                && !own_fragmentainer;
-            // A box the author asked not to be broken, and a box that scrolls or clips its
-            // overflow, are carried whole into a fragmentainer rather than cut: the scrollport is
-            // one box that cannot be in two places at once (`multicol-overflow-clip-auto-sized`).
-            // A flex, grid or table container is not: Chrome breaks those item by item, and
-            // treating them as unbreakable makes the columns around them too tall.
-            if scroll_container || avoids_inside(styles.clone_break_inside()) {
+                && !own_fragmentainer
+                && !foreign_axis;
+            // A box the author asked not to be broken, a box that scrolls or clips its
+            // overflow, and a box on another axis are carried whole into a fragmentainer rather than
+            // cut: the scrollport is one box that cannot be in two places at once
+            // (`multicol-overflow-clip-auto-sized`), and a nested flow cannot be cut where the cut
+            // is not being taken.
+            if scroll_container || avoids_inside(styles.clone_break_inside()) || foreign_axis {
                 self.units.push(Unit::whole(outer_top, outer_bottom));
             }
             // A flex item is one thing the container sized and placed: where it does not fit the
