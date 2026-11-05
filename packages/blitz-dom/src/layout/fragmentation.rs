@@ -80,36 +80,47 @@
 //! evidence. The probe that pinned the old reading used `columns: 1` for exactly the same reason and
 //! proved nothing; it now uses two columns, and asserts the container rule the references give.
 //!
-//! So the three defects were in [`multicol`](super::multicol)'s own arithmetic, and no new input was
-//! needed. The first: the height the author wrote is the **content** box under the default
-//! `box-sizing`, while the block algorithm is handed a **border box** — which the width in the same
-//! call already was (`columns.width + insets`). A container of `height: 200px; border: 5px` therefore
-//! measured its own content at 190px, its columns at 95, and every percentage inside at 95 instead of
-//! 100. That is also why the seven attempts above "found no channel": they were re-basing a percentage
-//! whose basis was already wrong by the border, and each one moved the box and the basis together,
-//! which is what makes a change look inert. The second: a run of columns after a `column-span: all`
-//! box may use only the depth the container has left, which is what gives `-002`'s last row four
-//! columns of 50px, two of them outside the box's own width, exactly as its reference draws them;
-//! under `column-fill: auto` each row still gets the whole content box
-//! (`multicol-gap-decorations-020`). The third: [`Band`] positions were counted from zero *after* the
-//! offset had already been started at `insets.top`, and the flow's coordinates carry those insets, so
-//! a spanned container painted its whole page below where the unfragmented pass had put its content —
-//! 5px in `-002`, 64px in `multicol-span-all-rule-001`, whose test and reference both run through this
-//! path and so hid the error from each other while the pair passed.
+//! So what was wrong was in [`multicol`](super::multicol)'s own arithmetic, and no new input was
+//! needed. Four things, three of them the same shape — a number counted twice, or counted as the
+//! wrong box:
 //!
-//! Measured: the corpus goes 5061 → 5062 with no pair lost, and the three acceptance pairs fall from
-//! 39720 / 51537 / 56685px to 3271 / 3971 / 7885px.
+//! 1. The height the author wrote is the **content** box under the default `box-sizing`, while the
+//!    block algorithm is handed a **border box** — which the width in the same call already was
+//!    (`columns.width + insets`). A container of `height: 200px; border: 5px` therefore measured its
+//!    own content at 190px, its columns at 95, and every percentage inside at 95 instead of 100. This
+//!    is also why the seven attempts above "found no channel": they were re-basing a percentage whose
+//!    basis was already wrong by the border, and each one moved the box and the basis together, which
+//!    is what makes a change look inert.
+//! 2. A run of columns after a `column-span: all` box may use only the depth the container has left,
+//!    which is what gives `-002`'s last row four columns of 50px, two of them outside the box's own
+//!    width, exactly as its reference draws them. Under `column-fill: auto` each row still gets the
+//!    whole content box (`multicol-gap-decorations-020`).
+//! 3. `spanner_bands` started its running offset at `insets.top` and then advanced it by the first
+//!    run's flow start, which already carries that inset — so the container's insets were counted
+//!    twice along the flow, and a spanned page sat 5px below where the unfragmented pass had put its
+//!    content (`-002`), or 64px below (`multicol-span-all-rule-001`, whose two halves run through this
+//!    same path and so hid the error from each other while the pair passed).
+//! 4. The same double-count across the flow: a band's `origin` includes the container's cross inset,
+//!    and the subtree drawn into the band was laid out from that inset too, so
+//!    [`BreakPlan::translate`] adding `origin` as a shift put every column of a bordered container
+//!    one inset too far right — `-002`'s yellow began at x 18 where its reference has x 13. Hence
+//!    [`BreakPlan::cross_start`], which the page sequence leaves at zero because a page's bands
+//!    already carry the page's own position.
 //!
-//! Two further shapes were tried on top of that and reverted by pixels, both because a column **rule**
-//! is measured to the container's content edge whatever the run — the assert of
-//! `multicol-span-all-rule-001`, which each one lost: stretching the last run to the room left rather
-//! than balancing it (43/6 in the two multicol families against 44/7), and setting the band's `depth`
-//! to the run's depth instead. Read [`BreakPlan::fragment_rect`] before trying the second again: the
-//! clip is cut at `end - start`, so [`Band::depth`] is *only* the rule's measure. An earlier draft of
-//! this note claimed the short run that paints past the bottom of its box needed the rule and the clip
-//! to be separated first; the fields already are separate, and what was painting there was the
-//! double-counted inset above. That mistake is recorded because a wrong map here costs rounds: the
-//! basis chase it resembled spent seven of them.
+//! Measured, with the two `multicol-span-all-button` claims retired because the engine now draws them
+//! identically: 5061 → 5068, five pairs fixed and none lost — `-002` and `-003` (from 39720 and
+//! 51537px), `out-of-flow-in-multicolumn-093`, `gecko/pagination/border-breaking-001-cols` and
+//! `css-break/flexbox/flex-item-content-overflow-002b`.
+//!
+//! Two shapes were tried part-way through and rejected, both because a column **rule** is drawn to the
+//! container's content edge whatever the run — the assert of `multicol-span-all-rule-001`, which each
+//! of them lost: stretching the last run to the room left rather than balancing it, and setting
+//! [`Band::depth`] from the run instead of the container. Read [`BreakPlan::fragment_rect`] before
+//! trying the second again: the clip is cut at `end - start`, so `depth` is *only* the rule's measure.
+//! An earlier draft of this note said the painting past the bottom of the box needed the rule and the
+//! clip separated first; they are separate, and what was painting there was double-count 4. Both
+//! rejections were measured before fixes 3 and 4 landed, so if the nested axis needs the stretch, its
+//! numbers are worth taking again rather than trusting.
 //!
 //! What still waits behind the per-fragmentainer measure is unchanged: float carrying across columns
 //! and pages, abspos content fragmented onto the pages it spans, the flex row gap truncated at a line
@@ -359,6 +370,15 @@ pub struct BreakPlan {
     /// so without this its content would be measured longer than it is, and every reversed page would
     /// mis-align by exactly the difference.
     pub flow_end: f32,
+    /// The coordinate the flow's own children start at, along the axis *across* the flow. A band's
+    /// `origin` is the far edge of the fragmentainer's content box and already includes it, while the
+    /// subtree drawn into the band was laid out from it, so the shift is `origin - cross_start`.
+    /// Taking the origin alone paints a bordered columned box one border-width away from where the
+    /// unfragmented pass put its content: the yellow of
+    /// `multicol-span-all-children-height-002` began at x 18 where its reference has x 13, five times
+    /// the container's `border: 5px`. A page sequence sets `0.0`: its bands carry the page's own
+    /// absolute position, and the content box the children live in is already relative to that.
+    pub cross_start: f32,
 }
 
 impl BreakPlan {
@@ -430,16 +450,16 @@ impl BreakPlan {
         let (_, end) = self.content_slice(band);
         match self.axis {
             FlowAxis::Y => Point {
-                x: band.origin.x,
+                x: band.origin.x - self.cross_start,
                 y: near - band.start,
             },
             FlowAxis::X if self.reversed => Point {
                 x: near - (self.measure - end),
-                y: band.origin.y,
+                y: band.origin.y - self.cross_start,
             },
             FlowAxis::X => Point {
                 x: near - band.start,
-                y: band.origin.y,
+                y: band.origin.y - self.cross_start,
             },
         }
     }
@@ -1888,5 +1908,8 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         measure: flow_measure,
         depth,
         flow_end: content_end,
+        // A page's bands already carry the page's absolute position, and the content laid out into a
+        // page starts at that band, so there is nothing to subtract: the shift is the origin itself.
+        cross_start: 0.0,
     })
 }

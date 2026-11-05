@@ -419,6 +419,9 @@ impl LayoutPassState<'_> {
             measure: 0.0,
             depth: 0.0,
             flow_end: 0.0,
+            // The flow was measured at one column's width inside this container's content box, so its
+            // children begin at the container's own cross inset and the bands must not add it twice.
+            cross_start: insets.left,
         }));
 
         // The container is as tall as one column, not as tall as the flow it was cut from —
