@@ -84,6 +84,60 @@ pub enum FlowAxis {
     X,
 }
 
+impl FlowAxis {
+    /// Where a box's border box begins along this axis, given the flow's origin `offset`. Margins are
+    /// added by the caller: the outer edge is the box's own begin less the room before it, while how
+    /// far the flow reaches is measured to the border box — a margin left at the bottom of a
+    /// fragmentainer asks for no page. For [`Self::Y`] this is the physical y; a `vertical-rl` flow
+    /// is *not* flipped here, on purpose: the walk records edges in increasing physical order and the
+    /// page plan mirrors them at its own edge (`BreakPlan::outer_edges`), which keeps the cut rules —
+    /// legal points, widows, `carry_before` — independent of direction. A vertical document still has
+    /// to settle which of those two places the direction belongs; this is the one that leaves the
+    /// rest of the file alone.
+    pub(crate) fn along(self, offset: Point<f32>, layout: &taffy::Layout) -> f32 {
+        match self {
+            FlowAxis::Y => offset.y + layout.location.y,
+            FlowAxis::X => offset.x + layout.location.x,
+        }
+    }
+
+    /// The room a box leaves before it and after it **along this axis** — the margins the flow has to
+    /// respect. `start` is the edge the flow reaches first: for a `vertical-rl` flow that is the
+    /// box's *right* margin, and that mapping is the one decision a vertical document still has to
+    /// make, so it lives here rather than scattered through the walk.
+    pub(crate) fn start_edge(self, margin: Rect<f32>) -> f32 {
+        match self {
+            FlowAxis::Y => margin.top,
+            FlowAxis::X => margin.left,
+        }
+    }
+
+    pub(crate) fn end_edge(self, margin: Rect<f32>) -> f32 {
+        match self {
+            FlowAxis::Y => margin.bottom,
+            FlowAxis::X => margin.right,
+        }
+    }
+
+    /// How far a box reaches along this axis.
+    pub(crate) fn measure(self, layout: &taffy::Layout) -> f32 {
+        match self {
+            FlowAxis::Y => layout.size.height,
+            FlowAxis::X => layout.size.width,
+        }
+    }
+
+    /// The axis the flow runs against, given the box's own writing mode: a vertical writing mode
+    /// blocks along x. Horizontal flows are the only ones cut today.
+    pub(crate) fn of(vertical: bool) -> Self {
+        if vertical {
+            FlowAxis::X
+        } else {
+            FlowAxis::Y
+        }
+    }
+}
+
 /// What a position in the flow is worth as a place to cut.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Rank {
@@ -629,6 +683,10 @@ struct Planner<'a> {
     /// Read the unrounded layout rather than the rounded one: a column asks for its flow's break
     /// points while layout is still running, before anything has been rounded.
     unrounded: bool,
+    /// The axis the flow runs along: see [`FlowAxis::along`]. Only [`FlowAxis::Y`] is cut today; the
+    /// walk already measures through this field so that a vertical document has one place left to
+    /// settle rather than a coordinate convention repeated through the file.
+    axis: FlowAxis,
     edges: Vec<Edge>,
     /// The stretches of this flow that cannot be cut (see [`Unit`]).
     units: Vec<Unit>,
@@ -692,17 +750,19 @@ impl<'a> Planner<'a> {
             } else {
                 child.final_layout()
             };
-            let top = offset.y + layout.location.y;
-
             // A percentage margin resolves against the containing block's inline size; `auto`
             // resolves to nothing, which is what it means in a block flow.
             let margin = child
                 .layout_style()
                 .margin()
                 .resolve_or_zero(Some(inline_size), resolve_calc_value);
-            let outer_top = top - margin.top;
-            let bottom = top + layout.size.height;
-            let outer_bottom = bottom + margin.bottom;
+            // Where the box sits along the flow, and how far it reaches — both asked of
+            // [`FlowAxis`], so that one place decides what "further along the flow" means. See
+            // [`FlowAxis::along`] for the coordinate choice a vertical document has to settle.
+            let top = self.axis.along(offset, &layout);
+            let bottom = top + self.axis.measure(&layout);
+            let outer_top = top - self.axis.start_edge(margin);
+            let outer_bottom = bottom + self.axis.end_edge(margin);
             // How far the flow reaches is where its content ends, not where the last box's
             // margin does: a margin left at the bottom of a fragmentainer asks for no page.
             self.extent = self.extent.max(bottom);
@@ -1234,6 +1294,7 @@ pub(crate) fn edges_of(
     let mut planner = Planner {
         doc,
         unrounded: true,
+        axis: FlowAxis::Y,
         edges: Vec::new(),
         units: Vec::new(),
         spans: Vec::new(),
@@ -1489,6 +1550,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
     let mut planner = Planner {
         doc,
         unrounded: false,
+        axis: FlowAxis::Y,
         edges: Vec::new(),
         units: Vec::new(),
         spans: Vec::new(),
