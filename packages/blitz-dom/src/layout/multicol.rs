@@ -132,7 +132,7 @@ impl LayoutPassState<'_> {
         // the styles cannot outlive a pass that writes into the same tree. The insets are the
         // container's own box, which the single-column pass adds back on so that its children sit
         // the same distance from its border as they would in one column.
-        let (columns, insets, content_width, definite, inline_root) = {
+        let (columns, insets, content_width, definite, inline_root, fit_content_width) = {
             let node = &self.nodes[dom_id];
             let Some(styles) = node.primary_styles() else {
                 return LayoutOutput::HIDDEN;
@@ -140,6 +140,17 @@ impl LayoutPassState<'_> {
             if !is_multicol(&styles) {
                 return LayoutOutput::HIDDEN;
             }
+            // A box takes a fit-content width — the width it chooses for itself, as opposed to one
+            // specified or stretched to the space — when it has no width of its own and does not
+            // stretch: out of flow, floated, or inline-level (CSS 2.1 §10.3.7). Which of the three
+            // the container's width is decides how its columns are sized, so the difference is not
+            // cosmetic: a specified or stretched width is divided among the columns the style names,
+            // while a fit-content one is the width of the columns the content actually needed.
+            use style::values::computed::Size as ComputedSize;
+            use style::values::specified::box_::DisplayOutside;
+            let fit_content_width = matches!(styles.clone_width(), ComputedSize::Auto)
+                && (node.is_out_of_flow()
+                    || styles.get_box().clone_display().outside() == DisplayOutside::Inline);
             let style = node.layout_style();
             let padding = style
                 .padding()
@@ -156,7 +167,7 @@ impl LayoutPassState<'_> {
             let content_width = (available_width - insets.left - insets.right).max(0.0);
             let columns = Columns::measure(&styles, content_width, parent_width);
             let definite = style_height(&styles, inputs);
-            (columns, insets, content_width, definite, node.flags.is_inline_root())
+            (columns, insets, content_width, definite, node.flags.is_inline_root(), fit_content_width)
         };
 
         // Pass one: this container's flow as a single column.
@@ -359,13 +370,16 @@ impl LayoutPassState<'_> {
                 Wm::VerticalRl | Wm::VerticalLr | Wm::SidewaysRl | Wm::SidewaysLr
             )
         });
-        // At least two columns must be involved: a flow cut into a single band is not evidence that
-        // the content needs fewer columns than it names, since the single band is usually the floor
-        // that keeps a column no shorter than the tallest thing that cannot be cut at all. What that
-        // floor should be when `break-inside: avoid` merely asks is a separate question, and
-        // `break-inside-avoid-min-block-size-1` (failing before this rule too) is on its far side.
+        // Only a box that chooses its own width is re-measured. A width that is specified, or
+        // stretched to the space, is divided among the columns the style names even when the balanced
+        // flow fills fewer: that is `break-inside-avoid-min-block-size-1` (`columns: 3; inline-size:
+        // 500px`), whose reference keeps three columns of 160px while a flow of two fragments uses
+        // two. A fit-content box has to pick a width, and the width it picks is the columns its
+        // content needed — `widows-orphans-002` (`columns: 4`, absolutely positioned, no width) fills
+        // two columns of 396px, not four of 198px, because the counts bar the smaller fragments.
+        // At least two columns must be involved, for the reason in round 43's message.
         if count_hint.is_none()
-            && definite_width.is_some()
+            && fit_content_width
             && !spanned
             && !columns.sequential
             && !vertical_flow
