@@ -85,36 +85,46 @@ pub enum FlowAxis {
 }
 
 impl FlowAxis {
-    /// Where a box's border box begins along this axis, given the flow's origin `offset`. Margins are
+    /// Where a box's border box begins **in the flow's own coordinates**, given the physical `offset`
+    /// of its container and `measure`, the far edge the flow's coordinates count from. Margins are
     /// added by the caller: the outer edge is the box's own begin less the room before it, while how
     /// far the flow reaches is measured to the border box — a margin left at the bottom of a
-    /// fragmentainer asks for no page. For [`Self::Y`] this is the physical y; a `vertical-rl` flow
-    /// is *not* flipped here, on purpose: the walk records edges in increasing physical order and the
-    /// page plan mirrors them at its own edge (`BreakPlan::outer_edges`), which keeps the cut rules —
-    /// legal points, widows, `carry_before` — independent of direction. A vertical document still has
-    /// to settle which of those two places the direction belongs; this is the one that leaves the
-    /// rest of the file alone.
-    pub(crate) fn along(self, offset: Point<f32>, layout: &taffy::Layout) -> f32 {
+    /// fragmentainer asks for no page.
+    ///
+    /// A horizontal flow and a `vertical-lr` one read the physical coordinate directly. A
+    /// `vertical-rl` flow starts at the containing space's *right* edge and advances leftwards, so a
+    /// box's place along the flow is how far its own right edge sits from that far edge. Flipping
+    /// here, once, keeps every cut rule — legal points in increasing order, widows, `carry_before` —
+    /// blind to the direction; painting converts the other way, in [`BreakPlan::translate`].
+    pub(crate) fn along(
+        self,
+        reversed: bool,
+        measure: f32,
+        offset: Point<f32>,
+        layout: &taffy::Layout,
+    ) -> f32 {
         match self {
             FlowAxis::Y => offset.y + layout.location.y,
+            FlowAxis::X if reversed => measure - (offset.x + layout.location.x + layout.size.width),
             FlowAxis::X => offset.x + layout.location.x,
         }
     }
 
-    /// The room a box leaves before it and after it **along this axis** — the margins the flow has to
-    /// respect. `start` is the edge the flow reaches first: for a `vertical-rl` flow that is the
-    /// box's *right* margin, and that mapping is the one decision a vertical document still has to
-    /// make, so it lives here rather than scattered through the walk.
-    pub(crate) fn start_edge(self, margin: Rect<f32>) -> f32 {
+    /// The room a box leaves before it along the flow — its *right* margin for a reversed flow, whose
+    /// first edge is the right one. Paired with [`Self::end_edge`]: these two with [`Self::along`]
+    /// are the whole of what the direction does to where a break may fall.
+    pub(crate) fn start_edge(self, reversed: bool, margin: Rect<f32>) -> f32 {
         match self {
             FlowAxis::Y => margin.top,
+            FlowAxis::X if reversed => margin.right,
             FlowAxis::X => margin.left,
         }
     }
 
-    pub(crate) fn end_edge(self, margin: Rect<f32>) -> f32 {
+    pub(crate) fn end_edge(self, reversed: bool, margin: Rect<f32>) -> f32 {
         match self {
             FlowAxis::Y => margin.bottom,
+            FlowAxis::X if reversed => margin.left,
             FlowAxis::X => margin.right,
         }
     }
@@ -278,39 +288,99 @@ pub struct BreakPlan {
     /// holds, because a page has a margin, so this measures the paper and not the area.
     pub stride: f32,
     pub bands: ThinVec<Band>,
+    /// Whether the flow runs against the axis (`vertical-rl`). Such a flow *enters* its
+    /// fragmentainers at the far edge, which is what [`Self::fragment_span`] and [`Self::translate`]
+    /// account for.
+    pub reversed: bool,
+    /// The far edge a reversed flow's coordinates were counted from — what the walk measured against.
+    pub measure: f32,
+    /// How deep one fragmentainer is along the axis, which is what a reversed flow right-aligns its
+    /// content inside.
+    pub depth: f32,
+    /// Where the flow's content actually stops. The last band is drawn to its fragmentainer's depth,
+    /// so without this its content would be measured longer than it is, and every reversed page would
+    /// mis-align by exactly the difference.
+    pub flow_end: f32,
 }
 
 impl BreakPlan {
-    /// The canvas rectangle one band's content is clipped to: the fragmentainer's content box,
-    /// cut short at the flow line where the next break was placed. Painting the whole page box
-    /// would show the content that belongs to the following fragmentainer as well.
+    /// The flow lines one band really holds: `(start, end)`, with the last band's end brought back to
+    /// where the content stops. A band's `end` records the depth of its fragmentainer — where the
+    /// next break would have fallen — which is right for the clip and wrong for measuring content.
+    fn content_slice(&self, band: &Band) -> (f32, f32) {
+        let end = if self.reversed {
+            band.end.min(self.flow_end)
+        } else {
+            band.end
+        };
+        (band.start, end.max(band.start))
+    }
+
+    /// Where one band's content sits on the canvas along the flow: its `(near, far)` edges.
+    ///
+    /// Normally content begins at its fragmentainer's near edge. A reversed flow *enters* the
+    /// fragmentainer at its far edge, so its first content is what sits against the right: the same
+    /// span, grown from the other side. Both the clip and [`Self::translate`] start here, so they
+    /// cannot drift apart.
+    pub fn fragment_span(&self, band: &Band) -> (f32, f32) {
+        let (start, end) = self.content_slice(band);
+        let span = (end - start).max(0.0);
+        let near = match self.axis {
+            FlowAxis::Y => band.origin.y,
+            FlowAxis::X if self.reversed => band.origin.x + (self.depth - span).max(0.0),
+            FlowAxis::X => band.origin.x,
+        };
+        (near, near + span)
+    }
+
+    /// The canvas rectangle one band's content is clipped to: the fragmentainer's content box, cut
+    /// short at the flow line where the next break was placed. Painting the whole page box would show
+    /// the content that belongs to the following fragmentainer as well.
+    ///
+    /// The clip is measured by the fragmentainer's **depth**, not by [`Self::content_slice`]: a band's
+    /// own page is as deep as the page is, and a last band's overflowing tail must not be shaved.
     pub fn fragment_rect(&self, band: &Band) -> Rect<f32> {
-        let span = (band.end - band.start).max(0.0);
+        let depth = (band.end - band.start).max(0.0);
+        let near = match self.axis {
+            FlowAxis::Y => band.origin.y,
+            FlowAxis::X if self.reversed => band.origin.x + (self.depth - depth).max(0.0),
+            FlowAxis::X => band.origin.x,
+        };
+        let far = near + depth;
         match self.axis {
             FlowAxis::Y => Rect {
                 left: band.origin.x,
-                top: band.origin.y,
+                top: near,
                 right: band.origin.x + band.cross,
-                bottom: band.origin.y + span,
+                bottom: far,
             },
             FlowAxis::X => Rect {
-                left: band.origin.x,
+                left: near,
                 top: band.origin.y,
-                right: band.origin.x + span,
+                right: far,
                 bottom: band.origin.y + band.cross,
             },
         }
     }
 
-    /// How far the fragmentainer's subtree shifts to draw one band.
+    /// How far the fragmentainer's subtree shifts to draw one band: from where layout physically put
+    /// the flow's slice, to where [`Self::fragment_span`] says it belongs. A reversed flow's
+    /// coordinates count from the far edge of the space they were measured in, so its slice begins at
+    /// `measure - end` rather than at `start`.
     pub fn translate(&self, band: &Band) -> Point<f32> {
+        let (near, _) = self.fragment_span(band);
+        let (_, end) = self.content_slice(band);
         match self.axis {
             FlowAxis::Y => Point {
                 x: band.origin.x,
-                y: band.origin.y - band.start,
+                y: near - band.start,
+            },
+            FlowAxis::X if self.reversed => Point {
+                x: near - (self.measure - end),
+                y: band.origin.y,
             },
             FlowAxis::X => Point {
-                x: band.origin.x - band.start,
+                x: near - band.start,
                 y: band.origin.y,
             },
         }
@@ -697,6 +767,10 @@ struct Planner<'a> {
     /// walk already measures through this field so that a vertical document has one place left to
     /// settle rather than a coordinate convention repeated through the file.
     axis: FlowAxis,
+    /// Whether the flow runs against the axis (`vertical-rl`), and the far edge its coordinates count
+    /// from. A horizontal flow sets neither.
+    reversed: bool,
+    measure: f32,
     edges: Vec<Edge>,
     /// The stretches of this flow that cannot be cut (see [`Unit`]).
     units: Vec<Unit>,
@@ -769,10 +843,12 @@ impl<'a> Planner<'a> {
             // Where the box sits along the flow, and how far it reaches — both asked of
             // [`FlowAxis`], so that one place decides what "further along the flow" means. See
             // [`FlowAxis::along`] for the coordinate choice a vertical document has to settle.
-            let top = self.axis.along(offset, &layout);
+            let top = self
+                .axis
+                .along(self.reversed, self.measure, offset, &layout);
             let bottom = top + self.axis.measure(&layout);
-            let outer_top = top - self.axis.start_edge(margin);
-            let outer_bottom = bottom + self.axis.end_edge(margin);
+            let outer_top = top - self.axis.start_edge(self.reversed, margin);
+            let outer_bottom = bottom + self.axis.end_edge(self.reversed, margin);
             // How far the flow reaches is where its content ends, not where the last box's
             // margin does: a margin left at the bottom of a fragmentainer asks for no page.
             self.extent = self.extent.max(bottom);
@@ -1305,6 +1381,10 @@ pub(crate) fn edges_of(
         doc,
         unrounded: true,
         axis: FlowAxis::Y,
+        // A column sequence is measured along its own block axis, which this pass only does for a
+        // horizontal flow — so no direction to account for here.
+        reversed: false,
+        measure: 0.0,
         edges: Vec::new(),
         units: Vec::new(),
         spans: Vec::new(),
@@ -1554,23 +1634,25 @@ mod tests {
 /// Compute the page plan for the flow rooted at `root_id`, or `None` when the flow cannot be
 /// fragmented yet.
 fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
-    // Which way the document's own flow runs. A vertical writing mode blocks along x, so its pages
-    // are cut across the paper and stack sideways; `vertical-rl` runs *against* x and still needs
-    // the direction settled at the walk (see [`FlowAxis::along`]), so it keeps the single continuous
-    // page it has always had, while `vertical-lr` paginates.
+    // Which way the document's own flow runs. A vertical writing mode blocks along x, so its pages are
+    // cut across the paper and stack sideways; `vertical-rl` runs *against* x, which the walk settles
+    // once (see [`FlowAxis::along`]) and painting answers by right-aligning each page's content (see
+    // [`BreakPlan::fragment_span`]). A sideways mode is neither, and is not paginated yet.
     #[cfg(feature = "writing-mode")]
-    let axis = {
+    let (axis, reversed) = {
         let mode = doc.nodes[root_id].writing_mode();
-        if mode.is_vertical_lr() {
-            FlowAxis::X
+        if mode.is_vertical_rl() {
+            (FlowAxis::X, true)
+        } else if mode.is_vertical_lr() {
+            (FlowAxis::X, false)
         } else if mode.is_vertical() {
             return None;
         } else {
-            FlowAxis::Y
+            (FlowAxis::Y, false)
         }
     };
     #[cfg(not(feature = "writing-mode"))]
-    let axis = FlowAxis::Y;
+    let (axis, reversed) = (FlowAxis::Y, false);
 
     let page = doc.page_box?;
     let area = page.area();
@@ -1596,10 +1678,22 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         .primary_styles()
         .map(|styles| styles.clone_page())
         .unwrap_or(PageName::Auto);
+    // What a reversed flow's coordinates count from: the **far edge**, in absolute layout
+    // coordinates, of the space the root was laid out in — not the root's own width. A
+    // `vertical-rl` root is itself placed against the far side of that space (240px of content in an
+    // 800px viewport sits at x 560), so counting from the width instead shifts the whole document off
+    // the canvas and paints nothing at all.
+    let root_layout = doc.nodes[root_id].final_layout();
+    let flow_measure = match axis {
+        FlowAxis::Y => root_layout.size.height,
+        FlowAxis::X => root_layout.location.x + root_layout.size.width,
+    };
     let mut planner = Planner {
         doc,
         unrounded: false,
         axis,
+        reversed,
+        measure: flow_measure,
         edges: Vec::new(),
         units: Vec::new(),
         spans: Vec::new(),
@@ -1613,7 +1707,19 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         FlowAxis::Y => area.width,
         FlowAxis::X => area.height,
     };
-    planner.walk(root_id, Point::ZERO, inline_size, true, false, &root_page);
+    // The walk starts where the root box actually sits, not at the origin: a `vertical-rl` root is
+    // placed against the far side of the space (x 560 above), and the coordinates the plan cuts must
+    // be the same ones painting sees — paint shifts absolute positions, so a flow coordinate measured
+    // from the root's own corner would put every page off the canvas. For a horizontal root, at y 0,
+    // this is the origin it has always been given.
+    planner.walk(
+        root_id,
+        root_layout.location,
+        inline_size,
+        true,
+        false,
+        &root_page,
+    );
     // Where the content ends, and not the bottom of the first page: a flow shorter than a page
     // that asks for a break after its last box still gets one page, not two.
     //
@@ -1625,11 +1731,17 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
     // whose abspos content "is printed in two pages").
     let content_end = planner
         .extent
-        .max(anchored_extent(doc, root_id, axis));
+        .max(anchored_extent(doc, root_id, axis, reversed, flow_measure));
 
     /// How far along the flow the boxes anchored to `container` reach, and their own anchored
-    /// descendants with them.
-    fn anchored_extent(doc: &BaseDocument, container: crate::NodeId, axis: FlowAxis) -> f32 {
+    /// descendants with them. `measure` is the far edge a reversed flow counts from; unused otherwise.
+    fn anchored_extent(
+        doc: &BaseDocument,
+        container: crate::NodeId,
+        axis: FlowAxis,
+        reversed: bool,
+        measure: f32,
+    ) -> f32 {
         let mut far: f32 = 0.0;
         let hoisted = doc.nodes[container].hoisted_children.borrow();
         for &child in hoisted.iter() {
@@ -1639,26 +1751,26 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
                 .layout_style()
                 .margin()
                 .resolve_or_zero(None, resolve_calc_value);
-            let (start, measure, end_margin, ink) = match axis {
+            let (start, own, ink) = match axis {
                 FlowAxis::Y => (
                     layout.location.y,
                     layout.size.height,
-                    margin.bottom,
                     layout.scrollable_overflow_rect.bottom,
                 ),
                 FlowAxis::X => (
                     layout.location.x,
                     layout.size.width,
-                    margin.right,
                     layout.scrollable_overflow_rect.right,
                 ),
             };
-            let far_edge = start + measure + end_margin;
-            // Content that leaves the box travels with it, so the ink is what has to be printed.
+            let reached = (start + own + axis.end_edge(reversed, margin)).max(ink);
+            // Content that leaves the box travels with it, so the ink is what has to be printed. A
+            // reversed flow reads its coordinates from the far edge, so the box reaching furthest
+            // *along* it is the one whose physical extent lies furthest *back*.
+            let along_flow = if reversed { measure - start } else { reached };
             far = far
-                .max(far_edge)
-                .max(ink)
-                .max(anchored_extent(doc, node.id, axis));
+                .max(along_flow)
+                .max(anchored_extent(doc, node.id, axis, reversed, measure));
         }
         far
     }
@@ -1702,5 +1814,9 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
             FlowAxis::X => page.size.width,
         },
         bands,
+        reversed,
+        measure: flow_measure,
+        depth,
+        flow_end: content_end,
     })
 }

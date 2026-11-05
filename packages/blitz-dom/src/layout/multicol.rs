@@ -395,6 +395,12 @@ impl LayoutPassState<'_> {
             axis: FlowAxis::Y,
             stride: columns.width + columns.gap,
             bands,
+            // A column sequence is cut along its own block axis, which this pass only does for a
+            // horizontal flow: a vertical container's columns are the work left to do.
+            reversed: false,
+            measure: 0.0,
+            depth: 0.0,
+            flow_end: 0.0,
         }));
 
         // The container is as tall as one column, not as tall as the flow it was cut from —
