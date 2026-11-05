@@ -97,10 +97,14 @@
 //! Two further shapes were tried on top of that and reverted by pixels, both because a column **rule**
 //! is measured to the container's content edge whatever the run — the assert of
 //! `multicol-span-all-rule-001`, which each one lost: stretching the last run to the room left rather
-//! than balancing it (43/6 in the two multicol families against 44/7), and taking the run's own depth
-//! as the band depth, which is the same thing said from the clip's side. Until the rule and the clip
-//! are given separate fields, the band stays at the container's height and a short run paints past the
-//! bottom of its box — the residue that keeps `-002` at 14558px rather than at zero.
+//! than balancing it (43/6 in the two multicol families against 44/7), and setting the band's `depth`
+//! to the run's depth instead. Read [`BreakPlan::fragment_rect`] before trying the second again: the
+//! clip is cut at `end - start`, so [`Band::depth`] is *only* the rule's measure, and the short run
+//! that paints past the bottom of its box in `-002` is not the depth's doing — which is what the first
+//! draft of this note claimed, wrongly, and is written down here so the next reader does not go and
+//! "separate the rule from the clip" a field that is already separate.
+//!
+//! So `-002` at 14558px and `-003` at 12840px are not finished, and their residue is not the depth.
 //!
 //! What still waits behind the per-fragmentainer measure is unchanged: float carrying across columns
 //! and pages, abspos content fragmented onto the pages it spans, the flex row gap truncated at a line

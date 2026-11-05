@@ -556,10 +556,11 @@ impl LayoutPassState<'_> {
                     x: insets.left + index as f32 * stride,
                     y: offset,
                 };
-                // The rule of a column is drawn as deep as the container, and the clip that cuts a
-                // run's content stops where the run's own bands do; `multicol-span-all-rule-001`
-                // measures its rule by the content edge even in a run shorter than that, so this is
-                // the container's height and not the run's.
+                // The depth a column's rule is drawn to. A run shorter than the container still rules
+                // to the container's content edge — the assert of `multicol-span-all-rule-001`, and
+                // the reason measuring this by the run instead loses that pair. The clip is a separate
+                // number: `BreakPlan::fragment_rect` cuts at `end - start`, so the depth here never
+                // decides how much of a run's content shows.
                 band.depth = definite.unwrap_or(height);
                 bands.push(band);
             }
