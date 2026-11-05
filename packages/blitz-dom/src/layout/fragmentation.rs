@@ -58,6 +58,30 @@
 //! measurement can say whether the change keeps them. The sixth limit above does not need it — the cut
 //! already knows where the boundary would fall; what is missing is that a box taller than the
 //! fragmentainer should sometimes overflow it rather than be carried.
+//!
+//! Six attempts at the shape above have been made **through the existing fields** and every one is now
+//! measured dead, which is itself the finding: the fragmentainer's measure cannot be smuggled in, it
+//! has to be an input of its own. Drawing a columned container's out-of-flow children per column, or
+//! counting the container's own hoisted boxes into its flow: no pixel moved. Counting a *descendant's*
+//! hoisted reach into the flow: one pair gained, another lost — `out-of-flow-in-multicolumn-004` wants
+//! an abspos box to lengthen the flow while `bfc-004-print` wants the same shape not to, and nothing in
+//! the current inputs tells those apart (the containing block and the hoisting are the same kind in
+//! both). Setting the flow's measure to the column depth: the numbers moved in the wrong direction,
+//! because one field is asked to be both "how deep may this be measured" and "what a child's percentage
+//! resolves against", and for a container of a definite height those differ. Re-laying each child with a
+//! fresh input at the column depth: worse again, because a new input changes its width and its place in
+//! the flow as well as its basis, and keeping the old positions against new heights leaves the columns
+//! mis-aligned by exactly the amount the pairs then differ.
+//!
+//! So the seventh limit, and it is the one to clear first: [`multicol`](super::multicol)'s measure
+//! needs a parameter that says *"the fragmentainer you are laying out inside of is this deep, for
+//! percentages"*, applied to the container's direct children only, leaving the box's own height and the
+//! flow's available space alone — and the positions must come out of that same measure rather than be
+//! preserved. Everything else in this list (the moving content, the clone's rate, the nested axis, the
+//! abspos boxes) waits behind it. `multicol-span-all-children-height-001/-002/-003` are the acceptance
+//! pairs, at 209px, 39720px and 51537px respectively, and a probe here
+//! (`percentage_heights_in_a_column_ask_for_the_container`) pins today's basis so the change cannot be
+//! made silently, in either direction.
 
 use blitz_traits::node_id::NodeId;
 use style::computed_values::flex_direction::T as FlexDirection;
