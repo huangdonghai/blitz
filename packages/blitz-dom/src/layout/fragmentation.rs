@@ -1533,6 +1533,22 @@ mod tests {
         let bands = cut_bands(&edges, &units, &[], 0.0, 100.0, 800.0, 200.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 40.0));
     }
+
+    /// Two units that **overlap** along the flow are what a wrapping flex container's parallel lines
+    /// look like to the cut: a box per line, at the same extent. One of them could be moved on, both
+    /// cannot, so the cut goes through them. That is what `flexbox-unbreakable-child-2` depends on
+    /// today, and the reason a wrapping container cannot be fragmented by treating its items as
+    /// blocks along the flow (round 57 measured the two variants: each fixed two pairs and broke this
+    /// one). A per-band layout has to carry or cut the lines together; until then this stands, and
+    /// the test says which decision the corpus was waiting on rather than only that pairs got worse.
+    #[test]
+    fn parallel_units_are_cut_rather_than_one_being_carried() {
+        let edges = [edge(0.0, Rank::Legal)];
+        let units = [Unit::whole(0.0, 40.0), Unit::whole(4.0, 44.0)];
+        let bands = cut_bands(&edges, &units, &[], 0.0, 30.0, 800.0, 44.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 30.0));
+        assert_eq!(bands.len(), 2);
+    }
 }
 
 /// Compute the page plan for the flow rooted at `root_id`, or `None` when the flow cannot be

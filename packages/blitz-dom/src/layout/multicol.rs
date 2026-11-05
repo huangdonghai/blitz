@@ -798,3 +798,79 @@ fn balance(edges: &[Edge], units: &[Unit], spans: &[CloneSpan], flow_height: f32
     }
     flow_height.max(shortest)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::fragmentation::{cut_bands, Edge, Rank, Unit};
+    use super::balance;
+
+    fn edge(at: f32, rank: Rank, by_counts: bool) -> Edge {
+        Edge {
+            at,
+            rank,
+            by_counts,
+        }
+    }
+
+    fn line(start: f32, end: f32) -> Unit {
+        Unit {
+            start,
+            end,
+            box_start: start,
+            flex_item: false,
+        }
+    }
+
+    /// A 78px flow of three 26px lines, asked to balance into four columns. The only point between
+    /// the first and second line is barred by `widows`/`orphans`, so a column of 26px could only be
+    /// made by breaking where the counts say no: the balanced height is 52px instead ✓ (`balance`
+    /// refuses the shorter candidate). Nothing in the corpus would say which of the two produced a
+    /// 52 — this does.
+    #[test]
+    fn a_height_that_forces_a_count_barred_cut_is_not_balanced() {
+        let edges = [
+            edge(0.0, Rank::Legal, false),
+            edge(26.0, Rank::Forbidden, true),
+            edge(52.0, Rank::Legal, false),
+        ];
+        let units = [line(0.0, 26.0), line(26.0, 52.0), line(52.0, 78.0)];
+        assert_eq!(balance(&edges, &units, &[], 78.0, 4), 52.0);
+    }
+
+    /// The other half of the distinction, and the half that cost nine `css-multicol` pairs when it
+    /// was not made (round 24): a point barred by *content* — an unbreakable box, a `break-inside`
+    /// — does not veto the shorter height. The flow has to end somewhere, and refusing here balances
+    /// into columns the references do not draw.
+    #[test]
+    fn a_cut_barred_only_by_the_content_still_balances_short() {
+        let edges = [
+            edge(0.0, Rank::Legal, false),
+            edge(26.0, Rank::Forbidden, false),
+            edge(52.0, Rank::Legal, false),
+        ];
+        let units = [line(0.0, 26.0), line(26.0, 52.0), line(52.0, 78.0)];
+        assert_eq!(balance(&edges, &units, &[], 78.0, 4), 26.0);
+    }
+
+    /// The candidate that cannot fit the columns at all is not chosen just because it is legal:
+    /// four lines asked to balance into two columns give 52, not 26.
+    #[test]
+    fn a_height_that_overflows_the_columns_is_not_balanced() {
+        let edges = [
+            edge(0.0, Rank::Legal, false),
+            edge(26.0, Rank::Legal, false),
+            edge(52.0, Rank::Legal, false),
+            edge(78.0, Rank::Legal, false),
+        ];
+        let units = [
+            line(0.0, 26.0),
+            line(26.0, 52.0),
+            line(52.0, 78.0),
+            line(78.0, 104.0),
+        ];
+        assert_eq!(balance(&edges, &units, &[], 104.0, 2), 52.0);
+        // And the cut that the height asks for is really there, at each column's end.
+        let bands = cut_bands(&edges, &units, &[], 0.0, 52.0, 0.0, 104.0);
+        assert_eq!(bands.len(), 2);
+    }
+}
