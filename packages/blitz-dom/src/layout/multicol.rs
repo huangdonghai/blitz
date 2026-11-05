@@ -481,8 +481,17 @@ impl LayoutPassState<'_> {
         let mut spent = 0.0;
         // Where the previous run left the flow. A spanner's own margins collapse with the boxes
         // around it, and the space they take belongs to neither run — it is the gap between them,
-        // and the runs below have to be pushed down by it.
-        let mut cursor = 0.0;
+        // and the runs below have to be pushed down by it. The gap in front of the *first* run is
+        // measured from where that run starts rather than from zero, because the flow's coordinates
+        // already include the container's insets: a child sits at `insets.top` inside the border box
+        // it was laid out in. Starting at zero counted the insets twice and put every band of a
+        // spanned container below where the unfragmented pass had put its content — 5px in
+        // `multicol-span-all-children-height-002`, 64px in `multicol-span-all-rule-001`, whose test
+        // and reference both run through this path and so hid the error from each other.
+        let mut cursor = runs
+            .iter()
+            .find(|run| run.end > run.start)
+            .map_or(0.0, |run| run.start);
         for run in runs {
             if run.end <= run.start {
                 continue;

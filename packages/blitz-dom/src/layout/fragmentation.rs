@@ -80,7 +80,7 @@
 //! evidence. The probe that pinned the old reading used `columns: 1` for exactly the same reason and
 //! proved nothing; it now uses two columns, and asserts the container rule the references give.
 //!
-//! So the two defects were in [`multicol`](super::multicol)'s own arithmetic, and no new input was
+//! So the three defects were in [`multicol`](super::multicol)'s own arithmetic, and no new input was
 //! needed. The first: the height the author wrote is the **content** box under the default
 //! `box-sizing`, while the block algorithm is handed a **border box** — which the width in the same
 //! call already was (`columns.width + insets`). A container of `height: 200px; border: 5px` therefore
@@ -91,20 +91,25 @@
 //! box may use only the depth the container has left, which is what gives `-002`'s last row four
 //! columns of 50px, two of them outside the box's own width, exactly as its reference draws them;
 //! under `column-fill: auto` each row still gets the whole content box
-//! (`multicol-gap-decorations-020`). Measured: the corpus goes 5061 → 5062 with no pair lost, and the
-//! three acceptance pairs fall from 39720 / 51537 / 56685px to 14558 / 12840 / 13175px.
+//! (`multicol-gap-decorations-020`). The third: [`Band`] positions were counted from zero *after* the
+//! offset had already been started at `insets.top`, and the flow's coordinates carry those insets, so
+//! a spanned container painted its whole page below where the unfragmented pass had put its content —
+//! 5px in `-002`, 64px in `multicol-span-all-rule-001`, whose test and reference both run through this
+//! path and so hid the error from each other while the pair passed.
+//!
+//! Measured: the corpus goes 5061 → 5062 with no pair lost, and the three acceptance pairs fall from
+//! 39720 / 51537 / 56685px to 3271 / 3971 / 7885px.
 //!
 //! Two further shapes were tried on top of that and reverted by pixels, both because a column **rule**
 //! is measured to the container's content edge whatever the run — the assert of
 //! `multicol-span-all-rule-001`, which each one lost: stretching the last run to the room left rather
 //! than balancing it (43/6 in the two multicol families against 44/7), and setting the band's `depth`
 //! to the run's depth instead. Read [`BreakPlan::fragment_rect`] before trying the second again: the
-//! clip is cut at `end - start`, so [`Band::depth`] is *only* the rule's measure, and the short run
-//! that paints past the bottom of its box in `-002` is not the depth's doing — which is what the first
-//! draft of this note claimed, wrongly, and is written down here so the next reader does not go and
-//! "separate the rule from the clip" a field that is already separate.
-//!
-//! So `-002` at 14558px and `-003` at 12840px are not finished, and their residue is not the depth.
+//! clip is cut at `end - start`, so [`Band::depth`] is *only* the rule's measure. An earlier draft of
+//! this note claimed the short run that paints past the bottom of its box needed the rule and the clip
+//! to be separated first; the fields already are separate, and what was painting there was the
+//! double-counted inset above. That mistake is recorded because a wrong map here costs rounds: the
+//! basis chase it resembled spent seven of them.
 //!
 //! What still waits behind the per-fragmentainer measure is unchanged: float carrying across columns
 //! and pages, abspos content fragmented onto the pages it spans, the flex row gap truncated at a line
