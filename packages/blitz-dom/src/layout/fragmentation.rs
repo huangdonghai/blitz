@@ -32,23 +32,32 @@
 //! - an out-of-box anchored to the page sequence whose **own content** decides how many pages there
 //!   are (the extent now counts what it hoists; fragmenting that content does not).
 //!
-//! A fifth limit was reached from the other direction. The width a columned box reports when it is
-//! measured for its own size is the number of columns its content *needs* — four 26px lines with
-//! `widows: 2` shrink to two columns (`widows-orphans-002`), two lines shrink to one
-//! (`css-multicol/baseline-000`) — and "needs" means: fits, with every fragment ending where the
-//! flow may legally break. Deciding that is deciding which fragmentainer ends are legal, which is
-//! the question [`Rank::Forbidden`] cannot answer once asked of it alone: a point forbidden by
-//! `widows` and a point forbidden by `break-inside` arrive as the same rank. Guessing at the
-//! distinction in the balancing pass cost nine pairs and was reverted; the shrink-wrap width has to
-//! wait for the same distinction to be recorded rather than inferred.
+//! A fifth limit was reached from the other direction and has since been paid. The width a columned
+//! box reports when it is measured for its own size is the number of columns its content *needs* —
+//! four 26px lines with `widows: 2` shrink to two columns (`widows-orphans-002`), which needs to know
+//! *why* a fragment end is barred, since a point barred by `widows` and one barred by `break-inside`
+//! are not the same instruction to balancing. [`Rank::Forbidden`] now records that
+//! ([`Edge::by_counts`], set from [`line_edges`]), and a box that chooses its own width — auto, whether
+//! stretched or shrink-to-fit — is now divided by the columns its flow filled (`9840577f`, `92e4027f`,
+//! `eaf6b803`). What the work exposed is a sixth limit, and it is not the coordinate system:
+//! [`cut_bands`] will not place a boundary inside a [`Unit`] at all, so a box taller than its
+//! fragmentainer is carried whole to the next one, while Chrome lets it overflow and keeps the column
+//! count. That is where `break-inside-avoid-min-block-size-1` and the `column-box-alignment-rtl`
+//! family sit, and two hypotheses about it have now been measured false: the balancing floor is not the
+//! lever (`avoid`-only units excluded — no pixel moved), nor is a line-only floor (empty boxes have no
+//! line units at all). The lever is the carry-versus-overflow decision in the cut, and it is
+//! load-bearing against `single-line-column-flex-fragmentation-071`, `flexbox-unbreakable-child` and
+//! `table-page-break-inside-avoid-1`, where carrying an item whole is exactly right.
 //!
-//! The one change that would reach all four is running the flow layout **per band** rather than once
-//! — pass one of [`multicol`](super::multicol) already measures the flow at a column's width, so the
-//! shape is: let `cut_bands` return the ranges to re-measure, re-measure each at its fragmentainer's
+//! The one change that would reach the first four is running the flow layout **per band** rather than
+//! once — pass one of [`multicol`](super::multicol) already measures the flow at a column's width, so
+//! the shape is: let `cut_bands` return the ranges to re-measure, re-measure each at its fragmentainer's
 //! cross size and depth, and give each fragment its own coordinates. That is a layout-architecture
 //! change, not a rule in this file, and it should be attempted with `gecko/flexbox`, `css-multicol`,
-//! `-print` and the full corpus as its gate: the model as it stands is worth 5058 pairs, and only a
-//! measurement can say whether the change keeps them.
+//! `-print` and the full corpus as its gate: the model as it stands is worth 5061 pairs, and only a
+//! measurement can say whether the change keeps them. The sixth limit above does not need it — the cut
+//! already knows where the boundary would fall; what is missing is that a box taller than the
+//! fragmentainer should sometimes overflow it rather than be carried.
 
 use blitz_traits::node_id::NodeId;
 use style::computed_values::flex_direction::T as FlexDirection;
