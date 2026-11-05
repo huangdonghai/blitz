@@ -55,50 +55,58 @@
 //! cross size and depth, and give each fragment its own coordinates. That is a layout-architecture
 //! change, not a rule in this file, and it should be attempted with `gecko/flexbox`, `css-multicol`,
 //! `-print` and the full corpus as its gate: the model as it stands is worth 5061 pairs, and only a
-//! measurement can say whether the change keeps them. The sixth limit above does not need it — the cut
+//! measurement can say whether the change keeps them. The model is worth 5062 pairs today. The sixth
+//! limit above does not need it — the cut
 //! already knows where the boundary would fall; what is missing is that a box taller than the
 //! fragmentainer should sometimes overflow it rather than be carried.
 //!
-//! Six attempts at the shape above have been made **through the existing fields** and every one is now
-//! measured dead, which is itself the finding: the fragmentainer's measure cannot be smuggled in, it
-//! has to be an input of its own. Drawing a columned container's out-of-flow children per column, or
-//! counting the container's own hoisted boxes into its flow: no pixel moved. Counting a *descendant's*
-//! hoisted reach into the flow: one pair gained, another lost — `out-of-flow-in-multicolumn-004` wants
-//! an abspos box to lengthen the flow while `bfc-004-print` wants the same shape not to, and nothing in
-//! the current inputs tells those apart (the containing block and the hoisting are the same kind in
-//! both). Setting the flow's measure to the column depth: the numbers moved in the wrong direction,
-//! because one field is asked to be both "how deep may this be measured" and "what a child's percentage
-//! resolves against", and for a container of a definite height those differ. Re-laying each child with a
-//! fresh input at the column depth: worse again, because a new input changes its width and its place in
-//! the flow as well as its basis, and keeping the old positions against new heights leaves the columns
-//! mis-aligned by exactly the amount the pairs then differ.
+//! Six attempts at the shape above were made **through the existing fields** and every one measured
+//! dead, and the finding recorded here now reads backwards from the first two of them: what those
+//! attempts were chasing was never the rule. Drawing a columned container's out-of-flow children per
+//! column, or counting the container's own hoisted boxes into its flow: no pixel moved. Counting a
+//! *descendant's* hoisted reach into the flow: one pair gained, another lost —
+//! `out-of-flow-in-multicolumn-004` wants an abspos box to lengthen the flow while `bfc-004-print`
+//! wants the same shape not to, and nothing in the current inputs tells those apart (the containing
+//! block and the hoisting are the same kind in both). Setting the flow's measure to the column depth,
+//! and re-laying each child at it: worse, in the way described above.
 //!
-//! So the seventh limit, and it is the one to clear first: [`multicol`](super::multicol)'s measure
-//! needs a parameter that says *"the fragmentainer you are laying out inside of is this deep, for
-//! percentages"*, applied to the container's direct children only, leaving the box's own height and the
-//! flow's available space alone — and the positions must come out of that same measure rather than be
-//! preserved. Everything else in this list (the moving content, the clone's rate, the nested axis, the
-//! abspos boxes) waits behind it. `multicol-span-all-children-height-001/-002/-003` are the acceptance
-//! pairs, at 209px, 39720px and 51537px respectively, and a probe here
-//! (`percentage_heights_in_a_column_ask_for_the_container`) pins today's basis so the change cannot be
-//! made silently, in either direction.
+//! **A percentage height inside a column asks for the whole multicol, not for one column's depth.**
+//! `multicol-span-all-children-height-002/-003` say so in their own `assert` ("compute the percentage
+//! relative to the entire multicol"), and their references write the children as `height: 200px` in a
+//! box whose content is 200px and whose columns are 100px deep — the child is *spread over* the two
+//! columns, not one. The reading that sent seven rounds into the door below came from `-001`, whose
+//! children are `50%` in the test and `25%` in its reference: true as far as it goes, but `-001`'s
+//! column depth happens to be half its container, and a pair that cannot tell two rules apart is not
+//! evidence. The probe that pinned the old reading used `columns: 1` for exactly the same reason and
+//! proved nothing; it now uses two columns, and asserts the container rule the references give.
 //!
-//! An eighth attempt narrowed **where** that parameter would have to live, and is worth reading before
-//! trying the same: rewriting a *direct child's* `parent_size.height` during
-//! [`multicol`](super::multicol)'s measure (scoped by `Node::parent`, restored straight after ✓) left all
-//! three acceptance pairs at exactly the numbers above — **inert** ✓ — because taffy's block algorithm
-//! resolves a child's percentage block size against the container's own content height, computed inside
-//! it, and that field is not the channel. The same hook did move one unrelated pair (`-007`, by 4106px ✓),
-//! so the attempt mapped the channels rather than proving nothing: `parent_size.height` reaches padding
-//! and `available_space`/`known_dimensions` reach depth, and neither reaches a child's height.
+//! So the two defects were in [`multicol`](super::multicol)'s own arithmetic, and no new input was
+//! needed. The first: the height the author wrote is the **content** box under the default
+//! `box-sizing`, while the block algorithm is handed a **border box** — which the width in the same
+//! call already was (`columns.width + insets`). A container of `height: 200px; border: 5px` therefore
+//! measured its own content at 190px, its columns at 95, and every percentage inside at 95 instead of
+//! 100. That is also why the seven attempts above "found no channel": they were re-basing a percentage
+//! whose basis was already wrong by the border, and each one moved the box and the basis together,
+//! which is what makes a change look inert. The second: a run of columns after a `column-span: all`
+//! box may use only the depth the container has left, which is what gives `-002`'s last row four
+//! columns of 50px, two of them outside the box's own width, exactly as its reference draws them;
+//! under `column-fill: auto` each row still gets the whole content box
+//! (`multicol-gap-decorations-020`). Measured: the corpus goes 5061 → 5062 with no pair lost, and the
+//! three acceptance pairs fall from 39720 / 51537 / 56685px to 14558 / 12840 / 13175px.
 //!
-//! Which leaves exactly two doors, and they are not equivalent. Either the block-size basis becomes a
-//! parameter of taffy's block layout — meaning a **fifth fork**, since taffy is a pinned git dependency
-//! here rather than one of the four vendored ones, and that is a decision above this file — or the flow
-//! is measured **per fragmentainer**, where the container's content height legitimately *is* the
-//! fragmentainer's depth and no new field is needed at all. The latter is why round 68's single measure
-//! clipped the flow and this attempt did nothing: two halves of one fact ✓. `cut_bands` handing back the
-//! ranges to re-measure is its first step, and the pin named above fails the day it lands ✓
+//! Two further shapes were tried on top of that and reverted by pixels, both because a column **rule**
+//! is measured to the container's content edge whatever the run — the assert of
+//! `multicol-span-all-rule-001`, which each one lost: stretching the last run to the room left rather
+//! than balancing it (43/6 in the two multicol families against 44/7), and taking the run's own depth
+//! as the band depth, which is the same thing said from the clip's side. Until the rule and the clip
+//! are given separate fields, the band stays at the container's height and a short run paints past the
+//! bottom of its box — the residue that keeps `-002` at 14558px rather than at zero.
+//!
+//! What still waits behind the per-fragmentainer measure is unchanged: float carrying across columns
+//! and pages, abspos content fragmented onto the pages it spans, the flex row gap truncated at a line
+//! break, the nested writing mode (`vertical-wm-001/-002`) and vertical columns. `cut_bands` handing
+//! back the ranges to re-measure is the first step of that, and it is a larger change than anything
+//! named above.
 
 use blitz_traits::node_id::NodeId;
 use style::computed_values::flex_direction::T as FlexDirection;

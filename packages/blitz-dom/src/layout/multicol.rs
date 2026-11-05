@@ -132,7 +132,7 @@ impl LayoutPassState<'_> {
         // the styles cannot outlive a pass that writes into the same tree. The insets are the
         // container's own box, which the single-column pass adds back on so that its children sit
         // the same distance from its border as they would in one column.
-        let (columns, insets, content_width, definite, inline_root, auto_width) = {
+        let (columns, insets, content_width, definite, outer, inline_root, auto_width) = {
             let node = &self.nodes[dom_id];
             let Some(styles) = node.primary_styles() else {
                 return LayoutOutput::HIDDEN;
@@ -168,8 +168,28 @@ impl LayoutPassState<'_> {
             };
             let content_width = (available_width - insets.left - insets.right).max(0.0);
             let columns = Columns::measure(&styles, content_width, parent_width);
-            let definite = style_height(&styles, inputs);
-            (columns, insets, content_width, definite, node.flags.is_inline_root(), auto_width)
+            // Two different heights are asked for below, and under `box-sizing: content-box` — the
+            // default — they are not the same number: the height the author wrote is the **content**
+            // box, while the block algorithm is handed a **border box**, exactly as the width below
+            // is handed `columns.width + insets`. Taking the authored height for the border box
+            // measured a bordered container 10px short of its own `height: 200px`, and every
+            // percentage inside it asked for 190 (`multicol-span-all-children-height-002/-003`, whose
+            // references write that very height as 200px).
+            let authored = style_height(&styles, inputs);
+            let outer = match styles.get_position().box_sizing {
+                style::computed_values::box_sizing::T::BorderBox => authored,
+                _ => authored.map(|height| height + insets.top + insets.bottom),
+            };
+            let definite = outer.map(|height| (height - insets.top - insets.bottom).max(0.0));
+            (
+                columns,
+                insets,
+                content_width,
+                definite,
+                outer,
+                node.flags.is_inline_root(),
+                auto_width,
+            )
         };
 
         // Pass one: this container's flow as a single column.
@@ -191,7 +211,7 @@ impl LayoutPassState<'_> {
             let probe = LayoutInput {
                 known_dimensions: Size {
                     width: None,
-                    height: definite,
+                    height: outer,
                 },
                 available_space: Size {
                     width: inputs.available_space.width,
@@ -211,11 +231,11 @@ impl LayoutPassState<'_> {
         let narrow = LayoutInput {
             known_dimensions: Size {
                 width: Some(columns.width + insets.left + insets.right),
-                height: definite,
+                height: outer,
             },
             available_space: Size {
                 width: AvailableSpace::Definite(columns.width + insets.left + insets.right),
-                height: match definite {
+                height: match outer {
                     Some(height) => AvailableSpace::Definite(height),
                     None => AvailableSpace::MaxContent,
                 },
@@ -240,9 +260,7 @@ impl LayoutPassState<'_> {
         if spanned {
             // The container's own content height, which is the basis a spanner's percentage height
             // asks for. A height given as a percentage of an auto-height container stays indefinite.
-            let container_height =
-                definite.map(|height| (height - insets.top - insets.bottom).max(0.0));
-            self.remeasure_spanners(dom_id, content_width, columns.width, container_height);
+            self.remeasure_spanners(dom_id, content_width, columns.width, definite);
         }
 
         let flow_height = (flow.size.height - insets.top - insets.bottom).max(0.0);
@@ -457,6 +475,10 @@ impl LayoutPassState<'_> {
 
         let mut bands = ThinVec::new();
         let mut offset = insets.top;
+        // How deep the runs already stacked: the container's own height spent so far, counted from
+        // the runs themselves rather than from `offset`, which also carries the gaps between them and
+        // the container's insets.
+        let mut spent = 0.0;
         // Where the previous run left the flow. A spanner's own margins collapse with the boxes
         // around it, and the space they take belongs to neither run — it is the gap between them,
         // and the runs below have to be pushed down by it.
@@ -479,9 +501,18 @@ impl LayoutPassState<'_> {
                     depth: run.end - run.start,
                 });
                 offset += run.end - run.start;
+                spent += run.end - run.start;
                 continue;
             }
             let run_height = run.end - run.start;
+            // What the container's own height has left for this run. The limit is not the whole box:
+            // the runs above it and the spanners between them have already spent part of it, which is
+            // how `multicol-span-all-children-height-002`'s last run is balanced into columns of
+            // 50px rather than the 100px its own flow asks for — its reference writes that run as a
+            // box `height: 50px`, the 200px of the article less the 100px of columns and the 50px
+            // spanner above it. Where nothing is left the breaking rules still ask for a fragmentainer,
+            // and `-003`'s comment names the shape Chrome gives it: a column box one pixel deep.
+            let room = definite.map(|limit| (limit - spent).max(1.0));
             let inside: Vec<Edge> = edges
                 .iter()
                 .filter(|edge| edge.at > run.start && edge.at < run.end)
@@ -498,10 +529,14 @@ impl LayoutPassState<'_> {
                 .copied()
                 .collect();
             let height = match definite {
+                // Filling in order (`column-fill: auto`) fills each column to the bottom of the box,
+                // so a row is as deep as the container however much of it the rows above used:
+                // `multicol-gap-decorations-020` measures its rows by the whole content box.
                 Some(limit) if columns.sequential => limit,
-                Some(limit) => {
-                    limit.min(balance(&inside, &whole, &clones, run_height, columns.count))
-                }
+                // Balancing: what the container has left, as `room` says above.
+                Some(_) => room
+                    .unwrap_or(definite.unwrap_or(0.0))
+                    .min(balance(&inside, &whole, &clones, run_height, columns.count)),
                 None if columns.sequential => run_height,
                 None => balance(&inside, &whole, &clones, run_height, columns.count),
             };
@@ -521,10 +556,15 @@ impl LayoutPassState<'_> {
                     x: insets.left + index as f32 * stride,
                     y: offset,
                 };
+                // The rule of a column is drawn as deep as the container, and the clip that cuts a
+                // run's content stops where the run's own bands do; `multicol-span-all-rule-001`
+                // measures its rule by the content edge even in a run shorter than that, so this is
+                // the container's height and not the run's.
                 band.depth = definite.unwrap_or(height);
                 bands.push(band);
             }
             offset += height;
+            spent += height;
         }
         (bands, (offset - insets.top).max(0.0))
     }
