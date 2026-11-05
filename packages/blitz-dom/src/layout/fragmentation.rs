@@ -118,9 +118,15 @@
 //! [`Band::depth`] from the run instead of the container. Read [`BreakPlan::fragment_rect`] before
 //! trying the second again: the clip is cut at `end - start`, so `depth` is *only* the rule's measure.
 //! An earlier draft of this note said the painting past the bottom of the box needed the rule and the
-//! clip separated first; they are separate, and what was painting there was double-count 4. Both
-//! rejections were measured before fixes 3 and 4 landed, so if the nested axis needs the stretch, its
-//! numbers are worth taking again rather than trusting.
+//! clip separated first; they are separate, and what was painting there was double-count 4.
+//!
+//! The stretch was taken back out and measured again once the insets stopped being counted twice,
+//! because that rejection had been decided on the old arithmetic. It still fails, and it now fails for
+//! a different, larger reason: no pair changes state anywhere in the multicol, break, gaps or paged
+//! families (48 / 11 / 83 / 1 / 126, exactly as without it), `-001` stays at 209px and `-007` at
+//! 8883px, and `multicol-span-all-rule-002` goes from 337260 to 372520px. So it buys nothing and costs
+//! 35260px on an already-failing pair: rejected on measurement, not on memory, and the tree it was
+//! measured in was reverted back to `6d415d74` byte for byte.
 //!
 //! What still waits behind the per-fragmentainer measure is unchanged: float carrying across columns
 //! and pages, abspos content fragmented onto the pages it spans, the flex row gap truncated at a line
