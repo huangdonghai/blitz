@@ -272,6 +272,7 @@ pub(crate) struct Edge {
     pub(crate) by_counts: bool,
 }
 
+#[cfg(debug_assertions)]
 impl Rank {
     /// What to call the rank when the bands of a flow are dumped (`CUOTUO_DEBUG_FRAGMENTATION`).
     pub(crate) fn name(&self) -> &'static str {
@@ -283,6 +284,7 @@ impl Rank {
     }
 }
 
+#[cfg(debug_assertions)]
 impl Edge {
     /// See [`Rank::name`].
     pub(crate) fn rank_name(&self) -> &'static str {
