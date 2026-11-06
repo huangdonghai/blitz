@@ -1685,6 +1685,20 @@ pub(crate) fn stroke_text<'a>(
                                 y,
                             });
                         }
+                        if !sideways {
+                            // `cluster.advance()` carries the layout's word/letter
+                            // spacing and justification, while the upright glyphs
+                            // above advanced by their vertical metrics. Add the
+                            // difference once at the cluster boundary; deriving it
+                            // from font tables per glyph lets shaping differences
+                            // accumulate and push the column past its end.
+                            let spacing = if cluster.advance() > 0.0 {
+                                cluster.advance() - cluster.shaped_advance()
+                            } else {
+                                0.0
+                            };
+                            pen += spacing;
+                        }
                     }
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
