@@ -10,8 +10,6 @@ use parley::{Affinity, Cursor, Layout, Line, LineMetrics, PositionedLayoutItem, 
 use peniko::{Fill, Mix};
 use std::collections::HashMap;
 use style::properties::generated::longhands::text_decoration_style::computed_value::T as TextDecorationStyle;
-use style::values::computed::{TextEmphasisPosition, TextEmphasisStyle};
-use style::values::specified::text::{TextEmphasisFillMode, TextEmphasisShapeKeyword};
 use style::values::computed::Display;
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::values::computed::{
@@ -105,50 +103,6 @@ pub(crate) fn draw_inline_backgrounds<'a>(
 /// blob's unique id and face index. `None` is cached for fonts without a usable OS/2 or
 /// head table so they aren't re-parsed either.
 type WinAscentCache = HashMap<(u64, u32), Option<f32>>;
-
-/// Metrics for an emphasis mark's glyph: `(advance, x_min, y_min, x_max, y_max)` as
-/// `unitsPerEm` ratios.
-type EmphasisMetricsCache = HashMap<(u64, u32, u32), Option<(f32, f32, f32, f32, f32)>>;
-
-/// The glyph an emphasis mark is drawn with, with the metrics needed to centre it.
-fn emphasis_glyph(
-    cache: &mut EmphasisMetricsCache,
-    font: &parley::FontData,
-    character: char,
-) -> Option<(u32, f32, f32, f32, f32, f32)> {
-    use skrifa::raw::{FontRef, TableProvider as _};
-    use skrifa::{
-        MetadataProvider as _,
-        instance::{LocationRef, Size},
-    };
-
-    let font_ref = FontRef::from_index(font.data.as_ref(), font.index).ok()?;
-    let glyph_id = font_ref.charmap().map(character)?;
-    let metrics = font_ref.glyph_metrics(Size::unscaled(), LocationRef::default());
-    let cached = cache
-        .entry((font.data.id(), font.index, glyph_id.to_u32()))
-        .or_insert_with(|| {
-            let units_per_em = font_ref.head().ok()?.units_per_em() as f32;
-            let advance = metrics.advance_width(glyph_id)?;
-            let bounds = metrics.bounds(glyph_id)?;
-            Some((
-                advance / units_per_em,
-                bounds.x_min / units_per_em,
-                bounds.y_min / units_per_em,
-                bounds.x_max / units_per_em,
-                bounds.y_max / units_per_em,
-            ))
-        });
-    let cached = (*cached)?;
-    Some((
-        glyph_id.to_u32(),
-        cached.0,
-        cached.1,
-        cached.2,
-        cached.3,
-        cached.4,
-    ))
-}
 
 /// Cached [`vertical_glyph_metrics`], keyed by font face and glyph id.
 type VerticalMetricsCache = HashMap<(u64, u32, u32), Option<(f32, f32)>>;
@@ -260,15 +214,6 @@ struct ResolvedDecoration {
     inset: GenericTextDecorationInset<LengthPercentage>,
 }
 
-/// An emphasis mark: the glyph drawn over (or under) every character of a box.
-#[derive(Clone, Copy)]
-struct EmphasisMark {
-    glyph: char,
-    color: Color,
-    /// `true` for `text-emphasis-position: over`, the initial value in a horizontal mode.
-    over: bool,
-}
-
 /// An element on the current ancestor path (inline root -> run node), caching the
 /// values resolved from its computed style so descending into the same node across
 /// consecutive runs doesn't re-resolve them.
@@ -288,9 +233,6 @@ struct DecorationStackEntry {
     text_color: Color,
     /// The decoration this node introduces as a decorating box, if any.
     decoration: Option<ResolvedDecoration>,
-    /// The emphasis mark this node draws over its own text (`text-emphasis` inherits, so the
-    /// innermost node of a run carries the mark that applies to it).
-    emphasis: Option<EmphasisMark>,
     /// The text shadows this node asks for (`text-shadow` inherits).
     shadows: Vec<TextShadow>,
     /// Where `position: relative` moves this node's painting, in CSS pixels.
@@ -335,7 +277,6 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
             node_id,
             text_color: Color::BLACK,
             decoration: None,
-            emphasis: None,
             shadows: Vec::new(),
             relative_offset: (0.0, 0.0),
         };
@@ -383,7 +324,6 @@ fn resolve_decoration_entry(doc: &BaseDocument, node_id: NodeId) -> DecorationSt
     DecorationStackEntry {
         node_id,
         text_color,
-        emphasis: emphasis_mark(itext, text_color),
         shadows: resolve_shadows(itext),
         relative_offset: if styles.clone_display().outside() == DisplayOutside::Inline
             && styles.clone_display().inside() == DisplayInside::Flow
@@ -452,7 +392,6 @@ pub(crate) struct DrawTextContext {
     shadow_batches: Vec<GlyphBatch>,
     win_ascent_ratios: WinAscentCache,
     vertical_metrics: VerticalMetricsCache,
-    emphasis_metrics: EmphasisMetricsCache,
 }
 
 /// Resolve the CSS `text-decoration-thickness` to a device-pixel size.
@@ -628,47 +567,6 @@ fn draw_decoration_line(
             scene.stroke(&stroke, transform, brush, None, &path);
         }
     }
-}
-
-
-/// The mark a box's `text-emphasis-style` asks for, with its colour.
-///
-/// The shapes are the characters the spec names (CSS Text Decoration 3 5.5), so the mark is
-/// drawn from the font like any other glyph rather than as a shape of our own.
-fn emphasis_mark(
-    itext: &style::properties::style_structs::InheritedText,
-    text_color: Color,
-) -> Option<EmphasisMark> {
-    let glyph = match &itext.text_emphasis_style {
-        TextEmphasisStyle::None => return None,
-        TextEmphasisStyle::String(string) => string.chars().next()?,
-        TextEmphasisStyle::Keyword { fill, shape } => {
-            use TextEmphasisFillMode::{Filled, Open};
-            use TextEmphasisShapeKeyword::{Circle, Dot, DoubleCircle, Sesame, Triangle};
-            match (fill, shape) {
-                (Filled, Dot) => '\u{2022}',
-                (Open, Dot) => '\u{25E6}',
-                (Filled, Circle) => '\u{25CF}',
-                (Open, Circle) => '\u{25CB}',
-                (Filled, DoubleCircle) => '\u{25C9}',
-                (Open, DoubleCircle) => '\u{25CE}',
-                (Filled, Triangle) => '\u{25B2}',
-                (Open, Triangle) => '\u{25B3}',
-                (Filled, Sesame) => '\u{FE45}',
-                (Open, Sesame) => '\u{FE46}',
-            }
-        }
-    };
-    let color = itext
-        .text_emphasis_color
-        .as_absolute()
-        .map(ToColorColor::as_color_color)
-        .unwrap_or(text_color);
-    Some(EmphasisMark {
-        glyph,
-        color,
-        over: !itext.text_emphasis_position.contains(TextEmphasisPosition::UNDER),
-    })
 }
 
 /// The `text-shadow` list of a box, resolved to offsets and colours.
@@ -979,7 +877,6 @@ fn flush_line_decorations(
     scale: f64,
     deco_boxes: &[LineDecoration],
     win_ascent_ratios: &mut WinAscentCache,
-    inline_root_id: NodeId,
     metrics: &LineMetrics,
     vertical: Option<&VerticalTextPaint>,
     line_index: usize,
@@ -1418,7 +1315,6 @@ pub(crate) fn stroke_text<'a>(
         shadow_batches,
         win_ascent_ratios,
         vertical_metrics,
-        emphasis_metrics,
     } = context;
     // Which lines each decorating box's decoration covers. `text-decoration-inset` only applies
     // at the box's first and last fragment (CSS Text Decoration 4 2.3), so a decoration that
@@ -1997,7 +1893,6 @@ pub(crate) fn stroke_text<'a>(
             scale,
             deco_boxes,
             win_ascent_ratios,
-            inline_root_id,
             line.metrics(),
             vertical.as_ref(),
             line_index,
