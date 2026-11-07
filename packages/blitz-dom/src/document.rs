@@ -1385,19 +1385,14 @@ impl BaseDocument {
                     .collection
                     .register_fonts(font.clone(), Some(info_override));
 
-                #[cfg(feature = "parallel-construct")]
-                {
-                    rayon::broadcast(|_ctx| {
-                        let mut font_ctx = self
-                            .thread_font_contexts
-                            .get_or(|| RefCell::new(Box::new(global_font_ctx.clone())))
-                            .borrow_mut();
-                        font_ctx
-                            .collection
-                            .register_fonts(font.clone(), Some(info_override));
-                    });
-                }
                 drop(global_font_ctx);
+
+                // A short parallel iterator can also execute on its caller.
+                // Broadcasting only updates Rayon workers, leaving that caller's
+                // context stuck on fallback fonts. Recreate contexts lazily from
+                // the updated collection on every thread that actually needs one.
+                #[cfg(feature = "parallel-construct")]
+                self.thread_font_contexts.clear();
 
                 // TODO: see if we can only invalidate if resolved fonts may have changed
                 self.invalidate_inline_contexts();

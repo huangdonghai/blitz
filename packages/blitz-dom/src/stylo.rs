@@ -377,6 +377,60 @@ impl<'a> TNode for BlitzNode<'a> {
     }
 }
 
+/// Selectors 4 language ranges use RFC 4647 extended filtering.
+fn language_matches(language: &str, range: &str) -> bool {
+    if language.is_empty() || range.is_empty() {
+        return language.is_empty() && range.is_empty();
+    }
+    let mut language = language.split('-');
+    let mut range = range.split('-');
+    let first = range.next().unwrap();
+    if first != "*" && !language.next().unwrap().eq_ignore_ascii_case(first) {
+        return false;
+    }
+    if first == "*" {
+        language.next();
+    }
+    for subtag in range {
+        if subtag == "*" {
+            continue;
+        }
+        loop {
+            let Some(candidate) = language.next() else {
+                return false;
+            };
+            if candidate.eq_ignore_ascii_case(subtag) {
+                break;
+            }
+            if candidate.len() == 1 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+#[cfg(test)]
+mod language_tests {
+    use super::language_matches;
+
+    #[test]
+    fn language_ranges_follow_extended_filtering() {
+        for (tag, range, expected) in [
+            ("zh-Hans-CN", "zh-hans", true),
+            ("zh-Hant", "zh-Hans", false),
+            ("de-Latn-DE", "de-DE", true),
+            ("de-Latn-DE", "*-DE", true),
+            ("de-x-DE", "de-DE", false),
+            ("en", "e", false),
+            ("", "*", false),
+            ("", "", true),
+        ] {
+            assert_eq!(language_matches(tag, range), expected, "{tag}:lang({range})");
+        }
+    }
+}
+
 impl selectors::Element for BlitzNode<'_> {
     type Impl = SelectorImpl;
 
@@ -497,7 +551,7 @@ impl selectors::Element for BlitzNode<'_> {
             NonTSPseudoClass::Fullscreen => false,
             NonTSPseudoClass::Hover => self.element_state().contains(ElementState::HOVER),
             NonTSPseudoClass::Indeterminate => false,
-            NonTSPseudoClass::Lang(_) => false,
+            NonTSPseudoClass::Lang(ref lang) => self.match_element_lang(None, lang),
             NonTSPseudoClass::CustomState(_) => false,
             NonTSPseudoClass::Link => self.element_state().contains(ElementState::UNVISITED),
             NonTSPseudoClass::PlaceholderShown => false,
@@ -857,15 +911,37 @@ impl<'a> TElement for BlitzNode<'a> {
     }
 
     fn lang_attr(&self) -> Option<style::selector_parser::AttrValue> {
-        None
+        let element = self.element_data()?;
+        let xml_lang = element.attrs().iter().find(|attr| {
+            attr.name.local == local_name!("lang") && attr.name.ns == ns!(xml)
+        });
+        let lang = xml_lang.or_else(|| {
+            if element.name.ns != ns!(html) && element.name.ns != ns!(svg) {
+                return None;
+            }
+            element.attrs().iter().find(|attr| {
+                attr.name.local == local_name!("lang") && attr.name.ns == ns!()
+            })
+        })?;
+        Some(style::values::AtomString(Atom::from(lang.value.as_str())))
     }
 
     fn match_element_lang(
         &self,
-        _override_lang: Option<Option<style::selector_parser::AttrValue>>,
-        _value: &style::selector_parser::Lang,
+        override_lang: Option<Option<style::selector_parser::AttrValue>>,
+        value: &style::selector_parser::Lang,
     ) -> bool {
-        false
+        if let Some(lang) = override_lang {
+            return language_matches(lang.as_ref().map_or("", |lang| lang.as_ref()), value);
+        }
+        let mut current = Some(*self);
+        while let Some(element) = current {
+            if let Some(lang) = element.lang_attr() {
+                return language_matches(lang.as_ref(), value);
+            }
+            current = selectors::Element::parent_element(&element);
+        }
+        language_matches("", value)
     }
 
     fn is_html_document_body_element(&self) -> bool {

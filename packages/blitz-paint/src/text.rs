@@ -1577,11 +1577,13 @@ pub(crate) fn stroke_text<'a>(
 
                             // The axis is the line box's centre, not the run's own
                             // metrics: 鎼?.4 aligns every inline box in the line to
-                            // the dominant (central) baseline. `glyph.y` keeps the
-                            // column (block-axis) position and any `vertical-align`
-                            // shift.
-                            let centre =
-                                baseline + glyph.y + (line_centre - line_metrics.baseline);
+                            // the dominant (central) baseline. The run baseline
+                            // already contains any `vertical-align` shift.
+                            // Upright offsets remain in the font's physical axes;
+                            // sideways offsets rotate with the horizontal run.
+                            let centre = baseline
+                                + if sideways { glyph.y } else { 0.0 }
+                                + (line_centre - line_metrics.baseline);
                             let block_pos = if vertical.block_axis_starts_at_right {
                                 vertical.block_extent - centre
                             } else {
@@ -1611,19 +1613,19 @@ pub(crate) fn stroke_text<'a>(
                                     _ => block_pos - (metrics.ascent - metrics.descent) / 2.0,
                                 };
                                 let y = if vertical.inline_axis_needs_mirror {
-                                    vertical.inline_extent - inline_pos - advance
+                                    vertical.inline_extent - inline_pos - advance - glyph.x
                                 } else {
-                                    inline_pos
+                                    inline_pos + glyph.x
                                 };
                                 (x, y)
                             } else {
-                                let x = block_pos - advance / 2.0;
+                                let x = block_pos - advance / 2.0 + glyph.x;
                                 let y = if vertical.inline_axis_needs_mirror {
                                     vertical.inline_extent - inline_pos - step + origin
                                 } else {
                                     inline_pos + origin
                                 };
-                                (x, y)
+                                (x, y + glyph.y)
                             };
 
                             let target = if sideways { &mut rotated } else { &mut upright };
