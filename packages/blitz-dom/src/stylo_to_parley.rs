@@ -296,10 +296,20 @@ pub(crate) fn font_features(style: &stylo::ComputedValues) -> Vec<parley::FontFe
 
     self::font_feature_settings(&font_styles.font_feature_settings, &mut features);
 
+    // One value per tag, and the later one wins: `font-feature-settings` is
+    // appended last precisely so it can override a feature the earlier
+    // properties (or the writing mode) implied. A plain `dedup_by_key` would
+    // keep the *first* of each tag and silently drop the author's override, so
+    // that an explicit `'vert' 0` could not turn the implied `vert` off.
     features.sort_by_key(|feature| feature.tag);
-    features.dedup_by_key(|feature| feature.tag);
-
-    features
+    let mut deduped: Vec<parley::FontFeature> = Vec::with_capacity(features.len());
+    for feature in features {
+        match deduped.last_mut() {
+            Some(last) if last.tag == feature.tag => *last = feature,
+            _ => deduped.push(feature),
+        }
+    }
+    deduped
 }
 
 /// OpenType features implied by the writing mode.
