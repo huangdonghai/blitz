@@ -20,6 +20,7 @@ pub(crate) mod stylo {
     pub(crate) use style::values::computed::BaselineShift;
     pub(crate) use style::values::computed::LineBreak;
     pub(crate) use style::values::computed::OverflowWrap;
+    pub(crate) use style::values::computed::TextSpacingTrim;
     pub(crate) use style::values::computed::WordBreak;
     pub(crate) use style::values::computed::font::FontFeatureSettings;
     pub(crate) use style::values::computed::font::FontStyle;
@@ -355,6 +356,37 @@ pub(crate) fn text_align(input: stylo::TextAlignKeyword) -> parley::Alignment {
     }
 }
 
+pub(crate) fn text_spacing_trim(
+    input: stylo::TextSpacingTrim,
+) -> parley::TextSpacingTrim {
+    if input.contains(stylo::TextSpacingTrim::AUTO) {
+        return parley::TextSpacingTrim::Auto;
+    }
+    if input.contains(stylo::TextSpacingTrim::TRIM_ALL) {
+        return parley::TextSpacingTrim::TrimAll;
+    }
+    let start = if input.contains(stylo::TextSpacingTrim::TRIM_START) {
+        parley::TrimStart::Trim
+    } else if input.contains(stylo::TextSpacingTrim::SPACE_FIRST) {
+        parley::TrimStart::SpaceFirst
+    } else {
+        parley::TrimStart::Space
+    };
+    let adjacent = if input.contains(stylo::TextSpacingTrim::SPACE_ADJACENT) {
+        parley::TrimAdjacent::Space
+    } else {
+        parley::TrimAdjacent::Trim
+    };
+    let end = if input.contains(stylo::TextSpacingTrim::TRIM_END) {
+        parley::TrimEnd::Trim
+    } else if input.contains(stylo::TextSpacingTrim::SPACE_END) {
+        parley::TrimEnd::Space
+    } else {
+        parley::TrimEnd::Allow
+    };
+    parley::TextSpacingTrim::new(start, adjacent, end)
+}
+
 /// Returns `None` for `text-align-last: auto`
 pub(crate) fn text_align_last(input: stylo::TextAlignLast) -> Option<parley::Alignment> {
     match input {
@@ -537,6 +569,7 @@ pub(crate) fn style(
         vertical_align,
         word_spacing,
         letter_spacing,
+        text_spacing_trim: text_spacing_trim(itext_styles.text_spacing_trim),
         text_wrap_mode,
         white_space_collapse: white_space_collapse(itext_styles.white_space_collapse),
         overflow_wrap,
