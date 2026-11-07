@@ -104,45 +104,6 @@ pub(crate) fn draw_inline_backgrounds<'a>(
 /// head table so they aren't re-parsed either.
 type WinAscentCache = HashMap<(u64, u32), Option<f32>>;
 
-/// Cached [`vertical_glyph_metrics`], keyed by font face and glyph id.
-type VerticalMetricsCache = HashMap<(u64, u32, u32), Option<(f32, f32)>>;
-
-/// The font's vertical origin and vertical advance for a glyph, as `unitsPerEm`
-/// ratios.
-///
-/// Vertical typesetting places each glyph with its vertical origin on the pen
-/// and advances by its vertical advance (CSS Writing Modes 3 5.1.1). OpenType
-/// derives the origin from `VORG` when the face has one, and otherwise from the
-/// glyph's bounding box and its `vmtx` top side bearing (`vertOriginY = yMax +
-/// tsb`).
-///
-/// Both matter for upright text. Approximating the origin with the top of the
-/// em box leaves punctuation, whose ink sits in a corner, visibly high; and
-/// advancing by the horizontal advance packs Latin letters, which are about an
-/// em tall when upright but only half an em wide, on top of each other.
-fn vertical_glyph_metrics(font: &parley::FontData, glyph_id: u32) -> Option<(f32, f32)> {
-    use skrifa::raw::{FontRef, TableProvider as _};
-    use skrifa::{
-        GlyphId, MetadataProvider as _,
-        instance::{LocationRef, Size},
-    };
-    let font_ref = FontRef::from_index(font.data.as_ref(), font.index).ok()?;
-    let units_per_em = font_ref.head().ok()?.units_per_em() as f32;
-    let glyph_id = GlyphId::new(glyph_id);
-    let vmtx = font_ref.vmtx().ok()?;
-    let advance = vmtx.advance(glyph_id)? as f32 / units_per_em;
-    let origin = if let Ok(vorg) = font_ref.vorg() {
-        vorg.vertical_origin_y(glyph_id) as f32 / units_per_em
-    } else {
-        let bounds = font_ref
-            .glyph_metrics(Size::unscaled(), LocationRef::default())
-            .bounds(glyph_id)?;
-        let top_side_bearing = vmtx.side_bearing(glyph_id)?;
-        (bounds.y_max + top_side_bearing as f32) / units_per_em
-    };
-    Some((origin, advance))
-}
-
 /// The font's OS/2 `usWinAscent`, in the same (device) pixels as `font_size`.
 ///
 /// This is the ascent browsers use as the top of the "em box" when positioning overlines. It
@@ -391,7 +352,6 @@ pub(crate) struct DrawTextContext {
     glyph_batches: Vec<GlyphBatch>,
     shadow_batches: Vec<GlyphBatch>,
     win_ascent_ratios: WinAscentCache,
-    vertical_metrics: VerticalMetricsCache,
 }
 
 /// Resolve the CSS `text-decoration-thickness` to a device-pixel size.
@@ -1314,7 +1274,6 @@ pub(crate) fn stroke_text<'a>(
         glyph_batches,
         shadow_batches,
         win_ascent_ratios,
-        vertical_metrics,
     } = context;
     // Which lines each decorating box's decoration covers. `text-decoration-inset` only applies
     // at the box's first and last fragment (CSS Text Decoration 4 2.3), so a decoration that
@@ -1419,11 +1378,6 @@ pub(crate) fn stroke_text<'a>(
         // draws one decoration per box rather than one stepped segment per differently-sized
         // run. Clearing preserves the allocation for the next line and inline context.
         deco_boxes.clear();
-
-        // Difference between the painted and the laid-out inline position on
-        // this line, carried from run to run (see the upright branch below).
-        #[cfg(feature = "writing-mode")]
-        let mut pen_delta = 0.0f32;
 
         // Glyphs of this line, drawn once its decorations are in the scene.
         glyph_batches.clear();
@@ -1544,12 +1498,10 @@ pub(crate) fn stroke_text<'a>(
                 };
 
                 // The inline extent this run covers, in Parley's layout coordinates.
-                // A vertical root overrides it with the extent it actually paints
-                // (see the `run_x0`/`run_x1` assignments in that branch): upright
-                // glyphs advance by their vertical metrics, which Parley's layout
-                // does not know about, so the two drift apart along the line.
-                let mut run_x0 = glyph_run.offset() as f64;
-                let mut run_x1 = run_x0 + glyph_run.advance() as f64;
+                // Parley has already resolved vertical advances and spacing gaps, so the
+                // vertical painter can use the same extent as the horizontal painter.
+                let run_x0 = glyph_run.offset() as f64;
+                let run_x1 = run_x0 + glyph_run.advance() as f64;
 
                 // Map glyph positions from the inline root's axes onto physical
                 // space for vertical writing modes (see the note at the top).
@@ -1562,14 +1514,7 @@ pub(crate) fn stroke_text<'a>(
                     let line_centre =
                         (line_metrics.block_min_coord + line_metrics.block_max_coord) / 2.0;
                     let baseline = glyph_run.baseline();
-                    // Upright glyphs advance by their vertical metrics, which
-                    // differ from the horizontal advances Parley laid the run
-                    // out with. `pen_delta` carries the accumulated difference
-                    // into the following runs, so their start positions follow
-                    // what was actually painted instead of overlapping it.
-                    let mut pen = glyph_run.offset() + pen_delta;
-                    let parley_end = glyph_run.offset() + glyph_run.advance();
-                    run_x0 = f64::from(pen);
+                    let mut pen = glyph_run.offset();
                     let mut upright = Vec::new();
                     let mut rotated = Vec::new();
 
@@ -1593,29 +1538,32 @@ pub(crate) fn stroke_text<'a>(
                                     vo_map.get(c) == VerticalOrientation::Rotated
                                 }),
                         };
+                        // Parley owns the spacing model. Keep glyph placement and
+                        // the pen advancement on the same before/after contract
+                        // as the horizontal painter instead of collapsing the
+                        // two gaps into a trailing correction.
+                        let cluster_has_spacing = cluster.advance() > 0.0;
+                        let spacing_before = if cluster_has_spacing {
+                            cluster.spacing_before()
+                        } else {
+                            0.0
+                        };
+                        let spacing_after = if cluster_has_spacing {
+                            cluster.spacing_after()
+                        } else {
+                            0.0
+                        };
+                        pen += spacing_before;
                         for glyph in cluster.glyphs() {
                             let advance = glyph.advance;
-                            // The glyph's vertical origin and vertical advance.
-                            // The em box and the horizontal advance are the
-                            // fallback for faces with no `vmtx`.
-                            let cached = *vertical_metrics
-                                .entry((font.data.id(), font.index, glyph.id))
-                                .or_insert_with(|| vertical_glyph_metrics(font, glyph.id));
-                            let (origin, step) = match cached {
-                                Some((origin_ratio, advance_ratio)) => {
-                                    (origin_ratio * font_size, advance_ratio * font_size)
-                                }
-                                // CSS Writing Modes 3 5.1.1 requires the UA to
-                                // synthesize vertical metrics for faces that
-                                // have none: one em of advance, with the em box
-                                // filling the cell. Falling back to the
-                                // horizontal advance would overlap upright
-                                // Latin, which is half an em wide but an em tall.
-                                None => (
-                                    font_size * metrics.ascent
-                                        / (metrics.ascent + metrics.descent).max(f32::EPSILON),
-                                    font_size,
-                                ),
+                            // Parley resolves these from VORG/vmtx while preparing the
+                            // vertical layout. The painter must not re-read the font
+                            // tables: that is how the painted pen drifts from the
+                            // advances used for line breaking and hit testing.
+                            let (origin, step) = if sideways {
+                                (0.0, advance)
+                            } else {
+                                (glyph.vertical_origin, glyph.vertical_advance)
                             };
 
                             let inline_pos = pen;
@@ -1685,20 +1633,7 @@ pub(crate) fn stroke_text<'a>(
                                 y,
                             });
                         }
-                        if !sideways {
-                            // `cluster.advance()` carries the layout's word/letter
-                            // spacing and justification, while the upright glyphs
-                            // above advanced by their vertical metrics. Add the
-                            // difference once at the cluster boundary; deriving it
-                            // from font tables per glyph lets shaping differences
-                            // accumulate and push the column past its end.
-                            let spacing = if cluster.advance() > 0.0 {
-                                cluster.advance() - cluster.shaped_advance()
-                            } else {
-                                0.0
-                            };
-                            pen += spacing;
-                        }
+                        pen += spacing_after;
                     }
 
                     let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
@@ -1740,10 +1675,6 @@ pub(crate) fn stroke_text<'a>(
                             });
                         }
                     }
-                    // The decorations of this run have to land on the glyphs that were
-                    // painted, not on the position Parley reported.
-                    run_x1 = f64::from(pen);
-                    pen_delta = pen - parley_end;
                 } else {
                     let glyphs = run_glyphs(
                         &glyph_run,

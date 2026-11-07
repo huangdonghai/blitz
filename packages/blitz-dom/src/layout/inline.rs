@@ -26,7 +26,7 @@ use crate::node::{TextOrientation, VerticalTextPaint};
 use crate::layout::LayoutPassState;
 use crate::stylo_to_parley;
 
-/// Make Parley advance upright clusters by their vertical metrics.
+/// Make Parley resolve upright clusters' vertical metrics.
 ///
 /// A vertical writing mode advances upright text down the column by the font's vertical
 /// metrics, which are not the horizontal advances shaping produces (a CJK font may set a
@@ -39,19 +39,20 @@ use crate::stylo_to_parley;
 fn set_vertical_advances(
     layout: &mut parley::layout::Layout<crate::node::TextBrush>,
     text: &str,
-    sideways: bool,
-    force_upright: bool,
+    orientation: TextOrientation,
 ) {
-    use icu_properties::{CodePointMapData, props::VerticalOrientation};
+    layout.set_vertical_advances(text, orientation);
+}
 
-    let orientation = CodePointMapData::<VerticalOrientation>::new();
-    layout.set_vertical_advances(text, move |character| {
-        if sideways {
-            false
-        } else {
-            force_upright || orientation.get(character) != VerticalOrientation::Rotated
-        }
-    });
+#[cfg(feature = "writing-mode")]
+fn text_orientation(sideways: bool, upright: bool) -> TextOrientation {
+    if sideways {
+        TextOrientation::Sideways
+    } else if upright {
+        TextOrientation::Upright
+    } else {
+        TextOrientation::Mixed
+    }
 }
 
 /// Subtract a child's margins from the definite axes of the available space it is laid out in.
@@ -710,8 +711,7 @@ impl LayoutPassState<'_> {
                 set_vertical_advances(
                     &mut inline_layout.layout,
                     &inline_layout.text,
-                    wm.is_sideways(),
-                    wm.is_upright(),
+                    text_orientation(wm.is_sideways(), wm.is_upright()),
                 );
             }
         }
@@ -741,8 +741,7 @@ impl LayoutPassState<'_> {
                     set_vertical_advances(
                         &mut inline_layout.layout,
                         &inline_layout.text,
-                        wm.is_sideways(),
-                        wm.is_upright(),
+                        text_orientation(wm.is_sideways(), wm.is_upright()),
                     );
                 }
             }
@@ -1212,13 +1211,7 @@ impl LayoutPassState<'_> {
                         // `VERTICAL_SIDEWAYS` from `writing-mode: sideways-*`, which
                         // rotates everything too. `UPRIGHT` only exists for
                         // `text-orientation: upright`, so its absence means `mixed`.
-                        text_orientation: if wm.is_sideways() {
-                            TextOrientation::Sideways
-                        } else if wm.is_upright() {
-                            TextOrientation::Upright
-                        } else {
-                            TextOrientation::Mixed
-                        },
+                        text_orientation: text_orientation(wm.is_sideways(), wm.is_upright()),
                     })
                 } else {
                     None

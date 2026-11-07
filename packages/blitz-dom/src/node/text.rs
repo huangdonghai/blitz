@@ -86,13 +86,7 @@ pub struct VerticalTextPaint {
 /// CSS Writing Modes §5.1: `mixed` (the initial value) orients each character
 /// from UAX #50's `Vertical_Orientation`, `upright` keeps every character
 /// upright, and `sideways` rotates every character 90° clockwise.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TextOrientation {
-    #[default]
-    Mixed,
-    Upright,
-    Sideways,
-}
+pub use parley::TextOrientation;
 
 impl TextLayout {
     /// Map a physical point, relative to the inline root's content box, into
