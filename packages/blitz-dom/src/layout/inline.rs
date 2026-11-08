@@ -21,9 +21,9 @@ use taffy::{BlockItemStyle as _, Clear, Float, prelude::TaffyMaxContent};
 use stylo_taffy::StyleFlags;
 
 use super::resolve_calc_value;
+use crate::layout::LayoutPassState;
 #[cfg(feature = "writing-mode")]
 use crate::node::{TextOrientation, VerticalTextPaint};
-use crate::layout::LayoutPassState;
 use crate::stylo_to_parley;
 
 /// Make Parley resolve upright clusters' vertical metrics.
@@ -428,6 +428,12 @@ impl LayoutPassState<'_> {
 
         // Update inline boxes
         for ibox in inline_layout.layout.inline_boxes_mut() {
+            if matches!(
+                ibox.kind,
+                parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+            ) {
+                continue;
+            }
             let style = self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
             let margin = style
                 .margin()
@@ -544,6 +550,13 @@ impl LayoutPassState<'_> {
                     AvailableSpace::MinContent => {
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes_mut() {
+                            if matches!(
+                                ibox.kind,
+                                parley::InlineBoxKind::HangBoundary
+                                    | parley::InlineBoxKind::InlineEdge
+                            ) {
+                                continue;
+                            }
                             let (is_floated, margin) = {
                                 let style =
                                     self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
@@ -579,6 +592,13 @@ impl LayoutPassState<'_> {
                         let mut right_band: f32 = 0.0;
                         let mut width: f32 = 0.0;
                         for ibox in inline_layout.layout.inline_boxes_mut() {
+                            if matches!(
+                                ibox.kind,
+                                parley::InlineBoxKind::HangBoundary
+                                    | parley::InlineBoxKind::InlineEdge
+                            ) {
+                                continue;
+                            }
                             let (float, clear, margin) = {
                                 let style =
                                     self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
@@ -993,6 +1013,12 @@ impl LayoutPassState<'_> {
         for line in inline_layout.layout.lines() {
             for item in line.items() {
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
+                    if matches!(
+                        ibox.kind,
+                        parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+                    ) {
+                        continue;
+                    }
                     let order = ibox_order;
                     ibox_order += 1;
                     if inputs.run_mode == RunMode::PerformLayout {

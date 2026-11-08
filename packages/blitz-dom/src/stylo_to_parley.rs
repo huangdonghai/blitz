@@ -20,8 +20,8 @@ pub(crate) mod stylo {
     pub(crate) use style::properties::ComputedValues;
     pub(crate) use style::values::computed::AlignmentBaseline;
     pub(crate) use style::values::computed::BaselineShift;
-    pub(crate) use style::values::computed::LineBreak;
     pub(crate) use style::values::computed::HangingPunctuation;
+    pub(crate) use style::values::computed::LineBreak;
     pub(crate) use style::values::computed::OverflowWrap;
     pub(crate) use style::values::computed::TextAutospace;
     pub(crate) use style::values::computed::TextSpacingTrim;
@@ -522,7 +522,7 @@ pub(crate) fn vertical_align(style: &stylo::ComputedValues) -> parley::VerticalA
 /// container, so a glyph on its edge hangs past it regardless: only inline
 /// elements inside the root count, and only on their first/last fragments
 /// (the breaker narrows that part itself).
-fn hanging_insets(style: &stylo::ComputedValues, inline_element: bool) -> (bool, bool) {
+pub(crate) fn hanging_insets(style: &stylo::ComputedValues, inline_element: bool) -> (bool, bool) {
     if !inline_element {
         return (false, false);
     }
@@ -531,13 +531,17 @@ fn hanging_insets(style: &stylo::ComputedValues, inline_element: bool) -> (bool,
     let vertical = writing_mode.is_vertical();
     let border = style.get_border();
     let padding = style.get_padding();
-    let border_width = |width: &style::values::computed::BorderSideWidth| width.0 == app_units::Au(0);
+    let border_width =
+        |width: &style::values::computed::BorderSideWidth| width.0 == app_units::Au(0);
     // A side is an inset only if a border is actually drawn there: the computed
     // `medium` width applies on every side while `border-style: none`, and that
     // alone blocks nothing.
-    let inset_zero = |drawn: bool, width_zero: bool, pad_zero: bool| !drawn || (width_zero && pad_zero);
+    let inset_zero =
+        |drawn: bool, width_zero: bool, pad_zero: bool| !drawn || (width_zero && pad_zero);
     let is_drawn = |s: style::values::computed::BorderStyle| !s.none_or_hidden();
-    let pad_zero = |padding: &style::values::generics::NonNegative<LengthPercentage>| padding.0.resolve(Length::new(0.0)).px() == 0.0;
+    let pad_zero = |padding: &style::values::generics::NonNegative<LengthPercentage>| {
+        padding.0.resolve(Length::new(0.0)).px() == 0.0
+    };
     let (start_zero, end_zero) = if vertical {
         // The inline axis runs vertically, so its edges are the top and bottom.
         (
@@ -582,17 +586,37 @@ fn hanging_insets(style: &stylo::ComputedValues, inline_element: bool) -> (bool,
     (!start_zero, !end_zero)
 }
 
+/// The used inline-axis margins of a non-replaced inline element, as
+/// `(inline-start, inline-end)`. Percentages need the containing block's inline
+/// size, which is not known while the inline tree is built; they resolve to
+/// zero here.
+pub(crate) fn inline_margins(style: &stylo::ComputedValues) -> (f32, f32) {
+    let margin = style.get_margin();
+    let px = |value: &style::values::computed::Margin| {
+        use style::values::generics::length::GenericMargin;
+        match value {
+            GenericMargin::LengthPercentage(value) => value.resolve(Length::new(0.0)).px(),
+            _ => 0.0,
+        }
+    };
+    let writing_mode = style.writing_mode;
+    let rtl = style.clone_direction() == stylo::Direction::Rtl;
+    if writing_mode.is_vertical() {
+        (px(&margin.margin_top), px(&margin.margin_bottom))
+    } else if rtl {
+        (px(&margin.margin_right), px(&margin.margin_left))
+    } else {
+        (px(&margin.margin_left), px(&margin.margin_right))
+    }
+}
+
 pub(crate) fn style(
     span_id: NodeId,
     style: &stylo::ComputedValues,
     inline_element: bool,
 ) -> parley::TextStyle<'static, 'static, TextBrush> {
     let (hang_start_blocked, hang_end_blocked) = hanging_insets(style, inline_element);
-    let inline_element_id = if inline_element {
-        span_id.as_u64()
-    } else {
-        0
-    };
+    let inline_element_id = if inline_element { span_id.as_u64() } else { 0 };
     let font_styles = style.get_font();
     let itext_styles = style.get_inherited_text();
 

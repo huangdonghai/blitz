@@ -1324,6 +1324,44 @@ pub(crate) fn build_inline_layout_into(
                                     ..Default::default()
                                 });
 
+                            let (start_margin, end_margin) = node
+                                .primary_styles()
+                                .map(|s| stylo_to_parley::inline_margins(&s))
+                                .unwrap_or_default();
+                            let push_margin = |builder: &mut TreeBuilder<TextBrush>, width: f32| {
+                                if width != 0.0 {
+                                    builder.push_inline_box(InlineBox {
+                                        id: node_id.as_u64(),
+                                        kind: InlineBoxKind::InlineEdge,
+                                        index: 0,
+                                        width,
+                                        height: 0.0,
+                                        baseline: None,
+                                        vertical_align: parley::VerticalAlign::BASELINE,
+                                    });
+                                }
+                            };
+                            push_margin(builder, start_margin);
+
+                            let hang_boundary = node.children.is_empty()
+                                && node.before().is_none()
+                                && node.after().is_none()
+                                && node.primary_styles().is_some_and(|s| {
+                                    let (start, end) = stylo_to_parley::hanging_insets(&s, true);
+                                    start || end
+                                });
+                            if hang_boundary {
+                                builder.push_inline_box(InlineBox {
+                                    id: node_id.as_u64(),
+                                    kind: InlineBoxKind::HangBoundary,
+                                    index: 0,
+                                    width: 0.0,
+                                    height: 0.0,
+                                    baseline: None,
+                                    vertical_align: parley::VerticalAlign::BASELINE,
+                                });
+                            }
+
                             builder.push_style_span(style);
 
                             if let Some(before_id) = node.before() {
@@ -1361,6 +1399,7 @@ pub(crate) fn build_inline_layout_into(
                                 );
                             }
 
+                            push_margin(builder, end_margin);
                             builder.pop_style_span();
                         }
                     }

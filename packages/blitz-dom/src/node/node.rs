@@ -1808,6 +1808,12 @@ impl Node {
                         union(&mut line_rect, x0, y0, x1, y1);
                     }
                     PositionedLayoutItem::InlineBox(inline_box) => {
+                        if matches!(
+                            inline_box.kind,
+                            parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+                        ) {
+                            continue;
+                        }
                         if !is_in_target(NodeId::from_u64(inline_box.id)) {
                             continue;
                         }

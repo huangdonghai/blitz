@@ -75,8 +75,9 @@ pub(crate) fn draw_inline_backgrounds<'a>(
             }
 
             let metrics = glyph_run.run().font_metrics();
-            let x = glyph_run.offset() as f64;
-            let w = glyph_run.advance() as f64;
+            let (hang_before, hang_after) = glyph_run.hanging_punctuation_advance();
+            let x = f64::from(glyph_run.offset() - hang_before);
+            let w = f64::from(glyph_run.advance() + hang_before + hang_after);
             let baseline = glyph_run.baseline() as f64;
             // Upright text is set in a square cell centred on the line's central baseline, so
             // the font's horizontal ascent and descent say nothing about the block axis: the
