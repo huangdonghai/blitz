@@ -2,7 +2,7 @@
 use blitz_traits::node_id::NodeId;
 use std::borrow::Cow;
 
-use style::values::computed::Length;
+use style::values::computed::{Length, LengthPercentage};
 
 use crate::node::TextBrush;
 
@@ -21,6 +21,7 @@ pub(crate) mod stylo {
     pub(crate) use style::values::computed::AlignmentBaseline;
     pub(crate) use style::values::computed::BaselineShift;
     pub(crate) use style::values::computed::LineBreak;
+    pub(crate) use style::values::computed::HangingPunctuation;
     pub(crate) use style::values::computed::OverflowWrap;
     pub(crate) use style::values::computed::TextAutospace;
     pub(crate) use style::values::computed::TextSpacingTrim;
@@ -406,6 +407,23 @@ pub(crate) fn text_autospace(input: stylo::TextAutospace) -> parley::TextAutospa
     }
 }
 
+pub(crate) fn hanging_punctuation(input: stylo::HangingPunctuation) -> parley::HangingPunctuation {
+    let mut value = parley::HangingPunctuation::NONE;
+    if input.contains(stylo::HangingPunctuation::FIRST) {
+        value = value.union(parley::HangingPunctuation::FIRST);
+    }
+    if input.contains(stylo::HangingPunctuation::LAST) {
+        value = value.union(parley::HangingPunctuation::LAST);
+    }
+    if input.contains(stylo::HangingPunctuation::ALLOW_END) {
+        value = value.union(parley::HangingPunctuation::ALLOW_END);
+    }
+    if input.contains(stylo::HangingPunctuation::FORCE_END) {
+        value = value.union(parley::HangingPunctuation::FORCE_END);
+    }
+    value
+}
+
 pub(crate) fn text_orientation(input: stylo::TextOrientation) -> parley::TextOrientation {
     match input {
         stylo::TextOrientation::Mixed => parley::TextOrientation::Mixed,
@@ -499,10 +517,82 @@ pub(crate) fn vertical_align(style: &stylo::ComputedValues) -> parley::VerticalA
     parley::VerticalAlign::new(alignment, shift)
 }
 
+/// (start blocked, end blocked) for an inline element's inline-axis border and
+/// padding (CSS Text 3 §8.2.1). The inline root's own box is the block
+/// container, so a glyph on its edge hangs past it regardless: only inline
+/// elements inside the root count, and only on their first/last fragments
+/// (the breaker narrows that part itself).
+fn hanging_insets(style: &stylo::ComputedValues, inline_element: bool) -> (bool, bool) {
+    if !inline_element {
+        return (false, false);
+    }
+    let writing_mode = style.writing_mode;
+    let rtl = style.clone_direction() == stylo::Direction::Rtl;
+    let vertical = writing_mode.is_vertical();
+    let border = style.get_border();
+    let padding = style.get_padding();
+    let border_width = |width: &style::values::computed::BorderSideWidth| width.0 == app_units::Au(0);
+    // A side is an inset only if a border is actually drawn there: the computed
+    // `medium` width applies on every side while `border-style: none`, and that
+    // alone blocks nothing.
+    let inset_zero = |drawn: bool, width_zero: bool, pad_zero: bool| !drawn || (width_zero && pad_zero);
+    let is_drawn = |s: style::values::computed::BorderStyle| !s.none_or_hidden();
+    let pad_zero = |padding: &style::values::generics::NonNegative<LengthPercentage>| padding.0.resolve(Length::new(0.0)).px() == 0.0;
+    let (start_zero, end_zero) = if vertical {
+        // The inline axis runs vertically, so its edges are the top and bottom.
+        (
+            inset_zero(
+                is_drawn(border.border_top_style),
+                border_width(&border.border_top_width),
+                pad_zero(&padding.padding_top),
+            ),
+            inset_zero(
+                is_drawn(border.border_bottom_style),
+                border_width(&border.border_bottom_width),
+                pad_zero(&padding.padding_bottom),
+            ),
+        )
+    } else if rtl {
+        (
+            inset_zero(
+                is_drawn(border.border_right_style),
+                border_width(&border.border_right_width),
+                pad_zero(&padding.padding_right),
+            ),
+            inset_zero(
+                is_drawn(border.border_left_style),
+                border_width(&border.border_left_width),
+                pad_zero(&padding.padding_left),
+            ),
+        )
+    } else {
+        (
+            inset_zero(
+                is_drawn(border.border_left_style),
+                border_width(&border.border_left_width),
+                pad_zero(&padding.padding_left),
+            ),
+            inset_zero(
+                is_drawn(border.border_right_style),
+                border_width(&border.border_right_width),
+                pad_zero(&padding.padding_right),
+            ),
+        )
+    };
+    (!start_zero, !end_zero)
+}
+
 pub(crate) fn style(
     span_id: NodeId,
     style: &stylo::ComputedValues,
+    inline_element: bool,
 ) -> parley::TextStyle<'static, 'static, TextBrush> {
+    let (hang_start_blocked, hang_end_blocked) = hanging_insets(style, inline_element);
+    let inline_element_id = if inline_element {
+        span_id.as_u64()
+    } else {
+        0
+    };
     let font_styles = style.get_font();
     let itext_styles = style.get_inherited_text();
 
@@ -602,6 +692,10 @@ pub(crate) fn style(
         letter_spacing,
         text_spacing_trim: text_spacing_trim(itext_styles.text_spacing_trim),
         text_autospace: text_autospace(itext_styles.text_autospace),
+        hanging_punctuation: hanging_punctuation(itext_styles.hanging_punctuation),
+        hang_start_blocked,
+        hang_end_blocked,
+        inline_element_id,
         text_orientation: text_orientation(style.get_inherited_box().clone_text_orientation()),
         text_combine_upright: text_combine_upright(itext_styles.text_combine_upright),
         text_wrap_mode,

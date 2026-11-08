@@ -861,7 +861,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     let parley_style = node
         .primary_styles()
         .as_ref()
-        .map(|s| stylo_to_parley::style(node.id, s))
+        .map(|s| stylo_to_parley::style(node.id, s, false))
         .unwrap_or_default();
     let alignment = node
         .primary_styles()
@@ -1090,7 +1090,7 @@ pub(crate) fn build_inline_layout_into(
 
     let parley_style = root_node_style
         .as_ref()
-        .map(|s| stylo_to_parley::style(inline_context_root_node_id, s))
+        .map(|s| stylo_to_parley::style(inline_context_root_node_id, s, false))
         .unwrap_or_else(|| parley::TextStyle {
             white_space_collapse: WhiteSpaceCollapse::Collapse,
             ..Default::default()
@@ -1318,7 +1318,7 @@ pub(crate) fn build_inline_layout_into(
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let style = node
                                 .primary_styles()
-                                .map(|s| stylo_to_parley::style(node.id, &s))
+                                .map(|s| stylo_to_parley::style(node.id, &s, true))
                                 .unwrap_or_else(|| parley::TextStyle {
                                     white_space_collapse: WhiteSpaceCollapse::Collapse,
                                     ..Default::default()
