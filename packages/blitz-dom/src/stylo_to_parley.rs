@@ -11,6 +11,8 @@ pub(crate) mod stylo {
     pub(crate) use style::computed_values::direction::T as Direction;
     pub(crate) use style::computed_values::font_variant_caps::T as FontVariantCaps;
     pub(crate) use style::computed_values::font_variant_position::T as FontVariantPosition;
+    pub(crate) use style::computed_values::text_combine_upright::T as TextCombineUpright;
+    pub(crate) use style::computed_values::text_orientation::T as TextOrientation;
     pub(crate) use style::computed_values::text_wrap_mode::T as TextWrapMode;
     pub(crate) use style::computed_values::unicode_bidi::T as UnicodeBidi;
     pub(crate) use style::computed_values::white_space_collapse::T as WhiteSpaceCollapse;
@@ -20,6 +22,7 @@ pub(crate) mod stylo {
     pub(crate) use style::values::computed::BaselineShift;
     pub(crate) use style::values::computed::LineBreak;
     pub(crate) use style::values::computed::OverflowWrap;
+    pub(crate) use style::values::computed::TextAutospace;
     pub(crate) use style::values::computed::TextSpacingTrim;
     pub(crate) use style::values::computed::WordBreak;
     pub(crate) use style::values::computed::font::FontFeatureSettings;
@@ -366,9 +369,7 @@ pub(crate) fn text_align(input: stylo::TextAlignKeyword) -> parley::Alignment {
     }
 }
 
-pub(crate) fn text_spacing_trim(
-    input: stylo::TextSpacingTrim,
-) -> parley::TextSpacingTrim {
+pub(crate) fn text_spacing_trim(input: stylo::TextSpacingTrim) -> parley::TextSpacingTrim {
     if input.contains(stylo::TextSpacingTrim::AUTO) {
         return parley::TextSpacingTrim::Auto;
     }
@@ -395,6 +396,26 @@ pub(crate) fn text_spacing_trim(
         parley::TrimEnd::Allow
     };
     parley::TextSpacingTrim::new(start, adjacent, end)
+}
+
+pub(crate) fn text_autospace(input: stylo::TextAutospace) -> parley::TextAutospace {
+    if input.contains(stylo::TextAutospace::NORMAL) {
+        parley::TextAutospace::Normal
+    } else {
+        parley::TextAutospace::NoAutospace
+    }
+}
+
+pub(crate) fn text_orientation(input: stylo::TextOrientation) -> parley::TextOrientation {
+    match input {
+        stylo::TextOrientation::Mixed => parley::TextOrientation::Mixed,
+        stylo::TextOrientation::Upright => parley::TextOrientation::Upright,
+        stylo::TextOrientation::Sideways => parley::TextOrientation::Sideways,
+    }
+}
+
+pub(crate) fn text_combine_upright(input: stylo::TextCombineUpright) -> bool {
+    matches!(input, stylo::TextCombineUpright::All)
 }
 
 /// Returns `None` for `text-align-last: auto`
@@ -580,6 +601,9 @@ pub(crate) fn style(
         word_spacing,
         letter_spacing,
         text_spacing_trim: text_spacing_trim(itext_styles.text_spacing_trim),
+        text_autospace: text_autospace(itext_styles.text_autospace),
+        text_orientation: text_orientation(style.get_inherited_box().clone_text_orientation()),
+        text_combine_upright: text_combine_upright(itext_styles.text_combine_upright),
         text_wrap_mode,
         white_space_collapse: white_space_collapse(itext_styles.white_space_collapse),
         overflow_wrap,
@@ -759,7 +783,10 @@ mod tests {
             implied(W::WRITING_MODE_VERTICAL_RL | W::UPRIGHT),
             Some(*b"vert")
         );
-        assert_eq!(implied(W::WRITING_MODE_VERTICAL_RL | W::TEXT_SIDEWAYS), None);
+        assert_eq!(
+            implied(W::WRITING_MODE_VERTICAL_RL | W::TEXT_SIDEWAYS),
+            None
+        );
 
         // `direction: rtl` is orthogonal to the block axis and must not change
         // the answer (it only sets INLINE_REVERSED on top of the same flags).
