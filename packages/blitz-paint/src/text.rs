@@ -1543,7 +1543,13 @@ pub(crate) fn stroke_text<'a>(
                         // the pen advancement on the same before/after contract
                         // as the horizontal painter instead of collapsing the
                         // two gaps into a trailing correction.
-                        let cluster_has_spacing = cluster.advance() > 0.0;
+                        // A hanging punctuation cluster has a net advance of zero -
+                        // its trimmed character advance became a negative margin -
+                        // but the glyph itself is still shaped and its trim shift
+                        // belongs in the painted position. Check the shaped advance,
+                        // which is zero only for text whose advances were cleared
+                        // (ruby annotations).
+                        let cluster_has_spacing = cluster.shaped_advance() > 0.0;
                         let spacing_before = if cluster_has_spacing {
                             cluster.spacing_before()
                         } else {
