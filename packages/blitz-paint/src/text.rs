@@ -1940,6 +1940,7 @@ pub(crate) fn stroke_inline_notes(
             let rows = [
                 (
                     &fragment.first_range,
+                    &fragment.first_unit_range,
                     &fragment.first_shaped_clusters,
                     fragment.first_advance,
                     fragment.first_justification_opportunities,
@@ -1956,6 +1957,7 @@ pub(crate) fn stroke_inline_notes(
                 ),
                 (
                     &fragment.second_range,
+                    &fragment.second_unit_range,
                     &fragment.second_shaped_clusters,
                     fragment.second_advance,
                     fragment.second_justification_opportunities,
@@ -1973,6 +1975,7 @@ pub(crate) fn stroke_inline_notes(
             ];
             for (
                 range,
+                unit_range,
                 shaped_clusters,
                 row_advance,
                 row_justification_opportunities,
@@ -1994,9 +1997,11 @@ pub(crate) fn stroke_inline_notes(
                 paint_inline_note_row(
                     scene,
                     source,
+                    segment,
                     &source_line,
                     &segment.run_spans,
                     range,
+                    unit_range,
                     shaped_clusters,
                     first_line,
                     &inline_box,
@@ -2419,9 +2424,11 @@ fn inline_note_box_extent(
 fn paint_inline_note_row(
     scene: &mut impl PaintScene,
     source: &InlineNoteSource,
+    segment: &blitz_dom::node::InlineNoteSegment,
     source_line: &Line<'_, TextBrush>,
     run_spans: &[blitz_dom::node::InlineNoteRunSpan],
     text_range: &std::ops::Range<usize>,
+    unit_range: &std::ops::Range<usize>,
     shaped_range: &std::ops::Range<u32>,
     first_line: bool,
     inline_box: &parley::layout::PositionedInlineBox,
@@ -2480,7 +2487,27 @@ fn paint_inline_note_row(
         .map(|span| span.item_index)
         .collect();
     selected_run_indices.sort_unstable();
+    selected_run_indices.dedup();
+    let mut inline_box_units = Vec::new();
+    if segment.units[unit_range.clone()]
+        .iter()
+        .any(|unit| unit.inline_box_index.is_some())
+    {
+        inline_box_units.extend(
+            unit_range
+                .clone()
+                .filter(|index| segment.units[*index].inline_box_index.is_some()),
+        );
+        inline_box_units.sort_unstable_by_key(|index| segment.units[*index].visual_order_index);
+    }
+    let mut inline_box_cursor = 0;
     for item_index in selected_run_indices {
+        while inline_box_cursor < inline_box_units.len()
+            && segment.units[inline_box_units[inline_box_cursor]].line_item_index < item_index
+        {
+            row_pen += segment.units[inline_box_units[inline_box_cursor]].advance;
+            inline_box_cursor += 1;
+        }
         for item in source_line.items_for_text_item(item_index, shaped_range.clone()) {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
                 continue;
