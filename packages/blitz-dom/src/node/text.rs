@@ -117,8 +117,14 @@ pub struct InlineNoteUnit {
     pub shaped_clusters: std::ops::Range<u32>,
     /// Layout box represented by this indivisible unit, when it is atomic inline content.
     pub inline_box_index: Option<usize>,
+    /// DOM node represented by this unit when it paints as an atomic inline child.
+    pub atomic_node_id: Option<u64>,
     /// Visual line-item index used to place atomic content beside shaped text runs.
     pub line_item_index: usize,
+    /// Unit order within its source line after bidi visual reordering.
+    pub visual_order_index: usize,
+    /// Atomic box block offset from the source line's block minimum.
+    pub inline_box_block_offset: f32,
     pub line_height: f32,
     pub line_over: f32,
     pub line_under: f32,
@@ -198,6 +204,28 @@ pub struct InlineNoteFragment {
     pub inline_end_edge: f32,
     pub block_start_inset: f32,
     pub block_end_inset: f32,
+}
+
+impl InlineNoteFragment {
+    /// Extra justification spacing each row needs to share the note's width on its outer line.
+    pub fn justification_fill_amounts(&self, justification_amount: f32) -> (f32, f32) {
+        let first_common_width = self.first_advance
+            + self.first_justification_opportunities as f32 * justification_amount;
+        let second_common_width = self.second_advance
+            + self.second_justification_opportunities as f32 * justification_amount;
+        let justified_note_width = first_common_width.max(second_common_width);
+        let row_fill = |advance: f32, opportunities: u32| {
+            if self.outer_line_end && justification_amount > 0.0 && opportunities > 0 {
+                (justified_note_width - advance).max(0.0) / opportunities as f32
+            } else {
+                0.0
+            }
+        };
+        (
+            row_fill(first_common_width, self.first_justification_opportunities),
+            row_fill(second_common_width, self.second_justification_opportunities),
+        )
+    }
 }
 
 /// Physical geometry needed to paint an inline root laid out in a vertical

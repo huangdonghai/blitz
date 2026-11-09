@@ -296,6 +296,116 @@ fn note_unit_end_advance(unit: &crate::node::InlineNoteUnit, hanging: NoteHangin
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn inline_note_atomic_positions(
+    source: &InlineNoteSource,
+    segment: &crate::node::InlineNoteSegment,
+    note_box: &parley::layout::PositionedInlineBox,
+    fragment: &InlineNoteFragment,
+    unit_range: &std::ops::Range<usize>,
+    row_advance: f32,
+    row_justification_opportunities: u32,
+    row_fill_amount: f32,
+    justification_amount: f32,
+    row_block_offset: f32,
+    first_line: bool,
+    hanging_start: bool,
+    hanging_end: bool,
+    hanging_advance: f32,
+) -> Vec<(u64, f32, f32)> {
+    if unit_range.is_empty() {
+        return Vec::new();
+    }
+
+    let units = &segment.units;
+    let first_text = unit_range
+        .clone()
+        .find(|index| units[*index].inline_box_index.is_none());
+    let last_text = unit_range
+        .clone()
+        .rev()
+        .find(|index| units[*index].inline_box_index.is_none());
+    let mut advances = units[unit_range.clone()]
+        .iter()
+        .map(|unit| unit.advance)
+        .collect::<Vec<_>>();
+
+    if first_text == Some(unit_range.start) {
+        let unit = &units[unit_range.start];
+        let start_advance = if hanging_start && unit.starts_with_hanging_opening {
+            if first_line {
+                unit.first_line_start_hanging_advance
+            } else {
+                unit.line_start_hanging_advance
+            }
+        } else if first_line {
+            unit.first_line_start_advance
+        } else {
+            unit.line_start_advance
+        };
+        advances[0] += start_advance - unit.advance;
+    }
+
+    // Match the fragment width selected by the line breaker, including hanging at the end.
+    if last_text == unit_range.end.checked_sub(1) {
+        let natural_advance = advances.iter().sum::<f32>();
+        advances[unit_range.end - unit_range.start - 1] += row_advance - natural_advance;
+    }
+
+    let content_width = (note_box.width - fragment.inline_start_edge - fragment.inline_end_edge)
+        .max(0.0);
+    let effective_advance = row_advance
+        + row_justification_opportunities as f32 * (justification_amount + row_fill_amount);
+    let inline_origin = if source.layout.is_rtl() {
+        note_box.x
+            + fragment.inline_end_edge
+            + (content_width - effective_advance).max(0.0)
+            - hanging_advance
+    } else {
+        note_box.x + fragment.inline_start_edge
+    };
+    let block_origin = note_box.y + row_block_offset + fragment.block_start_inset;
+    let mut visual_units = unit_range.clone().collect::<Vec<_>>();
+    visual_units.sort_unstable_by_key(|index| units[*index].visual_order_index);
+
+    let row_justification_amount = justification_amount + row_fill_amount;
+    let mut positions = Vec::new();
+    let mut inline_pen = 0.0;
+    for unit_index in visual_units {
+        let unit = &units[unit_index];
+        if let Some(atomic_node_id) = unit.atomic_node_id {
+            positions.push((
+                atomic_node_id,
+                inline_origin + inline_pen,
+                block_origin + unit.inline_box_block_offset,
+            ));
+        }
+
+        let is_row_start_hanging = unit_index == unit_range.start
+            && hanging_start
+            && unit.starts_with_hanging_opening;
+        let is_row_end = unit_index + 1 == unit_range.end;
+        let is_row_end_hanging = is_row_end
+            && hanging_end
+            && (unit.force_hanging_at_end
+                || unit.allow_hanging_at_end
+                || unit.last_hanging_at_end);
+        let extra_justification = if justification_amount > 0.0
+            && unit.is_justification_opportunity
+            && !is_row_start_hanging
+            && !is_row_end_hanging
+            && !(is_row_end && unit.is_word_separator)
+        {
+            row_justification_amount
+        } else {
+            0.0
+        };
+        inline_pen += advances[unit_index - unit_range.start] + extra_justification;
+    }
+
+    positions
+}
+
 fn inline_note_range_height(
     source: &InlineNoteSource,
     segment: &crate::node::InlineNoteSegment,
@@ -1283,6 +1393,27 @@ impl LayoutPassState<'_> {
                 let border = style
                     .border()
                     .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+                let is_flow = matches!(
+                    style.effective_display().inside(),
+                    DisplayInside::Flow | DisplayInside::FlowRoot
+                );
+                let baseline_source = style.style.get_box().clone_baseline_source();
+                let uses_last_baseline = match baseline_source {
+                    BaselineSource::Auto => is_flow,
+                    BaselineSource::First => false,
+                    BaselineSource::Last => true,
+                };
+                let overflow = style.overflow();
+                let is_scroll_container = !matches!(overflow.y, Overflow::Visible | Overflow::Clip);
+                let is_block_axis_scroll_container = is_flow
+                    && is_scroll_container
+                    && !style
+                        .flags
+                        .intersects(StyleFlags::IS_BUTTON | StyleFlags::IS_BUTTON_INPUT);
+                let contain_layout = style.style.get_box().clone_contain().contains(Contain::LAYOUT);
+                let exports_baseline = !(baseline_source == BaselineSource::Auto
+                    && is_block_axis_scroll_container)
+                    && !contain_layout;
                 let child_inputs = inline_box_inputs(style.size().width, margin, child_inputs);
                 drop(style);
 
@@ -1291,11 +1422,23 @@ impl LayoutPassState<'_> {
                     child_inputs,
                 );
                 inline_box.width = (margin.left + margin.right + output.size.width) * scale;
-                inline_box.baseline = output
-                    .baselines
-                    .first
-                    .or(output.baselines.last)
-                    .map(|baseline| (margin.top + baseline) * scale);
+                inline_box.baseline = if exports_baseline {
+                    let baseline = if uses_last_baseline {
+                        output.baselines.last.or(output.baselines.first)
+                    } else {
+                        output.baselines.first.or(output.baselines.last)
+                    };
+                    baseline.map(|baseline| {
+                        let baseline = if is_scroll_container {
+                            baseline.clamp(0.0, output.size.height)
+                        } else {
+                            baseline
+                        };
+                        (margin.top + baseline) * scale
+                    })
+                } else {
+                    None
+                };
                 let margin_box_height = margin.top + margin.bottom + output.size.height;
                 inline_box.height = if inline_box.baseline.is_some() {
                     (margin_box_height * scale).min(f32::MAX)
@@ -1305,6 +1448,7 @@ impl LayoutPassState<'_> {
 
                 let child_layout = self.nodes[child_node_id].unrounded_layout_mut();
                 child_layout.size = output.size;
+                child_layout.scrollable_overflow_rect = output.scrollable_overflow_rect;
                 child_layout.padding = padding;
                 child_layout.border = border;
                 child_layout.margin = margin;
@@ -2112,15 +2256,157 @@ impl LayoutPassState<'_> {
         let mut span_cb_flags = StyleFlags::empty();
         for line in inline_layout.layout.lines() {
             for item in line.items() {
-                if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
-                    if matches!(
-                        ibox.kind,
-                        parley::InlineBoxKind::HangBoundary
-                            | parley::InlineBoxKind::InlineEdge
-                            | parley::InlineBoxKind::CustomInFlowCentered
-                    ) {
-                        continue;
+                let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item else {
+                    continue;
+                };
+                if ibox.kind == parley::InlineBoxKind::CustomInFlowCentered {
+                    if inputs.run_mode == RunMode::PerformLayout {
+                        let Some(Some(fragment)) =
+                            inline_layout.inline_note_fragments.get(ibox.index)
+                        else {
+                            continue;
+                        };
+                        let Some(source) = inline_layout.inline_notes.get(fragment.source_index)
+                        else {
+                            continue;
+                        };
+                        let Some(segment) = source.segments.get(fragment.segment_index) else {
+                            continue;
+                        };
+                        let justification_amount = line.justification_amount_per_opportunity();
+                        let (first_row_fill, second_row_fill) =
+                            fragment.justification_fill_amounts(justification_amount);
+                        let rows = [
+                            (
+                                &fragment.first_unit_range,
+                                fragment.first_advance,
+                                fragment.first_justification_opportunities,
+                                first_row_fill,
+                                0.0,
+                                fragment.first_line,
+                                fragment.first_hanging_start,
+                                fragment.first_hanging_end,
+                                fragment.first_hanging_advance,
+                            ),
+                            (
+                                &fragment.second_unit_range,
+                                fragment.second_advance,
+                                fragment.second_justification_opportunities,
+                                second_row_fill,
+                                fragment.first_line_height,
+                                false,
+                                false,
+                                fragment.second_hanging_end,
+                                fragment.second_hanging_advance,
+                            ),
+                        ];
+                        for (
+                            unit_range,
+                            row_advance,
+                            row_justification_opportunities,
+                            row_fill,
+                            row_block_offset,
+                            first_line,
+                            hanging_start,
+                            hanging_end,
+                            hanging_advance,
+                        ) in rows
+                        {
+                            if !segment.units[unit_range.clone()]
+                                .iter()
+                                .any(|unit| unit.atomic_node_id.is_some())
+                            {
+                                continue;
+                            }
+                            for (atomic_node_id, inline_position, block_position) in
+                                inline_note_atomic_positions(
+                                    source,
+                                    segment,
+                                    &ibox,
+                                    fragment,
+                                    unit_range,
+                                    row_advance,
+                                    row_justification_opportunities,
+                                    row_fill,
+                                    justification_amount,
+                                    row_block_offset,
+                                    first_line,
+                                    hanging_start,
+                                    hanging_end,
+                                    hanging_advance,
+                                )
+                            {
+                                let child = NodeId::from_u64(atomic_node_id);
+                                let (margin, inset_offset) = {
+                                    let style = self.child_layout_style(&self.nodes[child]);
+                                    let margin = style
+                                        .margin()
+                                        .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+                                    let inset_offset = if style.position() == taffy::Position::Relative
+                                    {
+                                        let inset_style = style.inset();
+                                        let content_width = final_size.width
+                                            - content_box_inset.horizontal_axis_sum();
+                                        let content_height = final_size.height
+                                            - content_box_inset.vertical_axis_sum();
+                                        let inset = taffy::Rect {
+                                            left: inset_style
+                                                .left
+                                                .maybe_resolve(content_width, resolve_calc_value),
+                                            right: inset_style
+                                                .right
+                                                .maybe_resolve(content_width, resolve_calc_value),
+                                            top: inset_style
+                                                .top
+                                                .maybe_resolve(content_height, resolve_calc_value),
+                                            bottom: inset_style
+                                                .bottom
+                                                .maybe_resolve(content_height, resolve_calc_value),
+                                        };
+                                        let direction = style.direction();
+                                        Point {
+                                            x: if direction == Direction::Rtl {
+                                                inset.right
+                                                    .map(|value| -value)
+                                                    .or(inset.left)
+                                                    .unwrap_or(0.0)
+                                            } else {
+                                                inset.left
+                                                    .or(inset.right.map(|value| -value))
+                                                    .unwrap_or(0.0)
+                                            },
+                                            y: inset
+                                                .top
+                                                .or(inset.bottom.map(|value| -value))
+                                                .unwrap_or(0.0),
+                                        }
+                                    } else {
+                                        Point::ZERO
+                                    };
+                                    (margin, inset_offset)
+                                };
+                                let child_layout = self.nodes[child].unrounded_layout_mut();
+                                child_layout.location = Point {
+                                    x: inline_position / scale
+                                        + margin.left
+                                        + container_pb.left
+                                        + inset_offset.x,
+                                    y: block_position / scale
+                                        + margin.top
+                                        + line_box_top
+                                        + inset_offset.y,
+                                };
+                            }
+                        }
                     }
+                    continue;
+                }
+                if matches!(
+                    ibox.kind,
+                    parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+                ) {
+                    continue;
+                }
                     let order = ibox_order;
                     ibox_order += 1;
                     if inputs.run_mode == RunMode::PerformLayout {
@@ -2290,7 +2576,6 @@ impl LayoutPassState<'_> {
                             oof_candidates.append(&mut output.oof_candidates);
                         }
                     }
-                }
             }
         }
 

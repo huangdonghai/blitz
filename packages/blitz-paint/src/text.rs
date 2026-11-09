@@ -1924,29 +1924,8 @@ pub(crate) fn stroke_inline_notes(
                 continue;
             }
 
-            let first_common_width = fragment.first_advance
-                + fragment.first_justification_opportunities as f32 * justification_amount;
-            let second_common_width = fragment.second_advance
-                + fragment.second_justification_opportunities as f32 * justification_amount;
-            let justified_note_width = first_common_width.max(second_common_width);
-            let first_row_fill = if fragment.outer_line_end
-                && justification_amount > 0.0
-                && fragment.first_justification_opportunities > 0
-            {
-                (fragment.first_justification_opportunities as f32).recip()
-                    * (justified_note_width - first_common_width).max(0.0)
-            } else {
-                0.0
-            };
-            let second_row_fill = if fragment.outer_line_end
-                && justification_amount > 0.0
-                && fragment.second_justification_opportunities > 0
-            {
-                (fragment.second_justification_opportunities as f32).recip()
-                    * (justified_note_width - second_common_width).max(0.0)
-            } else {
-                0.0
-            };
+            let (first_row_fill, second_row_fill) =
+                fragment.justification_fill_amounts(justification_amount);
 
             draw_inline_note_box_background(
                 scene,

@@ -1269,7 +1269,10 @@ pub(crate) fn inline_note_segments(
                 text_range: start_byte..end_byte,
                 shaped_clusters,
                 inline_box_index: None,
+                atomic_node_id: None,
                 line_item_index: clusters[start].run().index(),
+                visual_order_index: 0,
+                inline_box_block_offset: 0.0,
                 line_height: clusters[start].line_height(),
                 line_over,
                 line_under,
@@ -1334,7 +1337,11 @@ pub(crate) fn inline_note_segments(
                 text_range: layout_box.index..layout_box.index,
                 shaped_clusters: 0..0,
                 inline_box_index: Some(inline_box.index),
+                atomic_node_id: (inline_box.kind == InlineBoxKind::InFlow)
+                    .then_some(layout_box.id),
                 line_item_index: inline_box.item_index,
+                visual_order_index: 0,
+                inline_box_block_offset: inline_box.y - line.metrics().block_min_coord,
                 line_height: inline_box.height,
                 line_over,
                 line_under,
@@ -1373,6 +1380,34 @@ pub(crate) fn inline_note_segments(
                 unit.line_item_index,
             )
         });
+        let item_directions = line
+            .runs()
+            .map(|run| (run.index() as usize, run.is_rtl()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut visual_order = (0..units.len()).collect::<Vec<_>>();
+        visual_order.sort_unstable_by(|left, right| {
+            let left_unit = &units[*left];
+            let right_unit = &units[*right];
+            left_unit
+                .line_item_index
+                .cmp(&right_unit.line_item_index)
+                .then_with(|| {
+                    let is_rtl = item_directions
+                        .get(&left_unit.line_item_index)
+                        .copied()
+                        .unwrap_or_else(|| layout.is_rtl());
+                    match (left_unit.inline_box_index, right_unit.inline_box_index) {
+                        (None, None) if is_rtl => {
+                            right_unit.text_range.start.cmp(&left_unit.text_range.start)
+                        }
+                        (None, None) => left_unit.text_range.start.cmp(&right_unit.text_range.start),
+                        _ => left.cmp(right),
+                    }
+                })
+        });
+        for (visual_index, unit_index) in visual_order.into_iter().enumerate() {
+            units[unit_index].visual_order_index = visual_index;
+        }
 
         let mut prefix_advances = Vec::<f32>::with_capacity(units.len() + 1);
         prefix_advances.push(0.0);
