@@ -255,10 +255,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     let shift = plan.translate(band);
                     let page = plan.fragment_rect(band);
                     let band_rect = Rect::new(
-                        page.left as f64 * self.scale,
-                        page.top as f64 * self.scale,
-                        page.right as f64 * self.scale,
-                        page.bottom as f64 * self.scale,
+                        page.left as f64 * self.scale + self.initial_x,
+                        page.top as f64 * self.scale + self.initial_y,
+                        page.right as f64 * self.scale + self.initial_x,
+                        page.bottom as f64 * self.scale + self.initial_y,
                     );
                     let clip = band_rect.intersect(viewport_clip_rect);
                     if clip.area() <= 0.0 {
@@ -475,11 +475,12 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             should_clip = true;
         }
 
-        let screen_transform = Affine::translate(Vec2 {
-            x: -self.initial_x,
-            y: -self.initial_y,
-        }) * transform;
-        let screen_bbox = screen_transform.transform_rect_bbox(overflow.union(border_box));
+        // `transform` already maps layout coordinates into the scene's output
+        // coordinates. `clip_rect` is in those same coordinates, so the box
+        // must not have the output offset subtracted again: a crop of the
+        // second page translates the scene up by a page, and undoing that
+        // here would cull exactly the boxes that belong to it.
+        let screen_bbox = transform.transform_rect_bbox(overflow.union(border_box));
 
         // Cull elements that fall entirely outside the current clip rectangle. In addition to
         // the viewport, `clip_rect` is narrowed by any ancestor scrollport (see below), so this
@@ -576,7 +577,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             } else {
                 cx.frame.padding_box_path()
             };
-            clip_rect.intersect(screen_transform.transform_rect_bbox(clip_box.bounding_box()))
+            clip_rect.intersect(transform.transform_rect_bbox(clip_box.bounding_box()))
         } else {
             clip_rect
         };
@@ -1347,10 +1348,7 @@ impl ElementCx<'_, '_> {
     /// coordinates, so the region has to be mapped back through the same screen
     /// offset the culling in `render_element` uses.
     fn local_cull_rect(&self, transform: Affine) -> Rect {
-        let screen = Affine::translate(Vec2 {
-            x: -self.context.initial_x,
-            y: -self.context.initial_y,
-        }) * transform;
+        let screen = transform;
         // A degenerate transform has no visible region to speak of; cull nothing
         // rather than guess at one.
         if screen.determinant().abs() < f64::EPSILON {

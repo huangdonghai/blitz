@@ -63,8 +63,8 @@ pub fn paint_scene(
         scale,
         width,
         height,
-        x_offset as f64,
-        y_offset as f64,
+        -(x_offset as f64),
+        -(y_offset as f64),
         &custom_widget_scenes,
     );
     generator.paint_scene(scene);

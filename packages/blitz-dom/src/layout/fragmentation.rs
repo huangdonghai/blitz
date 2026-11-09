@@ -549,6 +549,19 @@ impl BaseDocument {
             },
         })
     }
+
+    /// Number of page fragmentainers in the current print flow.
+    pub fn page_count(&self) -> usize {
+        self.root_element()
+            .break_plan
+            .as_deref()
+            .map_or(0, |plan| plan.bands.len())
+    }
+
+    /// Size of one sheet of paper, including its page margins.
+    pub fn page_box_size(&self) -> Option<Size<f32>> {
+        self.page_box.map(|page| page.size)
+    }
 }
 
 /// The paper one page is printed on, and the margin that keeps content off its edge, in the CSS
