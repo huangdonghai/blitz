@@ -446,15 +446,30 @@ fn inline_note_range_height(
     start: usize,
     end: usize,
 ) -> f32 {
+    if start >= end {
+        return source.strut_line_height;
+    }
+    let units = &segment.units[start..end];
+    // An atomic inline is a line of its own content: its margin box supplies the
+    // subline's block extent, and the note's strut must not be added on top. Text
+    // units already carry the line height of their own runs.
+    let has_atomic = units.iter().any(|unit| unit.atomic_node_id.is_some());
     if source.layout.is_vertical() {
-        segment.units[start..end]
-            .iter()
-            .fold(source.strut_line_height, |height, unit| {
-                height.max(unit.line_height)
-            })
+        units.iter().fold(
+            if has_atomic {
+                0.0
+            } else {
+                source.strut_line_height
+            },
+            |height, unit| height.max(unit.line_height),
+        )
     } else {
-        let (over, under) = segment.units[start..end].iter().fold(
-            (source.strut_over, source.strut_under),
+        let (over, under) = units.iter().fold(
+            if has_atomic {
+                (0.0, 0.0)
+            } else {
+                (source.strut_over, source.strut_under)
+            },
             |(over, under), unit| (over.max(unit.line_over), under.max(unit.line_under)),
         );
         over + under
@@ -998,6 +1013,10 @@ fn subtract_margins(mut child_inputs: LayoutInput, margin: taffy::Rect<f32>) -> 
     child_inputs
 }
 
+/// The line breaker compares accumulated advances with a max-content limit directly;
+/// a small cushion keeps exact float equality from producing a spurious soft wrap.
+const INLINE_BOX_MAX_CONTENT_CUSHION: f32 = 0.01;
+
 /// Layout inputs for an atomic inline box, with any sizing keyword on its `width` style
 /// (`min-content`, `max-content`, `fit-content`, `fit-content(...)`, `stretch`) resolved
 /// into the available space or known width the box is measured with.
@@ -1045,6 +1064,41 @@ fn inline_box_inputs(
 }
 
 impl LayoutPassState<'_> {
+    fn inline_box_inputs_for_child(
+        &self,
+        child_node_id: NodeId,
+        scale: f32,
+        width_style: taffy::Dimension,
+        margin: taffy::Rect<f32>,
+        padding: taffy::Rect<f32>,
+        border: taffy::Rect<f32>,
+        child_inputs: LayoutInput,
+    ) -> LayoutInput {
+        let mut inputs = inline_box_inputs(width_style, margin, child_inputs);
+        if !width_style.is_auto() {
+            return inputs;
+        }
+        let Some(max_content_inline_size) = self.nodes[child_node_id]
+            .element_data()
+            .and_then(|element| element.inline_layout_data.as_ref())
+            .map(|layout| layout.layout.calculate_content_widths().max / scale)
+        else {
+            return inputs;
+        };
+        let natural = max_content_inline_size
+            + padding.horizontal_axis_sum()
+            + border.horizontal_axis_sum();
+        let fits = match inputs.available_space.width {
+            taffy::AvailableSpace::MinContent => false,
+            taffy::AvailableSpace::MaxContent => true,
+            taffy::AvailableSpace::Definite(limit) => natural <= limit,
+        };
+        if fits {
+            inputs.known_dimensions.width = Some(natural + INLINE_BOX_MAX_CONTENT_CUSHION);
+        }
+        inputs
+    }
+
     pub(crate) fn compute_inline_layout(
         &mut self,
         node_id: NodeId,
@@ -1498,7 +1552,14 @@ impl LayoutPassState<'_> {
                         let max_content_border_box = output.size.width
                             + (max_content_inline_size - current_content_size).max(0.0);
                         if max_content_border_box > output.size.width {
-                            child_inputs.known_dimensions.width = Some(max_content_border_box);
+                            // The first measurement may have used advances from the
+                            // previous scale. Give the refreshed max-content width a
+                            // subpixel cushion: the line breaker compares accumulated
+                            // advances with this limit, and exact equality can otherwise
+                            // split the atom into two lines at some DPI/zoom products.
+                            child_inputs.known_dimensions.width = Some(
+                                max_content_border_box + INLINE_BOX_MAX_CONTENT_CUSHION,
+                            );
                             output = self.compute_child_layout(
                                 crate::taffy_node_id(child_node_id),
                                 child_inputs,
@@ -1611,6 +1672,10 @@ impl LayoutPassState<'_> {
         }
 
         // Update inline boxes
+        #[cfg(feature = "writing-mode")]
+        let parent_vertical = self.layout_wm_of(node_id).is_vertical();
+        #[cfg(not(feature = "writing-mode"))]
+        let parent_vertical = false;
         for ibox in inline_layout.layout.inline_boxes_mut() {
             if matches!(
                 ibox.kind,
@@ -1625,6 +1690,12 @@ impl LayoutPassState<'_> {
             let style = self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
             let margin = style
                 .margin()
+                .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+            let padding = style
+                .padding()
+                .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+            let border = style
+                .border()
                 .resolve_or_zero(inputs.parent_size, resolve_calc_value);
 
             #[cfg(feature = "floats")]
@@ -1661,7 +1732,17 @@ impl LayoutPassState<'_> {
             let exports_baseline = !(baseline_source == BaselineSource::Auto
                 && is_block_axis_scroll_container)
                 && !contain_layout;
-            let box_inputs = inline_box_inputs(style.size().width, margin, child_inputs);
+            let auto_inline_size = style.size().width.is_auto();
+            let inline_insets = padding.horizontal_axis_sum() + border.horizontal_axis_sum();
+            let box_inputs = self.inline_box_inputs_for_child(
+                NodeId::from_u64(ibox.id),
+                scale,
+                style.size().width,
+                margin,
+                padding,
+                border,
+                child_inputs,
+            );
             drop(style);
 
             if is_out_of_flow || is_floated {
@@ -1669,8 +1750,29 @@ impl LayoutPassState<'_> {
                 ibox.height = 0.0;
                 ibox.baseline = None;
             } else {
-                let output = self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
-                ibox.width = (margin.left + margin.right + output.size.width) * scale;
+                let mut box_inputs = box_inputs;
+                let mut output =
+                    self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
+                if auto_inline_size {
+                    let refreshed = self.nodes[NodeId::from_u64(ibox.id)]
+                        .element_data()
+                        .and_then(|element| element.inline_layout_data.as_ref())
+                        .map(|layout| layout.layout.calculate_content_widths().max / scale);
+                    if let Some(max_content_inline_size) = refreshed {
+                        let natural = max_content_inline_size + inline_insets;
+                        let fits = match box_inputs.available_space.width {
+                            taffy::AvailableSpace::MinContent => false,
+                            taffy::AvailableSpace::MaxContent => true,
+                            taffy::AvailableSpace::Definite(limit) => natural <= limit,
+                        };
+                        if fits && natural > output.size.width {
+                            box_inputs.known_dimensions.width =
+                                Some(natural + INLINE_BOX_MAX_CONTENT_CUSHION);
+                            output =
+                                self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
+                        }
+                    }
+                }
                 ibox.baseline = if exports_baseline {
                     let baseline = if uses_last_baseline {
                         output.baselines.last.or(output.baselines.first)
@@ -1687,6 +1789,18 @@ impl LayoutPassState<'_> {
                     })
                 } else {
                     None
+                };
+                let advance = (margin.left + margin.right + output.size.width) * scale;
+                ibox.width = if parent_vertical
+                    && ibox.kind == parley::InlineBoxKind::InFlow
+                    && ibox.baseline.is_some()
+                {
+                    // The child's border box is rounded independently when it is
+                    // finalized. Keep one whole physical pixel beyond the rounded
+                    // inline extent so the following glyph cannot sit under it.
+                    advance.ceil() + 1.0
+                } else {
+                    advance
                 };
                 // Vertical margins adjust the space the box reserves in the line. A box with a
                 // baseline splits that space into ascent (`margin.top + baseline`) and descent
@@ -2567,7 +2681,15 @@ impl LayoutPassState<'_> {
                             .bottom
                             .maybe_resolve(container_content_size.height, resolve_calc_value),
                     };
-                    let box_inputs = inline_box_inputs(style.size().width, margin, child_inputs);
+                    let box_inputs = self.inline_box_inputs_for_child(
+                        NodeId::from_u64(ibox.id),
+                        scale,
+                        style.size().width,
+                        margin,
+                        padding,
+                        border,
+                        child_inputs,
+                    );
                     drop(style);
 
                     if is_absolute {
@@ -2640,6 +2762,8 @@ impl LayoutPassState<'_> {
                         let mut output =
                             self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
                         let size = output.size;
+                        #[cfg(feature = "writing-mode")]
+                        let vertical = self.layout_wm_of(node_id).is_vertical();
                         let node = &mut self.nodes[NodeId::from_u64(ibox.id)];
 
                         let is_relative = position == taffy::Position::Relative;
@@ -2663,8 +2787,30 @@ impl LayoutPassState<'_> {
                             (ibox.x / scale) + margin.left + container_pb.left + inset_offset.x;
                         // Parley positions the margin box; offset to the border box even
                         // when a negative top margin makes it extend above the margin box.
+                        #[cfg(feature = "writing-mode")]
+                        let margin_box_block_offset =
+                            // A vertical line's block axis is its column axis. Atomic
+                            // inline baselines are horizontal metrics, so center the
+                            // margin box in that line instead of using the baseline as
+                            // a block-axis offset.
+                            if vertical
+                                && ibox.kind == parley::InlineBoxKind::InFlow
+                                && ibox.baseline.is_some()
+                            {
+                                let line_start = line.metrics().block_min_coord / scale;
+                                let line_box_height = (line.metrics().block_max_coord
+                                    - line.metrics().block_min_coord)
+                                    / scale;
+                                let margin_box_height =
+                                    margin.top + layout.size.height + margin.bottom;
+                                line_start + (line_box_height - margin_box_height) * 0.5
+                            } else {
+                                ibox.y / scale
+                            };
+                        #[cfg(not(feature = "writing-mode"))]
+                        let margin_box_block_offset = ibox.y / scale;
                         layout.location.y =
-                            (ibox.y / scale) + margin.top + line_box_top + inset_offset.y;
+                            margin_box_block_offset + margin.top + line_box_top + inset_offset.y;
                         layout.padding = padding; //.map(|p| p / scale);
                         layout.border = border; //.map(|p| p / scale);
                         layout.margin = margin;
