@@ -116,6 +116,8 @@ impl BaseDocument {
         // Next we resolve layout with the data resolved by stlist
         self.resolve_layout();
         timer.record_time("layout");
+        crate::layout::margin::resolve_margin_notes(self);
+        timer.record_time("margin_notes");
         self.nodes.bump_geometry_generation();
 
         // Resolve transforms

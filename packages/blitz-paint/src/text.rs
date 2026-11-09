@@ -2102,6 +2102,133 @@ pub(crate) fn stroke_interline_notes(
     );
 }
 
+pub(crate) fn stroke_margin_note_group(
+    scene: &mut impl PaintScene,
+    group: &blitz_dom::node::MarginNoteGroup,
+    doc: &BaseDocument,
+    transform: Affine,
+    scale: f64,
+    inline_root_id: NodeId,
+    cull_rect: Rect,
+    context: &mut DrawTextContext,
+) {
+    let Some(styles) = doc
+        .get_node(group.node_id)
+        .and_then(|node| node.primary_styles())
+    else {
+        return;
+    };
+    let current_color = styles.clone_color();
+    let background = styles
+        .get_background()
+        .background_color
+        .resolve_to_absolute(&current_color)
+        .as_srgb_color();
+    let border = styles.get_border();
+    let local_border = Rect::new(
+        f64::from(group.border_box.left - group.content_box.left) * scale,
+        f64::from(group.border_box.top - group.content_box.top) * scale,
+        f64::from(group.border_box.right - group.content_box.left) * scale,
+        f64::from(group.border_box.bottom - group.content_box.top) * scale,
+    );
+    if background.components[3] > 0.0 {
+        scene.fill(Fill::NonZero, transform, background, None, &local_border);
+    }
+
+    let widths = [
+        (group.border_box.top - group.padding_box.top).max(0.0),
+        (group.border_box.right - group.padding_box.right).max(0.0),
+        (group.border_box.bottom - group.padding_box.bottom).max(0.0),
+        (group.border_box.left - group.padding_box.left).max(0.0),
+    ];
+    let resolve = |color: &style::values::computed::Color| {
+        color.resolve_to_absolute(&current_color).as_srgb_color()
+    };
+    draw_inline_note_border_side(
+        scene,
+        transform,
+        border.border_top_style,
+        resolve(&border.border_top_color),
+        NoteBorderSide::Top,
+        widths[0],
+        Rect::new(
+            local_border.x0,
+            local_border.y0,
+            local_border.x1,
+            local_border.y0 + f64::from(widths[0]) * scale,
+        ),
+    );
+    draw_inline_note_border_side(
+        scene,
+        transform,
+        border.border_right_style,
+        resolve(&border.border_right_color),
+        NoteBorderSide::Right,
+        widths[1],
+        Rect::new(
+            local_border.x1 - f64::from(widths[1]) * scale,
+            local_border.y0,
+            local_border.x1,
+            local_border.y1,
+        ),
+    );
+    draw_inline_note_border_side(
+        scene,
+        transform,
+        border.border_bottom_style,
+        resolve(&border.border_bottom_color),
+        NoteBorderSide::Bottom,
+        widths[2],
+        Rect::new(
+            local_border.x0,
+            local_border.y1 - f64::from(widths[2]) * scale,
+            local_border.x1,
+            local_border.y1,
+        ),
+    );
+    draw_inline_note_border_side(
+        scene,
+        transform,
+        border.border_left_style,
+        resolve(&border.border_left_color),
+        NoteBorderSide::Left,
+        widths[3],
+        Rect::new(
+            local_border.x0,
+            local_border.y0,
+            local_border.x0 + f64::from(widths[3]) * scale,
+            local_border.y1,
+        ),
+    );
+
+    #[cfg(feature = "writing-mode")]
+    let vertical = vertical_text(doc, inline_root_id, scale);
+    #[cfg(not(feature = "writing-mode"))]
+    let vertical: Option<VerticalTextPaint> = None;
+
+    draw_inline_backgrounds(
+        scene,
+        group.layout.lines(),
+        doc,
+        transform,
+        inline_root_id,
+        vertical.as_ref(),
+    );
+    stroke_text_with_data(
+        scene,
+        group.layout.lines(),
+        doc,
+        transform,
+        scale,
+        inline_root_id,
+        cull_rect,
+        &group.text,
+        &group.ruby_ranges,
+        &group.emphasis_ranges,
+        context,
+    );
+}
+
 fn draw_inline_note_box_background(
     scene: &mut impl PaintScene,
     source: &InlineNoteSource,

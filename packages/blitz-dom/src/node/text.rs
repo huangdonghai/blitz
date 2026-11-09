@@ -42,6 +42,10 @@ pub struct TextLayout {
     pub interline_lines: Vec<InterlineLine>,
     /// Extra block-axis offset of each body line, in CSS pixels.
     pub line_block_offsets: Vec<f32>,
+    /// Margin-note declarations found in this inline formatting context.
+    pub margin_anchors: Vec<MarginNoteAnchor>,
+    /// Laid-out margin-note groups painted with this inline root.
+    pub margin_note_groups: Vec<MarginNoteGroup>,
     /// Block-axis offset (in CSS px) of the line boxes from the top of the container's content
     /// box, as applied by `align-content`.
     pub block_offset: f32,
@@ -269,6 +273,50 @@ pub struct InterlinePart {
     pub inline_offset: f32,
     /// Natural inline advance of the part in CSS pixels.
     pub advance: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MarginNoteSide {
+    InlineStart,
+    InlineEnd,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MarginNoteAnchor {
+    pub node_id: NodeId,
+    /// Body line whose block-start the note group aligns to.
+    pub line_index: usize,
+    /// Scan order within the block, used to break ties on the same line.
+    pub order: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MarginNoteRect {
+    pub left: f32,
+    pub top: f32,
+    pub right: f32,
+    pub bottom: f32,
+}
+
+#[derive(Clone)]
+pub struct MarginNoteGroup {
+    pub node_id: NodeId,
+    pub side: MarginNoteSide,
+    pub text: String,
+    pub layout: parley::layout::Layout<TextBrush>,
+    pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    pub emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
+    /// Physical translation from the inline root's content origin to the note's
+    /// content box, in CSS pixels along the root's inline axis.
+    pub inline_dx: f32,
+    pub inline_dy: f32,
+    /// Content box in page coordinates, in CSS pixels.
+    pub content_box: MarginNoteRect,
+    pub padding_box: MarginNoteRect,
+    pub border_box: MarginNoteRect,
+    pub margin_box: MarginNoteRect,
+    pub content_inline_extent: f32,
+    pub content_block_extent: f32,
 }
 
 impl InlineNoteFragment {

@@ -81,6 +81,16 @@ fn interline_marker_id(index: usize) -> u64 {
     u64::MAX - index as u64
 }
 
+fn is_margin_note_node(nodes: &crate::NodeTree, id: u64) -> bool {
+    nodes
+        .get(NodeId::from_u64(id))
+        .and_then(|note| note.primary_styles())
+        .is_some_and(|style| {
+            style.clone__hutu_note_placement()
+                == stylo_to_parley::stylo::HutuNotePlacement::Margin
+        })
+}
+
 fn interline_line_parts(
     stream: &InterlineNoteStream,
     line: parley::Line<'_, crate::node::TextBrush>,
@@ -1218,7 +1228,7 @@ impl LayoutPassState<'_> {
         inputs
     }
 
-    fn measure_inline_boxes_in_layout(
+    pub(crate) fn measure_inline_boxes_in_layout(
         &mut self,
         layout: &mut parley::layout::Layout<crate::node::TextBrush>,
         inputs: LayoutInput,
@@ -1359,8 +1369,39 @@ impl LayoutPassState<'_> {
         }
     }
 
+    pub(crate) fn measure_margin_note_layout(
+        &mut self,
+        layout: &mut parley::layout::Layout<crate::node::TextBrush>,
+        inline_extent: f32,
+        scale: f32,
+        vertical: bool,
+    ) {
+        let extent = (inline_extent * scale).max(0.0);
+        let available_space = Size {
+            width: AvailableSpace::Definite(extent),
+            height: AvailableSpace::MaxContent,
+        };
+        let inputs = LayoutInput {
+            run_mode: RunMode::PerformLayout,
+            sizing_mode: SizingMode::InherentSize,
+            axis: RequestedAxis::Horizontal,
+            known_dimensions: Size::NONE,
+            known_dimensions_are_definite: Size {
+                width: false,
+                height: false,
+            },
+            parent_size: Size {
+                width: Some(extent),
+                height: None,
+            },
+            available_space,
+            vertical_margins_are_collapsible: taffy::Line::FALSE,
+        };
+        self.measure_inline_boxes_in_layout(layout, inputs, inputs, scale, vertical);
+    }
+
     #[allow(clippy::too_many_arguments)]
-    fn place_inline_boxes_in_layout(
+    pub(crate) fn place_inline_boxes_in_layout(
         &mut self,
         layout: &parley::layout::Layout<crate::node::TextBrush>,
         parent_size: Size<Option<f32>>,
@@ -2751,6 +2792,75 @@ impl LayoutPassState<'_> {
             };
         }
 
+        let mut margin_anchors = Vec::new();
+        let mut margin_anchor_order = 0u32;
+        let mut margin_anchor_seen = std::collections::HashSet::new();
+        {
+            let body_lines = inline_layout.layout.lines().collect::<Vec<_>>();
+            for (line_index, line) in body_lines.iter().enumerate() {
+                for item in line.items() {
+                    let parley::PositionedLayoutItem::InlineBox(inline_box) = item else {
+                        continue;
+                    };
+                    if inline_box.kind == parley::InlineBoxKind::Anchor
+                        && is_margin_note_node(&self.nodes, inline_box.id)
+                    {
+                        let node_id = NodeId::from_u64(inline_box.id);
+                        if margin_anchor_seen.insert(node_id) {
+                            margin_anchors.push(crate::node::MarginNoteAnchor {
+                                node_id,
+                                line_index,
+                                order: margin_anchor_order,
+                            });
+                            margin_anchor_order += 1;
+                        }
+                        continue;
+                    }
+                    if inline_box.kind != parley::InlineBoxKind::CustomInFlowCentered {
+                        continue;
+                    }
+                    let Some(Some(fragment)) =
+                        inline_layout.inline_note_fragments.get(inline_box.index)
+                    else {
+                        continue;
+                    };
+                    let Some(source) = inline_layout.inline_notes.get(fragment.source_index) else {
+                        continue;
+                    };
+                    let Some(segment) = source.segments.get(fragment.segment_index) else {
+                        continue;
+                    };
+                    let box_ids = source
+                        .layout
+                        .inline_boxes()
+                        .map(|inline_box| inline_box.id)
+                        .collect::<Vec<_>>();
+                    for unit_range in [&fragment.first_unit_range, &fragment.second_unit_range] {
+                        for unit_index in unit_range.clone() {
+                            let Some(box_index) = segment.units[unit_index].inline_box_index else {
+                                continue;
+                            };
+                            let Some(&box_id) = box_ids.get(box_index) else {
+                                continue;
+                            };
+                            if !is_margin_note_node(&self.nodes, box_id) {
+                                continue;
+                            }
+                            let node_id = NodeId::from_u64(box_id);
+                            if margin_anchor_seen.insert(node_id) {
+                                margin_anchors.push(crate::node::MarginNoteAnchor {
+                                    node_id,
+                                    line_index,
+                                    order: margin_anchor_order,
+                                });
+                                margin_anchor_order += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if let Some(mut stream) = inline_layout.interline.take() {
             self.measure_inline_boxes_in_layout(
                 &mut stream.layout,
@@ -3013,6 +3123,27 @@ impl LayoutPassState<'_> {
                     current_slot += 1;
                 }
                 slot_of_line.truncate(stream.layout.len());
+                for (line_index, line) in stream.layout.lines().enumerate() {
+                    for item in line.items() {
+                        let parley::PositionedLayoutItem::InlineBox(inline_box) = item else {
+                            continue;
+                        };
+                        if inline_box.kind != parley::InlineBoxKind::Anchor
+                            || !is_margin_note_node(&self.nodes, inline_box.id)
+                        {
+                            continue;
+                        }
+                        let node_id = NodeId::from_u64(inline_box.id);
+                        if margin_anchor_seen.insert(node_id) {
+                            margin_anchors.push(crate::node::MarginNoteAnchor {
+                                node_id,
+                                line_index: slot_of_line[line_index],
+                                order: margin_anchor_order,
+                            });
+                            margin_anchor_order += 1;
+                        }
+                    }
+                }
 
                 let note_alignment = if alignment == parley::layout::Alignment::Justify {
                     parley::layout::Alignment::Justify
@@ -3136,6 +3267,9 @@ impl LayoutPassState<'_> {
                 height = new_height;
             }
         }
+
+        inline_layout.margin_anchors = margin_anchors;
+        inline_layout.margin_note_groups.clear();
 
         // Note: `width` and `height` are content-box measurements of the inline content.
         // `known_dimensions` must not be substituted in here: those are border-box sizes, and

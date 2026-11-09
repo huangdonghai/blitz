@@ -1450,6 +1450,23 @@ impl ElementCx<'_, '_> {
                 self.local_cull_rect(transform),
                 &mut draw_text_context,
             );
+            for group in &text_layout.margin_note_groups {
+                let note_transform = transform
+                    * Affine::translate((
+                        f64::from(group.inline_dx) * self.scale,
+                        f64::from(group.inline_dy) * self.scale,
+                    ));
+                crate::text::stroke_margin_note_group(
+                    scene,
+                    group,
+                    self.context.dom,
+                    note_transform,
+                    self.scale,
+                    self.node.id,
+                    self.local_cull_rect(note_transform),
+                    &mut draw_text_context,
+                );
+            }
         }
     }
 

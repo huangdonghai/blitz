@@ -8,10 +8,11 @@ use crate::node::TextBrush;
 
 // Module of type aliases so we can refer to stylo types with nicer names
 pub(crate) mod stylo {
+    pub(crate) use style::computed_values::_hutu_note_placement::T as HutuNotePlacement;
+    pub(crate) use style::computed_values::_hutu_note_side::T as HutuNoteSide;
     pub(crate) use style::computed_values::direction::T as Direction;
     pub(crate) use style::computed_values::font_variant_caps::T as FontVariantCaps;
     pub(crate) use style::computed_values::font_variant_position::T as FontVariantPosition;
-    pub(crate) use style::computed_values::_hutu_note_placement::T as HutuNotePlacement;
     pub(crate) use style::computed_values::text_combine_upright::T as TextCombineUpright;
     pub(crate) use style::computed_values::text_orientation::T as TextOrientation;
     pub(crate) use style::computed_values::text_wrap_mode::T as TextWrapMode;

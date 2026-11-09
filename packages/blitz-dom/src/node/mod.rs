@@ -28,8 +28,9 @@ pub use stylo_data::ComputedStyleRef;
 #[cfg(feature = "svg")]
 pub use svg::{SvgImageData, SvgIntrinsicDimensions};
 pub use text::{
-    GeneratedTextInputEvent, InlineNoteBoxEdges, InlineNoteFragment, InterlineAnchor,
-    InterlineLine, InterlineNoteSource, InterlineNoteStream, InterlinePart, InlineNoteSegment,
-    InlineNoteRunSpan, InlineNoteSource, InlineNoteUnit, TextBrush, TextInputData, TextLayout,
-    TextOrientation, VerticalTextPaint,
+    GeneratedTextInputEvent, InlineNoteBoxEdges, InlineNoteFragment, InlineNoteRunSpan,
+    InlineNoteSegment, InlineNoteSource, InlineNoteUnit, InterlineAnchor, InterlineLine,
+    InterlineNoteSource, InterlineNoteStream, InterlinePart, MarginNoteAnchor, MarginNoteGroup,
+    MarginNoteRect, MarginNoteSide, TextBrush, TextInputData, TextLayout, TextOrientation,
+    VerticalTextPaint,
 };

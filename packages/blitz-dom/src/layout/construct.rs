@@ -1087,6 +1087,17 @@ fn collect_inline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeI
 
         let is_ruby_text = matches!(&*element.name.local, "rt" | "rtc");
         let in_ruby = inside_ruby || is_ruby_text;
+        if !in_ruby
+            && node.primary_styles().is_some_and(|style| {
+                matches!(
+                    style.clone__hutu_note_placement(),
+                    stylo_to_parley::stylo::HutuNotePlacement::Margin
+                        | stylo_to_parley::stylo::HutuNotePlacement::Interline
+                )
+            })
+        {
+            return;
+        }
         let is_inline_note = !in_ruby
             && node.primary_styles().is_some_and(|style| {
                 style.clone__hutu_note_placement()
@@ -1120,6 +1131,20 @@ fn collect_inline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeI
         walk(nodes, after, false, &mut notes);
     }
     notes
+}
+
+fn is_inside_ruby(nodes: &crate::NodeTree, node_id: NodeId) -> bool {
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let node = &nodes[id];
+        if node.element_data().is_some_and(|element| {
+            matches!(&*element.name.local, "rt" | "rtc")
+        }) {
+            return true;
+        }
+        current = node.parent;
+    }
+    false
 }
 
 fn collect_interline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeId> {
@@ -1157,6 +1182,9 @@ fn collect_interline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<No
         let placement = node
             .primary_styles()
             .map(|style| style.clone__hutu_note_placement());
+        if !in_ruby && placement == Some(stylo_to_parley::stylo::HutuNotePlacement::Margin) {
+            return;
+        }
         if !in_ruby && placement == Some(stylo_to_parley::stylo::HutuNotePlacement::Interline) {
             notes.push(node_id);
             return;
@@ -1627,6 +1655,8 @@ pub(crate) fn build_inline_layout_into(
             Some(note_node_id),
             &[],
             None,
+            None,
+            None,
         );
         if note_layout.text.is_empty() && note_layout.layout.inline_boxes().len() == 0 {
             continue;
@@ -1722,6 +1752,8 @@ pub(crate) fn build_inline_layout_into(
             None,
             &[],
             Some(&interline_nodes),
+            None,
+            None,
         );
         #[cfg(feature = "writing-mode")]
         {
@@ -1839,6 +1871,8 @@ pub(crate) fn build_inline_layout_into(
         None,
         &inline_notes,
         None,
+        None,
+        None,
     );
     let mut assigned = std::collections::HashSet::new();
     let source_intrinsics: std::collections::HashMap<_, _> = inline_notes
@@ -1871,6 +1905,32 @@ pub(crate) fn build_inline_layout_into(
     text_layout.inline_note_fragments = vec![None; text_layout.layout.inline_boxes().len()];
 }
 
+pub(crate) fn build_margin_note_content_layout(
+    nodes: &crate::NodeTree,
+    layout_ctx: &mut LayoutContext<TextBrush>,
+    font_ctx: &mut FontContext,
+    note_node_id: NodeId,
+    scale: f32,
+    vertical: bool,
+    base_direction: parley::BaseDirection,
+) -> TextLayout {
+    let mut text_layout = TextLayout::default();
+    build_inline_layout_into_inner(
+        nodes,
+        layout_ctx,
+        font_ctx,
+        &mut text_layout,
+        scale,
+        note_node_id,
+        Some(note_node_id),
+        &[],
+        None,
+        Some(vertical),
+        Some(base_direction),
+    );
+    text_layout
+}
+
 fn build_inline_layout_into_inner(
     nodes: &crate::NodeTree,
     layout_ctx: &mut LayoutContext<TextBrush>,
@@ -1881,6 +1941,8 @@ fn build_inline_layout_into_inner(
     note_root: Option<NodeId>,
     note_sources: &[crate::node::InlineNoteSource],
     interline_note_nodes: Option<&[NodeId]>,
+    forced_vertical: Option<bool>,
+    forced_base_direction: Option<parley::BaseDirection>,
 ) {
     // Get the inline context's root node's text styles
     let root_node = &nodes[inline_context_root_node_id];
@@ -1911,7 +1973,9 @@ fn build_inline_layout_into_inner(
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
-    if let Some(style) = context_root_style.as_deref() {
+    if let Some(base_direction) = forced_base_direction {
+        builder.set_base_direction(base_direction);
+    } else if let Some(style) = context_root_style.as_deref() {
         builder.set_base_direction(stylo_to_parley::base_direction(
             style.clone_direction(),
             style.clone_unicode_bidi(),
@@ -2003,7 +2067,7 @@ fn build_inline_layout_into_inner(
             scale,
             note_root,
             note_sources,
-            None,
+            forced_vertical,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -2017,7 +2081,7 @@ fn build_inline_layout_into_inner(
             scale,
             note_root,
             note_sources,
-            None,
+            forced_vertical,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -2031,7 +2095,7 @@ fn build_inline_layout_into_inner(
             scale,
             note_root,
             note_sources,
-            None,
+            forced_vertical,
         );
     }
 
@@ -2102,6 +2166,61 @@ fn build_inline_layout_into_inner(
                         == stylo_to_parley::stylo::HutuNotePlacement::Inline
                 })
         });
+        let note_root_is_interline = note_root.is_some_and(|root| {
+            nodes[root].primary_styles().is_some_and(|style| {
+                style.clone__hutu_note_placement()
+                    == stylo_to_parley::stylo::HutuNotePlacement::Interline
+            })
+        });
+        let is_margin_note = style.is_some_and(|style| {
+            style.clone__hutu_note_placement() == stylo_to_parley::stylo::HutuNotePlacement::Margin
+        }) && !is_inside_ruby(nodes, node_id);
+        let is_hidden = style.is_some_and(|style| {
+            let display = style.clone_display();
+            matches!(display.inside(), DisplayInside::None)
+                || matches!(display.outside(), DisplayOutside::None)
+        });
+        if is_margin_note && is_hidden {
+            return;
+        }
+        if is_margin_note {
+            if note_root.is_none() {
+                builder.push_inline_box(InlineBox {
+                    id: node_id.as_u64(),
+                    kind: InlineBoxKind::Anchor,
+                    index: 0,
+                    width: 0.0,
+                    height: 0.0,
+                    baseline: None,
+                    vertical_align: parley::VerticalAlign::BASELINE,
+                });
+                return;
+            }
+            if inside_inline_note {
+                builder.push_inline_box(InlineBox {
+                    id: node_id.as_u64(),
+                    kind: InlineBoxKind::InlineEdge,
+                    index: 0,
+                    width: 0.0,
+                    height: 0.0,
+                    baseline: None,
+                    vertical_align: parley::VerticalAlign::BASELINE,
+                });
+                return;
+            }
+            if note_root_is_interline {
+                builder.push_inline_box(InlineBox {
+                    id: node_id.as_u64(),
+                    kind: InlineBoxKind::Anchor,
+                    index: 0,
+                    width: 0.0,
+                    height: 0.0,
+                    baseline: None,
+                    vertical_align: parley::VerticalAlign::BASELINE,
+                });
+                return;
+            }
+        }
         if inside_inline_note
             && style.is_some_and(|style| {
                 style.clone__hutu_note_placement()
