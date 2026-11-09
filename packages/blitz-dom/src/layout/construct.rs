@@ -1073,12 +1073,7 @@ fn emphasis_char(styles: &style::properties::ComputedValues) -> Option<char> {
 }
 
 fn collect_inline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeId> {
-    fn walk(
-        nodes: &crate::NodeTree,
-        node_id: NodeId,
-        inside_ruby: bool,
-        notes: &mut Vec<NodeId>,
-    ) {
+    fn walk(nodes: &crate::NodeTree, node_id: NodeId, inside_ruby: bool, notes: &mut Vec<NodeId>) {
         let node = &nodes[node_id];
         let Some(element) = node.element_data() else {
             return;
@@ -1125,6 +1120,89 @@ fn collect_inline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeI
         walk(nodes, after, false, &mut notes);
     }
     notes
+}
+
+fn collect_interline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeId> {
+    fn walk(
+        nodes: &crate::NodeTree,
+        node_id: NodeId,
+        inside_ruby: bool,
+        inside_inline_note: bool,
+        notes: &mut Vec<NodeId>,
+    ) {
+        let node = &nodes[node_id];
+        let Some(element) = node.element_data() else {
+            return;
+        };
+        if let Some(display) = node.display_style()
+            && matches!(display.outside(), DisplayOutside::None)
+            && matches!(display.inside(), DisplayInside::None)
+        {
+            return;
+        }
+        if let Some(display) = node.display_style()
+            && !matches!(display.outside(), DisplayOutside::Inline)
+        {
+            return;
+        }
+        if node
+            .element_data()
+            .is_some_and(|element| is_inline_box_element(&element.name.local))
+        {
+            return;
+        }
+
+        let is_ruby_text = matches!(&*element.name.local, "rt" | "rtc");
+        let in_ruby = inside_ruby || is_ruby_text;
+        let placement = node
+            .primary_styles()
+            .map(|style| style.clone__hutu_note_placement());
+        if !in_ruby && placement == Some(stylo_to_parley::stylo::HutuNotePlacement::Interline) {
+            notes.push(node_id);
+            return;
+        }
+        if inside_inline_note
+            && !in_ruby
+            && placement == Some(stylo_to_parley::stylo::HutuNotePlacement::Inline)
+        {
+            return;
+        }
+        let in_inline_note = inside_inline_note
+            || (!in_ruby
+                && placement == Some(stylo_to_parley::stylo::HutuNotePlacement::Inline));
+
+        if let Some(before) = node.before() {
+            walk(nodes, before, in_ruby, in_inline_note, notes);
+        }
+        for child in node.children.iter().copied() {
+            walk(nodes, child, in_ruby, in_inline_note, notes);
+        }
+        if let Some(after) = node.after() {
+            walk(nodes, after, in_ruby, in_inline_note, notes);
+        }
+    }
+
+    let mut notes = Vec::new();
+    let node = &nodes[root];
+    if let Some(before) = node.before() {
+        walk(nodes, before, false, false, &mut notes);
+    }
+    for child in node.children.iter().copied() {
+        walk(nodes, child, false, false, &mut notes);
+    }
+    if let Some(after) = node.after() {
+        walk(nodes, after, false, false, &mut notes);
+    }
+    notes
+}
+
+fn interline_marker_id(index: usize) -> u64 {
+    u64::MAX - index as u64
+}
+
+fn interline_marker_index(id: u64, count: usize) -> Option<usize> {
+    let index = u64::MAX.checked_sub(id)? as usize;
+    (index <= count).then_some(index)
 }
 
 pub(crate) fn inline_note_segments(
@@ -1528,6 +1606,7 @@ pub(crate) fn build_inline_layout_into(
             note_node_id,
             Some(note_node_id),
             &[],
+            None,
         );
         if note_layout.text.is_empty() && note_layout.layout.inline_boxes().len() == 0 {
             continue;
@@ -1610,6 +1689,124 @@ pub(crate) fn build_inline_layout_into(
         });
     }
 
+    let interline_nodes = collect_interline_note_nodes(nodes, inline_context_root_node_id);
+    if !interline_nodes.is_empty() {
+        let mut stream_layout = TextLayout::default();
+        build_inline_layout_into_inner(
+            nodes,
+            layout_ctx,
+            font_ctx,
+            &mut stream_layout,
+            scale,
+            inline_context_root_node_id,
+            None,
+            &[],
+            Some(&interline_nodes),
+        );
+        #[cfg(feature = "writing-mode")]
+        {
+            let body_node = &nodes[inline_context_root_node_id];
+            let writing_mode = body_node.writing_mode();
+            stream_layout.layout.set_vertical(writing_mode.is_vertical());
+            if writing_mode.is_vertical() {
+                let orientation = body_node
+                    .primary_styles()
+                    .map(|style| {
+                        stylo_to_parley::text_orientation(style.clone_text_orientation())
+                    })
+                    .unwrap_or(parley::TextOrientation::Mixed);
+                stream_layout
+                    .layout
+                    .set_vertical_advances(&stream_layout.text, orientation);
+            }
+        }
+        stream_layout
+            .layout
+            .clear_advances(&stream_layout.text, &stream_layout.ruby_ranges);
+
+        let mut marker_text_indices = vec![None; interline_nodes.len() + 1];
+        let mut content_boxes = Vec::new();
+        for inline_box in stream_layout.layout.inline_boxes() {
+            if let Some(marker) = interline_marker_index(inline_box.id, interline_nodes.len()) {
+                marker_text_indices[marker] = Some(inline_box.index);
+            } else if matches!(
+                inline_box.kind,
+                InlineBoxKind::InFlow | InlineBoxKind::CustomInFlowCentered
+            ) {
+                content_boxes.push(inline_box.index);
+            }
+        }
+        for index in &mut marker_text_indices {
+            if index.is_none() {
+                *index = Some(stream_layout.text.len());
+            }
+        }
+        let marker_text_indices = marker_text_indices
+            .into_iter()
+            .map(Option::unwrap)
+            .collect::<Vec<_>>();
+        let mut sources = Vec::with_capacity(interline_nodes.len());
+        for (source_index, note_node_id) in interline_nodes.iter().copied().enumerate() {
+            let text_range = marker_text_indices[source_index]..marker_text_indices[source_index + 1];
+            let note_style = nodes[note_node_id].primary_styles();
+            let font_size = note_style
+                .as_ref()
+                .map(|style| style.get_font().font_size.computed_size().px() * scale)
+                .unwrap_or(0.0);
+            let strut_line_height = note_style
+                .as_ref()
+                .map(|style| {
+                    let font_size_css = style.get_font().font_size.computed_size().px();
+                    let line_height = match style.get_font().line_height {
+                        stylo_to_parley::stylo::LineHeight::Normal => font_size_css * 1.2,
+                        stylo_to_parley::stylo::LineHeight::Number(number) => {
+                            font_size_css * number.0
+                        }
+                        stylo_to_parley::stylo::LineHeight::Length(length) => length.0.px(),
+                    };
+                    line_height * scale
+                })
+                .unwrap_or(font_size * 1.2);
+            let active = !text_range.is_empty()
+                || content_boxes
+                    .iter()
+                    .any(|index| text_range.contains(index));
+            #[cfg(feature = "writing-mode")]
+            let vertical_text_orientation = nodes[inline_context_root_node_id]
+                .writing_mode()
+                .is_vertical()
+                .then(|| {
+                    nodes[inline_context_root_node_id]
+                        .primary_styles()
+                        .map(|style| {
+                            stylo_to_parley::text_orientation(style.clone_text_orientation())
+                        })
+                        .unwrap_or(parley::TextOrientation::Mixed)
+                });
+            #[cfg(not(feature = "writing-mode"))]
+            let vertical_text_orientation = None;
+            sources.push(crate::node::InterlineNoteSource {
+                node_id: note_node_id,
+                text_range,
+                active,
+                strut_line_height,
+                strut_over: strut_line_height,
+                strut_under: 0.0,
+                font_size,
+                vertical_text_orientation,
+            });
+        }
+        if sources.iter().any(|source| source.active) {
+            text_layout.interline = Some(crate::node::InterlineNoteStream {
+                text: stream_layout.text,
+                layout: stream_layout.layout,
+                ruby_ranges: stream_layout.ruby_ranges,
+                emphasis_ranges: stream_layout.emphasis_ranges,
+                sources,
+            });
+        }
+    }
+
     build_inline_layout_into_inner(
         nodes,
         layout_ctx,
@@ -1619,6 +1816,7 @@ pub(crate) fn build_inline_layout_into(
         inline_context_root_node_id,
         None,
         &inline_notes,
+        None,
     );
     let mut assigned = std::collections::HashSet::new();
     let source_intrinsics: std::collections::HashMap<_, _> = inline_notes
@@ -1660,14 +1858,23 @@ fn build_inline_layout_into_inner(
     inline_context_root_node_id: NodeId,
     note_root: Option<NodeId>,
     note_sources: &[crate::node::InlineNoteSource],
+    interline_note_nodes: Option<&[NodeId]>,
 ) {
     // Get the inline context's root node's text styles
     let root_node = &nodes[inline_context_root_node_id];
-    let root_node_style = root_node.primary_styles().or_else(|| {
+    let context_root_style = root_node.primary_styles().or_else(|| {
         root_node
             .parent
             .and_then(|parent_id| nodes[parent_id].primary_styles())
     });
+    let root_node_style = match interline_note_nodes.and_then(|notes| notes.first()) {
+        Some(note_id) => nodes[*note_id].primary_styles(),
+        None => root_node.primary_styles().or_else(|| {
+            root_node
+                .parent
+                .and_then(|parent_id| nodes[parent_id].primary_styles())
+        }),
+    };
 
     let parley_style = root_node_style
         .as_ref()
@@ -1679,7 +1886,7 @@ fn build_inline_layout_into_inner(
 
     // Create a parley tree builder
     let mut builder = layout_ctx.tree_builder(font_ctx, scale, true, &parley_style);
-    if let Some(style) = root_node_style.as_deref() {
+    if let Some(style) = context_root_style.as_deref() {
         builder.set_base_direction(stylo_to_parley::base_direction(
             style.clone_direction(),
             style.clone_unicode_bidi(),
@@ -1690,6 +1897,46 @@ fn build_inline_layout_into_inner(
         .as_deref()
         .map(|s| CaseTransform::from_style(s))
         .unwrap_or(CaseTransform::NONE);
+
+    if let Some(note_nodes) = interline_note_nodes {
+        let mut ruby = RubyBuild::default();
+        let mut text_transformer = TextTransformer::default();
+        for (source_index, note_node_id) in note_nodes.iter().copied().enumerate() {
+            builder.push_inline_box(InlineBox {
+                id: interline_marker_id(source_index),
+                kind: InlineBoxKind::CustomInFlow,
+                index: 0,
+                width: 0.0,
+                height: 0.0,
+                baseline: None,
+                vertical_align: parley::VerticalAlign::BASELINE,
+            });
+            build_inline_layout_recursive(
+                &mut builder,
+                &mut text_transformer,
+                nodes,
+                note_node_id,
+                &text_transform,
+                &mut ruby,
+                scale,
+                Some(note_node_id),
+                note_sources,
+            );
+        }
+        builder.push_inline_box(InlineBox {
+            id: interline_marker_id(note_nodes.len()),
+            kind: InlineBoxKind::InlineEdge,
+            index: 0,
+            width: 0.0,
+            height: 0.0,
+            baseline: None,
+            vertical_align: parley::VerticalAlign::BASELINE,
+        });
+        text_layout.text = builder.build_into(&mut text_layout.layout);
+        text_layout.ruby_ranges = ruby.ranges;
+        text_layout.emphasis_ranges = ruby.emphasis;
+        return;
+    }
 
     // Render position-inside list items
     if let Some(ListItemLayout {
@@ -1815,6 +2062,51 @@ fn build_inline_layout_into_inner(
             .map(|s| CaseTransform::from_style(s))
             .unwrap_or(CaseTransform::NONE);
 
+        let inside_inline_note = note_root.is_some_and(|root| {
+            nodes[root]
+                .primary_styles()
+                .is_some_and(|style| {
+                    style.clone__hutu_note_placement()
+                        == stylo_to_parley::stylo::HutuNotePlacement::Inline
+                })
+        });
+        if inside_inline_note
+            && style.is_some_and(|style| {
+                style.clone__hutu_note_placement()
+                    == stylo_to_parley::stylo::HutuNotePlacement::Interline
+            })
+        {
+            builder.push_inline_box(InlineBox {
+                id: node_id.as_u64(),
+                kind: InlineBoxKind::InlineEdge,
+                index: 0,
+                width: 0.0,
+                height: 0.0,
+                baseline: None,
+                vertical_align: parley::VerticalAlign::BASELINE,
+            });
+            return;
+        }
+
+        if note_root.is_none()
+            && matches!(&node.data, NodeData::Element(_))
+            && style.is_some_and(|style| {
+                style.clone__hutu_note_placement()
+                    == stylo_to_parley::stylo::HutuNotePlacement::Interline
+            })
+        {
+            builder.push_inline_box(InlineBox {
+                id: node_id.as_u64(),
+                kind: InlineBoxKind::Anchor,
+                index: 0,
+                width: 0.0,
+                height: 0.0,
+                baseline: None,
+                vertical_align: parley::VerticalAlign::BASELINE,
+            });
+            return;
+        }
+
         if note_root.is_none()
             && note_sources.iter().any(|note| note.node_id == node_id)
             && matches!(&node.data, NodeData::Element(_))
@@ -1832,6 +2124,17 @@ fn build_inline_layout_into_inner(
                         builder.push_inline_box(InlineBox {
                             id: node_id.as_u64(),
                             kind: InlineBoxKind::CustomInFlow,
+                            index: 0,
+                            width: 0.0,
+                            height: 0.0,
+                            baseline: None,
+                            vertical_align: parley::VerticalAlign::BASELINE,
+                        });
+                    }
+                    for nested in collect_interline_note_nodes(nodes, node_id) {
+                        builder.push_inline_box(InlineBox {
+                            id: nested.as_u64(),
+                            kind: InlineBoxKind::Anchor,
                             index: 0,
                             width: 0.0,
                             height: 0.0,

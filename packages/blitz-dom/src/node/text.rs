@@ -33,6 +33,15 @@ pub struct TextLayout {
     /// The fragment ranges selected by the line breaker, indexed by the
     /// corresponding Parley inline-box index.
     pub inline_note_fragments: Vec<Option<InlineNoteFragment>>,
+    /// The shared interline-note stream. A block container owns exactly one,
+    /// laid out into one interlinear slot per body line.
+    pub interline: Option<InterlineNoteStream>,
+    /// Zero-width declarations of interline notes on the body lines.
+    pub interline_anchors: Vec<InterlineAnchor>,
+    /// Note lines selected for the interlinear slots.
+    pub interline_lines: Vec<InterlineLine>,
+    /// Extra block-axis offset of each body line, in CSS pixels.
+    pub line_block_offsets: Vec<f32>,
     /// Block-axis offset (in CSS px) of the line boxes from the top of the container's content
     /// box, as applied by `align-content`.
     pub block_offset: f32,
@@ -204,6 +213,62 @@ pub struct InlineNoteFragment {
     pub inline_end_edge: f32,
     pub block_start_inset: f32,
     pub block_end_inset: f32,
+}
+
+/// One pre-shaped, shared interline-note flow.
+#[derive(Clone, Default)]
+pub struct InterlineNoteStream {
+    pub text: String,
+    pub layout: parley::layout::Layout<TextBrush>,
+    pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    pub emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
+    pub sources: Vec<InterlineNoteSource>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InterlineNoteSource {
+    pub node_id: NodeId,
+    /// Byte range of this note in [`InterlineNoteStream::text`].
+    pub text_range: std::ops::Range<usize>,
+    /// Whether the note generated any in-flow content.
+    pub active: bool,
+    pub strut_line_height: f32,
+    pub strut_over: f32,
+    pub strut_under: f32,
+    pub font_size: f32,
+    pub vertical_text_orientation: Option<TextOrientation>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct InterlineAnchor {
+    pub source_index: usize,
+    pub slot: usize,
+    /// Inline coordinate of the zero-width declaration, in CSS pixels.
+    pub position: f32,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct InterlineLine {
+    pub slot_index: usize,
+    /// Slot start in CSS pixels, relative to the container's content box.
+    pub block_offset: f32,
+    /// The note line's block size in CSS pixels.
+    pub height: f32,
+    /// The note line's natural inline advance in CSS pixels.
+    pub advance: f32,
+    /// Half-leading of the note line, in CSS pixels.
+    pub half_leading: f32,
+    pub parts: Vec<InterlinePart>,
+}
+
+#[derive(Clone, Debug)]
+pub struct InterlinePart {
+    pub source_index: usize,
+    pub text_range: std::ops::Range<usize>,
+    /// Inline offset of the part in its note line, in CSS pixels.
+    pub inline_offset: f32,
+    /// Natural inline advance of the part in CSS pixels.
+    pub advance: f32,
 }
 
 impl InlineNoteFragment {

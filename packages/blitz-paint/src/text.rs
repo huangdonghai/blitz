@@ -1272,6 +1272,53 @@ pub(crate) fn stroke_text<'a>(
     cull_rect: Rect,
     context: &mut DrawTextContext,
 ) {
+    let text = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|data| data.inline_layout_data.as_ref())
+        .map(|layout| layout.text.as_str())
+        .unwrap_or_default();
+    let annotations = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|element| element.inline_layout_data.as_ref())
+        .map(|data| data.ruby_ranges.as_slice())
+        .unwrap_or_default();
+    let emphasis_colors = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|element| element.inline_layout_data.as_ref())
+        .map(|data| data.emphasis_ranges.as_slice())
+        .unwrap_or_default();
+    stroke_text_with_data(
+        scene,
+        lines,
+        doc,
+        transform,
+        scale,
+        inline_root_id,
+        cull_rect,
+        text,
+        annotations,
+        emphasis_colors,
+        context,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn stroke_text_with_data<'a>(
+    scene: &mut impl PaintScene,
+    lines: impl Iterator<Item = Line<'a, TextBrush>>,
+    doc: &BaseDocument,
+    transform: Affine,
+    scale: f64,
+    inline_root_id: NodeId,
+    cull_rect: Rect,
+    text: &str,
+    annotations: &[std::ops::Range<usize>],
+    emphasis_colors: &[(std::ops::Range<usize>, Color)],
+    context: &mut DrawTextContext,
+) {
     let DrawTextContext {
         stack,
         path_scratch,
@@ -1290,12 +1337,6 @@ pub(crate) fn stroke_text<'a>(
     let mut fragments: HashMap<NodeId, Vec<(usize, f64, f64)>> = HashMap::new();
     // The painter measures a box from its first glyph to its last, so the pre-pass does the
     // same: a trailing space is outside the decoration and must not count towards its length.
-    let text: &str = doc
-        .get_node(inline_root_id)
-        .and_then(|node| node.element_data())
-        .and_then(|data| data.inline_layout_data.as_ref())
-        .map(|layout| layout.text.as_str())
-        .unwrap_or_default();
     for (index, line) in lines.iter().enumerate() {
         for item in line.items() {
             let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
@@ -1339,12 +1380,7 @@ pub(crate) fn stroke_text<'a>(
     // The laid-out text, so `text-orientation: mixed` can be decided per
     // character: glyphs carry only their glyph id, not their source character.
     #[cfg(feature = "writing-mode")]
-    let layout_text: &str = doc
-        .get_node(inline_root_id)
-        .and_then(|node| node.element_data())
-        .and_then(|data| data.inline_layout_data.as_ref())
-        .map(|layout| layout.text.as_str())
-        .unwrap_or_default();
+    let layout_text = text;
     #[cfg(feature = "writing-mode")]
     let vo_map = CodePointMapData::<VerticalOrientation>::new();
 
@@ -1394,20 +1430,10 @@ pub(crate) fn stroke_text<'a>(
 
         // An annotation is text the layout recorded as taking no room in the line: a `<rt>` element
     // or an emphasis mark, both of which are drawn over the character they belong to.
-    let annotations = doc
-        .get_node(inline_root_id)
-        .and_then(|node| node.element_data())
-        .and_then(|element| element.inline_layout_data.as_ref())
-        .map(|data| data.ruby_ranges.clone())
-        .unwrap_or_default();
+        let annotations = annotations;
     // `text-emphasis-color` paints the marks, which are shaped as annotation text and would
     // otherwise take the text's own colour.
-    let emphasis_colors = doc
-        .get_node(inline_root_id)
-        .and_then(|node| node.element_data())
-        .and_then(|element| element.inline_layout_data.as_ref())
-        .map(|data| data.emphasis_ranges.clone())
-        .unwrap_or_default();
+        let emphasis_colors = emphasis_colors;
 
     for item in line.items() {
             if let PositionedLayoutItem::GlyphRun(glyph_run) = item {
@@ -2026,6 +2052,54 @@ pub(crate) fn stroke_inline_notes(
             }
         }
     }
+}
+
+/// Paint the shared interline-note stream.
+///
+/// The notes are ordinary Parley lines whose block positions were shifted into
+/// the body's interlinear slots. Painting therefore goes through the same text
+/// path as body text: the same shaping, spacing, bidi, justification and
+/// `hanging-punctuation` state are used without a second line-breaking model.
+pub(crate) fn stroke_interline_notes(
+    scene: &mut impl PaintScene,
+    text_layout: &TextLayout,
+    doc: &BaseDocument,
+    transform: Affine,
+    scale: f64,
+    inline_root_id: NodeId,
+    cull_rect: Rect,
+    context: &mut DrawTextContext,
+) {
+    let Some(stream) = text_layout.interline.as_ref() else {
+        return;
+    };
+
+    #[cfg(feature = "writing-mode")]
+    let vertical = vertical_text(doc, inline_root_id, scale);
+    #[cfg(not(feature = "writing-mode"))]
+    let vertical: Option<VerticalTextPaint> = None;
+
+    draw_inline_backgrounds(
+        scene,
+        stream.layout.lines(),
+        doc,
+        transform,
+        inline_root_id,
+        vertical.as_ref(),
+    );
+    stroke_text_with_data(
+        scene,
+        stream.layout.lines(),
+        doc,
+        transform,
+        scale,
+        inline_root_id,
+        cull_rect,
+        &stream.text,
+        &stream.ruby_ranges,
+        &stream.emphasis_ranges,
+        context,
+    );
 }
 
 fn draw_inline_note_box_background(

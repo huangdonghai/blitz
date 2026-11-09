@@ -22,7 +22,10 @@ use super::resolve_calc_value;
 use crate::layout::LayoutPassState;
 #[cfg(feature = "writing-mode")]
 use crate::node::{TextOrientation, VerticalTextPaint};
-use crate::node::{InlineNoteFragment, InlineNoteSource};
+use crate::node::{
+    InlineNoteFragment, InlineNoteSource, InterlineAnchor, InterlineLine, InterlineNoteStream,
+    InterlinePart,
+};
 use crate::stylo_to_parley;
 
 /// Make Parley resolve upright clusters' vertical metrics.
@@ -52,6 +55,82 @@ fn text_orientation(sideways: bool, upright: bool) -> TextOrientation {
     } else {
         TextOrientation::Mixed
     }
+}
+
+fn interline_slot_geometry(
+    body_lines: &[parley::Line<'_, crate::node::TextBrush>],
+    full_width: f32,
+    slot: usize,
+) -> (f32, f32) {
+    if let Some(line) = body_lines.get(slot) {
+        let metrics = line.metrics();
+        let start = if slot == 0 {
+            metrics.inline_min_coord.max(metrics.indent)
+        } else {
+            metrics.inline_min_coord
+        };
+        return (
+            start,
+            (metrics.inline_max_coord - start).max(0.0),
+        );
+    }
+    (0.0, full_width.max(0.0))
+}
+
+fn interline_marker_id(index: usize) -> u64 {
+    u64::MAX - index as u64
+}
+
+fn interline_line_parts(
+    stream: &InterlineNoteStream,
+    line: parley::Line<'_, crate::node::TextBrush>,
+    scale: f32,
+) -> Vec<InterlinePart> {
+    let line_range = line.text_range();
+    let relative_origin = line.metrics().inline_min_coord + line.metrics().offset;
+    let mut parts = Vec::new();
+    let first_source = stream
+        .sources
+        .partition_point(|source| source.text_range.end <= line_range.start);
+    for (source_index, source) in stream.sources.iter().enumerate().skip(first_source) {
+        if source.text_range.start >= line_range.end {
+            break;
+        }
+        if !source.active {
+            continue;
+        }
+        let start = line_range.start.max(source.text_range.start);
+        let end = line_range.end.min(source.text_range.end);
+        if start >= end {
+            continue;
+        }
+        let mut inline_offset = None;
+        let mut advance = 0.0;
+        for item in line.items() {
+            match item {
+                parley::PositionedLayoutItem::GlyphRun(glyph_run) => {
+                    let mut cluster_pen = glyph_run.offset();
+                    for cluster in glyph_run.visual_clusters() {
+                        let cluster_range = cluster.text_range();
+                        let cluster_advance = cluster.advance();
+                        if start <= cluster_range.start && cluster_range.end <= end {
+                            inline_offset.get_or_insert(cluster_pen - relative_origin);
+                            advance += cluster_advance;
+                        }
+                        cluster_pen += cluster_advance;
+                    }
+                }
+                parley::PositionedLayoutItem::InlineBox(_) => {}
+            }
+        }
+        parts.push(InterlinePart {
+            source_index,
+            text_range: start..end,
+            inline_offset: inline_offset.unwrap_or(0.0) / scale,
+            advance: advance / scale,
+        });
+    }
+    parts
 }
 
 #[derive(Clone, Copy, Default)]
@@ -446,20 +525,40 @@ fn inline_note_range_height(
     start: usize,
     end: usize,
 ) -> f32 {
+    note_unit_range_height(
+        source.layout.is_vertical(),
+        source.strut_line_height,
+        source.strut_over,
+        source.strut_under,
+        &segment.units,
+        start,
+        end,
+    )
+}
+
+fn note_unit_range_height(
+    vertical: bool,
+    strut_line_height: f32,
+    strut_over: f32,
+    strut_under: f32,
+    units: &[crate::node::InlineNoteUnit],
+    start: usize,
+    end: usize,
+) -> f32 {
     if start >= end {
-        return source.strut_line_height;
+        return strut_line_height;
     }
-    let units = &segment.units[start..end];
+    let units = &units[start..end];
     // An atomic inline is a line of its own content: its margin box supplies the
     // subline's block extent, and the note's strut must not be added on top. Text
     // units already carry the line height of their own runs.
     let has_atomic = units.iter().any(|unit| unit.atomic_node_id.is_some());
-    if source.layout.is_vertical() {
+    if vertical {
         units.iter().fold(
             if has_atomic {
                 0.0
             } else {
-                source.strut_line_height
+                strut_line_height
             },
             |height, unit| height.max(unit.line_height),
         )
@@ -468,7 +567,7 @@ fn inline_note_range_height(
             if has_atomic {
                 (0.0, 0.0)
             } else {
-                (source.strut_over, source.strut_under)
+                (strut_over, strut_under)
             },
             |(over, under), unit| (over.max(unit.line_over), under.max(unit.line_under)),
         );
@@ -501,6 +600,26 @@ fn inline_note_justification_opportunities(
     count
         .saturating_sub(u32::from(start_hang))
         .saturating_sub(u32::from(end_excluded))
+}
+
+fn inline_note_row_prefix_advance(
+    segment: &crate::node::InlineNoteSegment,
+    start: usize,
+    end: usize,
+    first_line: bool,
+) -> f32 {
+    if start >= end {
+        return 0.0;
+    }
+    let first = &segment.units[start];
+    let mut advance = segment.prefix_advances[end] - segment.prefix_advances[start];
+    let start_advance = if first_line {
+        first.first_line_start_advance
+    } else {
+        first.line_start_advance
+    };
+    advance += start_advance - first.advance;
+    advance
 }
 
 fn inline_note_balanced_split(
@@ -1681,6 +1800,7 @@ impl LayoutPassState<'_> {
                 ibox.kind,
                 parley::InlineBoxKind::HangBoundary
                     | parley::InlineBoxKind::InlineEdge
+                    | parley::InlineBoxKind::Anchor
                     | parley::InlineBoxKind::OutOfFlow
                     | parley::InlineBoxKind::CustomOutOfFlow
                     | parley::InlineBoxKind::CustomInFlow
@@ -1829,7 +1949,8 @@ impl LayoutPassState<'_> {
                 parley::InlineBoxKind::InlineEdge => inline_box.width != 0.0,
                 parley::InlineBoxKind::OutOfFlow
                 | parley::InlineBoxKind::CustomOutOfFlow
-                | parley::InlineBoxKind::HangBoundary => false,
+                | parley::InlineBoxKind::HangBoundary
+                | parley::InlineBoxKind::Anchor => false,
             };
             visible_box_suffix[index] = visible || visible_box_suffix[index + 1];
         }
@@ -1902,6 +2023,7 @@ impl LayoutPassState<'_> {
                                 ibox.kind,
                                 parley::InlineBoxKind::HangBoundary
                                     | parley::InlineBoxKind::InlineEdge
+                                    | parley::InlineBoxKind::Anchor
                             ) {
                                 continue;
                             }
@@ -1944,6 +2066,7 @@ impl LayoutPassState<'_> {
                                 ibox.kind,
                                 parley::InlineBoxKind::HangBoundary
                                     | parley::InlineBoxKind::InlineEdge
+                                    | parley::InlineBoxKind::Anchor
                             ) {
                                 continue;
                             }
@@ -2404,6 +2527,385 @@ impl LayoutPassState<'_> {
             };
         }
 
+        if let Some(mut stream) = inline_layout.interline.take() {
+            let body_lines = inline_layout.layout.lines().collect::<Vec<_>>();
+            let parent_strut = inline_layout.layout.root_span_size_and_line_height();
+            let body_font_size = parent_strut.map(|(font_size, _)| font_size).unwrap_or(0.0);
+            let body_strut_line_height = parent_strut
+                .map(|(_, line_height)| line_height)
+                .filter(|line_height| *line_height > 0.0)
+                .unwrap_or_else(|| {
+                    body_lines
+                        .last()
+                        .map(|line| line.metrics().line_height)
+                        .unwrap_or(0.0)
+                });
+            let body_gap = ((body_strut_line_height - body_font_size) * 0.5).max(0.0);
+
+            let source_indices: std::collections::HashMap<_, _> = stream
+                .sources
+                .iter()
+                .enumerate()
+                .map(|(index, source)| (source.node_id.as_u64(), index))
+                .collect();
+            let marker_sources: std::collections::HashMap<_, _> = (0..stream.sources.len())
+                .map(|index| (interline_marker_id(index), index))
+                .collect();
+
+            let mut anchors = Vec::new();
+            let mut exact_anchor_sources = std::collections::HashSet::new();
+            let mut inline_boundaries = vec![Vec::new(); body_lines.len()];
+            for (line_index, line) in body_lines.iter().enumerate() {
+                for item in line.items() {
+                    let parley::PositionedLayoutItem::InlineBox(inline_box) = item else {
+                        continue;
+                    };
+                    if inline_box.kind == parley::InlineBoxKind::Anchor {
+                        let Some(&source_index) = source_indices.get(&inline_box.id) else {
+                            continue;
+                        };
+                        if !stream.sources[source_index].active {
+                            continue;
+                        }
+                        if exact_anchor_sources.contains(&source_index) {
+                            continue;
+                        }
+                        anchors.push(InterlineAnchor {
+                            source_index,
+                            slot: line_index,
+                            position: inline_box.x / scale,
+                        });
+                        continue;
+                    }
+                    if inline_box.kind != parley::InlineBoxKind::CustomInFlowCentered {
+                        continue;
+                    }
+                    let Some(Some(fragment)) =
+                        inline_layout.inline_note_fragments.get(inline_box.index)
+                    else {
+                        continue;
+                    };
+                    let Some(source) = inline_layout.inline_notes.get(fragment.source_index) else {
+                        continue;
+                    };
+                    let Some(segment) = source.segments.get(fragment.segment_index) else {
+                        continue;
+                    };
+                    let first_font_size = source
+                        .layout
+                        .root_span_size_and_line_height()
+                        .map(|(font_size, _)| font_size)
+                        .unwrap_or(fragment.first_line_height);
+                    let first_gap =
+                        ((fragment.first_line_height - first_font_size) * 0.5).max(0.0);
+                    let first_boundary =
+                        (line.metrics().line_height - inline_box.height) * 0.5
+                            + fragment.block_start_inset;
+                    inline_boundaries[line_index].push((first_boundary, first_gap));
+
+                    if !source.layout.is_rtl() {
+                        let box_ids = source
+                            .layout
+                            .inline_boxes()
+                            .map(|inline_box| inline_box.id)
+                            .collect::<Vec<_>>();
+                        for (unit_range, first_line) in [
+                            (&fragment.first_unit_range, true),
+                            (&fragment.second_unit_range, false),
+                        ] {
+                            for unit_index in unit_range.clone() {
+                                let Some(box_index) = segment.units[unit_index].inline_box_index
+                                else {
+                                    continue;
+                                };
+                                let Some(box_id) = box_ids.get(box_index) else {
+                                    continue;
+                                };
+                                let Some(&nested_source) = source_indices.get(box_id) else {
+                                    continue;
+                                };
+                                if !stream.sources[nested_source].active
+                                    || !exact_anchor_sources.insert(nested_source)
+                                {
+                                    continue;
+                                }
+                                let prefix = inline_note_row_prefix_advance(
+                                    segment,
+                                    unit_range.start,
+                                    unit_index,
+                                    first_line,
+                                );
+                                anchors.push(InterlineAnchor {
+                                    source_index: nested_source,
+                                    slot: line_index,
+                                    position: (inline_box.x
+                                        + fragment.inline_start_edge
+                                        + prefix)
+                                        / scale,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+
+            if anchors.is_empty() {
+                inline_layout.interline = None;
+            } else {
+                let body_line_heights = body_lines
+                    .iter()
+                    .map(|line| line.metrics().line_height)
+                    .collect::<Vec<_>>();
+                let body_line_tops = body_lines
+                    .iter()
+                    .map(|line| line.metrics().block_min_coord)
+                    .collect::<Vec<_>>();
+                let body_original_height = height;
+                let first_slot = anchors[0].slot;
+                let mut anchor_by_source = vec![None; stream.sources.len()];
+                for anchor in &anchors {
+                    anchor_by_source[anchor.source_index] = Some(*anchor);
+                }
+
+                let mut current_slot = first_slot;
+                let (mut slot_start, mut slot_width) =
+                    interline_slot_geometry(&body_lines, width, current_slot);
+                let mut slot_of_line = Vec::new();
+                let mut no_justify_lines = Vec::new();
+                let mut breaker = stream.layout.break_lines();
+                {
+                    let state = breaker.state_mut();
+                    state.set_layout_max_advance(width);
+                    state.set_line_max_advance(slot_width);
+                    state.set_line_x(slot_start);
+                    state.set_line_y(0.0);
+                }
+
+                while let Some(yield_data) = breaker.break_next() {
+                    match yield_data {
+                        YieldData::LineBreak(_) => {
+                            slot_of_line.push(current_slot);
+                            current_slot += 1;
+                            (slot_start, slot_width) =
+                                interline_slot_geometry(&body_lines, width, current_slot);
+                            let state = breaker.state_mut();
+                            state.set_line_max_advance(slot_width);
+                            state.set_line_x(slot_start);
+                        }
+                        YieldData::InlineBoxBreak(box_break) => {
+                            let Some(&source_index) =
+                                marker_sources.get(&box_break.inline_box_id)
+                            else {
+                                breaker.resolve_custom_inline_box(
+                                    box_break.inline_box_index,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    parley::InlineBoxKind::OutOfFlow,
+                                );
+                                continue;
+                            };
+                            let source = &stream.sources[source_index];
+                            if !source.active {
+                                breaker.resolve_custom_inline_box(
+                                    box_break.inline_box_index,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    parley::InlineBoxKind::CustomInFlow,
+                                );
+                                continue;
+                            }
+                            let Some(anchor) = anchor_by_source[source_index] else {
+                                breaker.resolve_custom_inline_box(
+                                    box_break.inline_box_index,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    parley::InlineBoxKind::CustomInFlow,
+                                );
+                                continue;
+                            };
+
+                            let mut current_advance = box_break.advance;
+                            if anchor.slot > current_slot {
+                                if current_advance > 0.0
+                                    && breaker.break_current_line().is_some()
+                                {
+                                    no_justify_lines.push(slot_of_line.len());
+                                    slot_of_line.push(current_slot);
+                                }
+                                current_slot = anchor.slot;
+                                (slot_start, slot_width) =
+                                    interline_slot_geometry(&body_lines, width, current_slot);
+                                let state = breaker.state_mut();
+                                state.set_line_max_advance(slot_width);
+                                state.set_line_x(slot_start);
+                                current_advance = 0.0;
+                            }
+
+                            let mut gap = 0.0;
+                            if anchor.slot == current_slot {
+                                let target = anchor.position * scale - slot_start;
+                                let remaining = (slot_width
+                                    - current_advance
+                                    - source.font_size)
+                                    .max(0.0);
+                                gap = (target - current_advance).clamp(0.0, remaining);
+                            }
+                            breaker.resolve_custom_inline_box(
+                                box_break.inline_box_index,
+                                gap,
+                                0.0,
+                                0.0,
+                                0.0,
+                                0.0,
+                                parley::InlineBoxKind::CustomInFlow,
+                            );
+                        }
+                        YieldData::MaxHeightExceeded(_) => {}
+                    }
+                }
+                breaker.finish();
+                for line_index in no_justify_lines {
+                    stream.layout.suppress_line_justification(line_index);
+                }
+
+                while slot_of_line.len() < stream.layout.len() {
+                    slot_of_line.push(current_slot);
+                    current_slot += 1;
+                }
+                slot_of_line.truncate(stream.layout.len());
+
+                let note_alignment = if alignment == parley::layout::Alignment::Justify {
+                    parley::layout::Alignment::Justify
+                } else {
+                    parley::layout::Alignment::Start
+                };
+                stream.layout.align(
+                    note_alignment,
+                    AlignmentOptions {
+                        align_when_overflowing: false,
+                        last_line_alignment: None,
+                    },
+                );
+
+                let mut line_by_slot = vec![None; stream.layout.len()];
+                let mut line_slots = vec![0usize; stream.layout.len()];
+                let mut line_heights = vec![0.0; stream.layout.len()];
+                let mut line_advances = vec![0.0; stream.layout.len()];
+                let mut line_half_leadings = vec![0.0; stream.layout.len()];
+                let mut line_parts = vec![Vec::new(); stream.layout.len()];
+                for (line_index, line) in stream.layout.lines().enumerate() {
+                    let slot = slot_of_line[line_index];
+                    if slot >= line_by_slot.len() {
+                        line_by_slot.resize(slot + 1, None);
+                    }
+                    line_by_slot[slot] = Some(line_index);
+                    line_slots[line_index] = slot;
+                    line_heights[line_index] = line.metrics().line_height;
+                    line_advances[line_index] = line.metrics().advance;
+                    let parts = interline_line_parts(&stream, line, scale);
+                    if let Some(part) = parts.first() {
+                        let source = &stream.sources[part.source_index];
+                        line_half_leadings[line_index] =
+                            ((line.metrics().line_height - source.font_size) * 0.5).max(0.0);
+                    }
+                    line_parts[line_index] = parts;
+                }
+                while line_by_slot.len() < body_lines.len() {
+                    line_by_slot.push(None);
+                }
+
+                let virtual_line_count = line_by_slot.len().max(body_lines.len());
+                let mut body_offsets = vec![0.0; body_lines.len()];
+                let mut note_deltas = vec![0.0; stream.layout.len()];
+                let mut note_tops = vec![0.0; stream.layout.len()];
+                let mut cumulative = 0.0;
+                for slot in 0..virtual_line_count {
+                    let original_top = if slot < body_lines.len() {
+                        body_line_tops[slot]
+                    } else {
+                        body_original_height
+                            + (slot - body_lines.len()) as f32 * body_strut_line_height
+                    };
+                    let note_line = line_by_slot.get(slot).and_then(|line| *line);
+                    let note_height = note_line
+                        .map(|line_index| line_heights[line_index])
+                        .unwrap_or(0.0);
+                    let note_gap = note_line
+                        .map(|line_index| line_half_leadings[line_index])
+                        .unwrap_or(0.0);
+                    let body_gap_for_line = if slot < body_lines.len() {
+                        ((body_line_heights[slot] - body_font_size) * 0.5).max(0.0)
+                    } else {
+                        body_gap
+                    };
+                    let adjustment = if note_line.is_none() {
+                        0.0
+                    } else if slot < inline_boundaries.len()
+                        && !inline_boundaries[slot].is_empty()
+                    {
+                        inline_boundaries[slot]
+                            .iter()
+                            .map(|(boundary, inline_gap)| {
+                                boundary + note_gap.min(*inline_gap)
+                            })
+                            .fold(f32::INFINITY, f32::min)
+                    } else {
+                        note_gap.min(body_gap_for_line)
+                    };
+                    let extra = note_height - adjustment;
+                    if slot < body_lines.len() {
+                        body_offsets[slot] = cumulative + extra;
+                    }
+                    if let Some(line_index) = note_line {
+                        let original_note_top = stream
+                            .layout
+                            .get(line_index)
+                            .map(|line| line.metrics().block_min_coord)
+                            .unwrap_or(0.0);
+                        let target_top = original_top + cumulative;
+                        note_deltas[line_index] = target_top - original_note_top;
+                        note_tops[line_index] = target_top;
+                    }
+                    cumulative += extra;
+                }
+
+                let synthetic_lines =
+                    virtual_line_count.saturating_sub(body_lines.len());
+                let new_height = body_original_height
+                    + synthetic_lines as f32 * body_strut_line_height
+                    + cumulative;
+                inline_layout
+                    .layout
+                    .shift_line_block_offsets(&body_offsets);
+                inline_layout.layout.set_block_size(new_height);
+                stream.layout.shift_line_block_offsets(&note_deltas);
+                inline_layout.line_block_offsets =
+                    body_offsets.iter().map(|offset| offset / scale).collect();
+                inline_layout.interline_anchors = anchors;
+                inline_layout.interline_lines = (0..stream.layout.len())
+                    .map(|line_index| InterlineLine {
+                        slot_index: line_slots[line_index],
+                        block_offset: note_tops[line_index] / scale,
+                        height: line_heights[line_index] / scale,
+                        advance: line_advances[line_index] / scale,
+                        half_leading: line_half_leadings[line_index] / scale,
+                        parts: std::mem::take(&mut line_parts[line_index]),
+                    })
+                    .collect();
+                inline_layout.interline = Some(stream);
+                height = new_height;
+            }
+        }
+
         // Note: `width` and `height` are content-box measurements of the inline content.
         // `known_dimensions` must not be substituted in here: those are border-box sizes, and
         // using them for the scrollable overflow rect (which adds padding below) would
@@ -2618,7 +3120,9 @@ impl LayoutPassState<'_> {
                 }
                 if matches!(
                     ibox.kind,
-                    parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+                    parley::InlineBoxKind::HangBoundary
+                        | parley::InlineBoxKind::InlineEdge
+                        | parley::InlineBoxKind::Anchor
                 ) {
                     continue;
                 }

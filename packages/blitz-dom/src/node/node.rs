@@ -1810,7 +1810,9 @@ impl Node {
                     PositionedLayoutItem::InlineBox(inline_box) => {
                         if matches!(
                             inline_box.kind,
-                            parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+                            parley::InlineBoxKind::HangBoundary
+                                | parley::InlineBoxKind::InlineEdge
+                                | parley::InlineBoxKind::Anchor
                         ) {
                             continue;
                         }

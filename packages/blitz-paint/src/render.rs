@@ -1440,6 +1440,16 @@ impl ElementCx<'_, '_> {
                 self.local_cull_rect(transform),
                 &mut draw_text_context,
             );
+            crate::text::stroke_interline_notes(
+                scene,
+                text_layout,
+                self.context.dom,
+                transform,
+                self.scale,
+                self.node.id,
+                self.local_cull_rect(transform),
+                &mut draw_text_context,
+            );
         }
     }
 
