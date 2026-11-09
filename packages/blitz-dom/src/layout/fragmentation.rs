@@ -558,6 +558,15 @@ impl BaseDocument {
             .map_or(0, |plan| plan.bands.len())
     }
 
+    /// Whether the page sequence advances horizontally, as it does for a
+    /// vertical writing mode, rather than down the paper.
+    pub fn page_flow_is_vertical(&self) -> bool {
+        self.root_element()
+            .break_plan
+            .as_deref()
+            .is_some_and(|plan| plan.axis == FlowAxis::X)
+    }
+
     /// Size of one sheet of paper, including its page margins.
     pub fn page_box_size(&self) -> Option<Size<f32>> {
         self.page_box.map(|page| page.size)
@@ -1829,9 +1838,28 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
     // cut across the paper and stack sideways; `vertical-rl` runs *against* x, which the walk settles
     // once (see [`FlowAxis::along`]) and painting answers by right-aligning each page's content (see
     // [`BreakPlan::fragment_span`]). A sideways mode is neither, and is not paginated yet.
+    //
+    // EPUBs commonly put `writing-mode: vertical-rl` on `<body>` while leaving
+    // `<html>` horizontal. The body is then the principal block flow that has to
+    // be cut, even though the root reports the initial horizontal mode.
     #[cfg(feature = "writing-mode")]
     let (axis, reversed) = {
-        let mode = doc.nodes[root_id].writing_mode();
+        let root_mode = doc.nodes[root_id].writing_mode();
+        let mode = if root_mode.is_vertical() {
+            root_mode
+        } else {
+            doc.nodes[root_id]
+                .children
+                .iter()
+                .find(|&&child| {
+                    doc.nodes[child]
+                        .element_data()
+                        .is_some_and(|element| &*element.name.local == "body")
+                })
+                .map(|&body| doc.nodes[body].writing_mode())
+                .filter(|mode| mode.is_vertical())
+                .unwrap_or(root_mode)
+        };
         if mode.is_vertical_rl() {
             (FlowAxis::X, true)
         } else if mode.is_vertical_lr() {
