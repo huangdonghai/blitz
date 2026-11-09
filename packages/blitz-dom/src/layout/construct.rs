@@ -1205,6 +1205,26 @@ fn interline_marker_index(id: u64, count: usize) -> Option<usize> {
     (index <= count).then_some(index)
 }
 
+fn force_writing_mode_features(style: &mut parley::TextStyle<TextBrush>, vertical: bool) {
+    let parley::FontFeatures::List(list) = &mut style.font_features else {
+        return;
+    };
+    let mut features = list.to_vec();
+    features.retain(|feature| feature.tag.to_bytes() != *b"vert");
+    if vertical {
+        features.push(
+            parley::FontFeature::parse_css_list("'vert' 1")
+                .next()
+                .transpose()
+                .ok()
+                .flatten()
+                .expect("valid vert feature"),
+        );
+    }
+    features.sort_by_key(|feature| feature.tag);
+    *list = std::borrow::Cow::Owned(features);
+}
+
 pub(crate) fn inline_note_segments(
     layout: &parley::layout::Layout<TextBrush>,
     text: &str,
@@ -1770,7 +1790,9 @@ pub(crate) fn build_inline_layout_into(
             let active = !text_range.is_empty()
                 || content_boxes
                     .iter()
-                    .any(|index| text_range.contains(index));
+                    .any(|index| {
+                        text_range.start <= *index && *index <= text_range.end
+                    });
             #[cfg(feature = "writing-mode")]
             let vertical_text_orientation = nodes[inline_context_root_node_id]
                 .writing_mode()
@@ -1867,6 +1889,9 @@ fn build_inline_layout_into_inner(
             .parent
             .and_then(|parent_id| nodes[parent_id].primary_styles())
     });
+    let body_vertical = context_root_style
+        .as_deref()
+        .is_some_and(|style| style.writing_mode.is_vertical());
     let root_node_style = match interline_note_nodes.and_then(|notes| notes.first()) {
         Some(note_id) => nodes[*note_id].primary_styles(),
         None => root_node.primary_styles().or_else(|| {
@@ -1921,6 +1946,7 @@ fn build_inline_layout_into_inner(
                 scale,
                 Some(note_node_id),
                 note_sources,
+                Some(body_vertical),
             );
         }
         builder.push_inline_box(InlineBox {
@@ -1977,6 +2003,7 @@ fn build_inline_layout_into_inner(
             scale,
             note_root,
             note_sources,
+            None,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -1990,6 +2017,7 @@ fn build_inline_layout_into_inner(
             scale,
             note_root,
             note_sources,
+            None,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -2003,6 +2031,7 @@ fn build_inline_layout_into_inner(
             scale,
             note_root,
             note_sources,
+            None,
         );
     }
 
@@ -2021,6 +2050,7 @@ fn build_inline_layout_into_inner(
         scale: f32,
         note_root: Option<NodeId>,
         note_sources: &[crate::node::InlineNoteSource],
+        forced_vertical: Option<bool>,
     ) {
         let is_annotation = nodes[node_id]
             .element_data()
@@ -2036,6 +2066,7 @@ fn build_inline_layout_into_inner(
             scale,
             note_root,
             note_sources,
+            forced_vertical,
         );
         if let Some(start) = start {
             ruby.ranges.push(start..builder.text().len());
@@ -2052,6 +2083,7 @@ fn build_inline_layout_into_inner(
         scale: f32,
         note_root: Option<NodeId>,
         note_sources: &[crate::node::InlineNoteSource],
+        forced_vertical: Option<bool>,
     ) {
         let node = &nodes[node_id];
 
@@ -2156,7 +2188,13 @@ fn build_inline_layout_into_inner(
                     }
                 }
 
-                let display = node.display_style().unwrap_or(Display::inline());
+                let mut display = node.display_style().unwrap_or(Display::inline());
+                if note_root == Some(node_id)
+                    && !matches!(display.outside(), DisplayOutside::None)
+                    && !matches!(display.inside(), DisplayInside::None)
+                {
+                    display = Display::inline();
+                }
                 let position = style
                     .map(|s| s.clone_position())
                     .unwrap_or(PositionProperty::Static);
@@ -2205,6 +2243,7 @@ fn build_inline_layout_into_inner(
                                 scale,
                                 note_root,
                                 note_sources,
+                                forced_vertical,
                             );
                         }
                         builder.pop_style_span();
@@ -2244,13 +2283,16 @@ fn build_inline_layout_into_inner(
                             text_transformer.word_break(builder);
                         } else {
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
-                            let style = node
+                            let mut style = node
                                 .primary_styles()
                                 .map(|s| stylo_to_parley::style(node.id, &s, true))
                                 .unwrap_or_else(|| parley::TextStyle {
                                     white_space_collapse: WhiteSpaceCollapse::Collapse,
                                     ..Default::default()
                                 });
+                            if let Some(vertical) = forced_vertical {
+                                force_writing_mode_features(&mut style, vertical);
+                            }
 
                             let (start_margin, end_margin) = node
                                 .primary_styles()
@@ -2303,6 +2345,7 @@ fn build_inline_layout_into_inner(
                                     scale,
                                     note_root,
                                     note_sources,
+                                    forced_vertical,
                                 );
                             }
 
@@ -2317,6 +2360,7 @@ fn build_inline_layout_into_inner(
                                     scale,
                                     note_root,
                                     note_sources,
+                                    forced_vertical,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -2330,6 +2374,7 @@ fn build_inline_layout_into_inner(
                                     scale,
                                     note_root,
                                     note_sources,
+                                    forced_vertical,
                                 );
                             }
 

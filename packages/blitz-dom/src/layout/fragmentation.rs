@@ -1276,6 +1276,61 @@ impl<'a> Planner<'a> {
         let scale = text.layout.scale();
         let widows = styles.clone_widows().max(1) as usize;
         let orphans = styles.clone_orphans().max(1) as usize;
+        if !text.interline_lines.is_empty() {
+            let body_lines = text.layout.lines().collect::<Vec<_>>();
+            let content_end = origin + text.layout.height() / scale;
+            let mut groups = Vec::<(f32, f32)>::new();
+            for (index, line) in body_lines.iter().enumerate() {
+                let body_top = origin + line.metrics().block_min_coord / scale;
+                let body_bottom = origin + line.metrics().block_max_coord / scale;
+                let note_top = text
+                    .interline_lines
+                    .iter()
+                    .filter(|note| note.slot_index == index)
+                    .map(|note| origin + note.block_offset)
+                    .min_by(f32::total_cmp)
+                    .unwrap_or(body_top);
+                groups.push((note_top.min(body_top), body_bottom));
+            }
+            let mut synthetic = text
+                .interline_lines
+                .iter()
+                .filter(|note| note.slot_index >= body_lines.len())
+                .collect::<Vec<_>>();
+            synthetic.sort_by(|left, right| left.block_offset.total_cmp(&right.block_offset));
+            for (index, note) in synthetic.iter().enumerate() {
+                let start = origin + note.block_offset;
+                let end = synthetic
+                    .get(index + 1)
+                    .map(|next| origin + next.block_offset)
+                    .unwrap_or(content_end);
+                groups.push((start, end.max(start)));
+            }
+            groups.sort_by(|left, right| left.0.total_cmp(&right.0));
+
+            let mut cursor = origin;
+            let mut ends = Vec::with_capacity(groups.len() + 1);
+            for (start, end) in groups {
+                let start = cursor.max(start);
+                let end = end.max(start);
+                self.units.push(Unit::whole(start, end));
+                ends.push(end);
+                cursor = end;
+            }
+            if cursor < content_end {
+                self.units.push(Unit::whole(cursor, content_end));
+                ends.push(content_end);
+            }
+            for (index, end) in ends.iter().enumerate() {
+                let before = index + 1;
+                let after = ends.len() - before;
+                if after == 0 {
+                    continue;
+                }
+                self.push_at(*end, line_rank(before, after, orphans, widows), true, true);
+            }
+            return;
+        }
         let lines: Vec<f32> = text
             .layout
             .lines()

@@ -1218,6 +1218,230 @@ impl LayoutPassState<'_> {
         inputs
     }
 
+    fn measure_inline_boxes_in_layout(
+        &mut self,
+        layout: &mut parley::layout::Layout<crate::node::TextBrush>,
+        inputs: LayoutInput,
+        child_inputs: LayoutInput,
+        scale: f32,
+        parent_vertical: bool,
+    ) {
+        for ibox in layout.inline_boxes_mut() {
+            if matches!(
+                ibox.kind,
+                parley::InlineBoxKind::HangBoundary
+                    | parley::InlineBoxKind::InlineEdge
+                    | parley::InlineBoxKind::Anchor
+                    | parley::InlineBoxKind::OutOfFlow
+                    | parley::InlineBoxKind::CustomOutOfFlow
+                    | parley::InlineBoxKind::CustomInFlow
+            ) {
+                continue;
+            }
+            let style = self.child_layout_style(&self.nodes[NodeId::from_u64(ibox.id)]);
+            let margin = style
+                .margin()
+                .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+            let padding = style
+                .padding()
+                .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+            let border = style
+                .border()
+                .resolve_or_zero(inputs.parent_size, resolve_calc_value);
+
+            #[cfg(feature = "floats")]
+            let is_floated = style.float().is_floated();
+            #[cfg(not(feature = "floats"))]
+            let is_floated = false;
+
+            let is_out_of_flow = style.position().is_out_of_flow();
+            let overflow = style.overflow();
+            let box_style = style.style.get_box();
+            let is_flow = matches!(
+                style.effective_display().inside(),
+                DisplayInside::Flow | DisplayInside::FlowRoot
+            );
+            let baseline_source = box_style.clone_baseline_source();
+            let uses_last_baseline = match baseline_source {
+                BaselineSource::Auto => is_flow,
+                BaselineSource::First => false,
+                BaselineSource::Last => true,
+            };
+            let is_scroll_container = !matches!(overflow.y, Overflow::Visible | Overflow::Clip);
+            let is_block_axis_scroll_container = is_flow
+                && is_scroll_container
+                && !style
+                    .flags
+                    .intersects(StyleFlags::IS_BUTTON | StyleFlags::IS_BUTTON_INPUT);
+            let contain_layout = box_style.clone_contain().contains(Contain::LAYOUT);
+            let exports_baseline = !(baseline_source == BaselineSource::Auto
+                && is_block_axis_scroll_container)
+                && !contain_layout;
+            let auto_inline_size = style.size().width.is_auto();
+            let inline_insets = padding.horizontal_axis_sum() + border.horizontal_axis_sum();
+            let box_inputs = self.inline_box_inputs_for_child(
+                NodeId::from_u64(ibox.id),
+                scale,
+                style.size().width,
+                margin,
+                padding,
+                border,
+                child_inputs,
+            );
+            drop(style);
+
+            if is_out_of_flow || is_floated {
+                ibox.width = 0.0;
+                ibox.height = 0.0;
+                ibox.baseline = None;
+                continue;
+            }
+
+            let mut box_inputs = box_inputs;
+            let mut output = self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
+            if auto_inline_size {
+                let refreshed = self.nodes[NodeId::from_u64(ibox.id)]
+                    .element_data()
+                    .and_then(|element| element.inline_layout_data.as_ref())
+                    .map(|layout| layout.layout.calculate_content_widths().max / scale);
+                if let Some(max_content_inline_size) = refreshed {
+                    let natural = max_content_inline_size + inline_insets;
+                    let fits = match box_inputs.available_space.width {
+                        taffy::AvailableSpace::MinContent => false,
+                        taffy::AvailableSpace::MaxContent => true,
+                        taffy::AvailableSpace::Definite(limit) => natural <= limit,
+                    };
+                    if fits && natural > output.size.width {
+                        box_inputs.known_dimensions.width =
+                            Some(natural + INLINE_BOX_MAX_CONTENT_CUSHION);
+                        output = self.compute_child_layout(taffy::NodeId::from(ibox.id), box_inputs);
+                    }
+                }
+            }
+            ibox.baseline = if exports_baseline {
+                let baseline = if uses_last_baseline {
+                    output.baselines.last.or(output.baselines.first)
+                } else {
+                    output.baselines.first.or(output.baselines.last)
+                };
+                baseline.map(|baseline| {
+                    let baseline = if is_scroll_container {
+                        baseline.clamp(0.0, output.size.height)
+                    } else {
+                        baseline
+                    };
+                    (margin.top + baseline) * scale
+                })
+            } else {
+                None
+            };
+            let advance = (margin.left + margin.right + output.size.width) * scale;
+            ibox.width = if parent_vertical
+                && ibox.kind == parley::InlineBoxKind::InFlow
+                && ibox.baseline.is_some()
+            {
+                advance.ceil() + 1.0
+            } else {
+                advance
+            };
+            let margin_box_height = margin.top + margin.bottom + output.size.height;
+            ibox.height = if ibox.baseline.is_some() {
+                (margin_box_height * scale).min(f32::MAX)
+            } else {
+                (margin_box_height.max(0.0) * scale).min(f32::MAX)
+            };
+
+            let child_layout = self.nodes[NodeId::from_u64(ibox.id)].unrounded_layout_mut();
+            child_layout.size = output.size;
+            child_layout.padding = padding;
+            child_layout.border = border;
+            child_layout.margin = margin;
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn place_inline_boxes_in_layout(
+        &mut self,
+        layout: &parley::layout::Layout<crate::node::TextBrush>,
+        parent_size: Size<Option<f32>>,
+        container_size: Size<f32>,
+        container_pb: taffy::Rect<f32>,
+        line_box_top: f32,
+        container_direction: Direction,
+        scale: f32,
+        vertical: bool,
+    ) {
+        for line in layout.lines() {
+            for item in line.items() {
+                let parley::PositionedLayoutItem::InlineBox(ibox) = item else {
+                    continue;
+                };
+                if ibox.kind != parley::InlineBoxKind::InFlow {
+                    continue;
+                }
+                let child_id = NodeId::from_u64(ibox.id);
+                let style = self.child_layout_style(&self.nodes[child_id]);
+                let margin = style
+                    .margin()
+                    .resolve_or_zero(parent_size, resolve_calc_value);
+                let padding = style
+                    .padding()
+                    .resolve_or_zero(parent_size, resolve_calc_value);
+                let border = style
+                    .border()
+                    .resolve_or_zero(parent_size, resolve_calc_value);
+                let inset_offset = if style.position() == taffy::Position::Relative {
+                    let inset_style = style.inset();
+                    let inset = taffy::Rect {
+                        left: inset_style
+                            .left
+                            .maybe_resolve(container_size.width, resolve_calc_value),
+                        right: inset_style
+                            .right
+                            .maybe_resolve(container_size.width, resolve_calc_value),
+                        top: inset_style
+                            .top
+                            .maybe_resolve(container_size.height, resolve_calc_value),
+                        bottom: inset_style
+                            .bottom
+                            .maybe_resolve(container_size.height, resolve_calc_value),
+                    };
+                    taffy::Point {
+                        x: if container_direction == Direction::Rtl {
+                            inset.right.map(|x| -x).or(inset.left).unwrap_or(0.0)
+                        } else {
+                            inset.left.or(inset.right.map(|x| -x)).unwrap_or(0.0)
+                        },
+                        y: inset.top.or(inset.bottom.map(|x| -x)).unwrap_or(0.0),
+                    }
+                } else {
+                    taffy::Point::ZERO
+                };
+                drop(style);
+                let margin_box_block_offset = if vertical && ibox.baseline.is_some() {
+                    let line_start = line.metrics().block_min_coord / scale;
+                    let line_box_height = (line.metrics().block_max_coord
+                        - line.metrics().block_min_coord)
+                        / scale;
+                    let child_height = self.nodes[child_id].unrounded_layout().size.height;
+                    let margin_box_height = margin.top + child_height + margin.bottom;
+                    line_start + (line_box_height - margin_box_height) * 0.5
+                } else {
+                    ibox.y / scale
+                };
+
+                let child_layout = self.nodes[child_id].unrounded_layout_mut();
+                child_layout.location.x =
+                    ibox.x / scale + margin.left + container_pb.left + inset_offset.x;
+                child_layout.location.y =
+                    margin_box_block_offset + margin.top + line_box_top + inset_offset.y;
+                child_layout.padding = padding;
+                child_layout.border = border;
+                child_layout.margin = margin;
+            }
+        }
+    }
+
     pub(crate) fn compute_inline_layout(
         &mut self,
         node_id: NodeId,
@@ -2528,6 +2752,13 @@ impl LayoutPassState<'_> {
         }
 
         if let Some(mut stream) = inline_layout.interline.take() {
+            self.measure_inline_boxes_in_layout(
+                &mut stream.layout,
+                inputs,
+                child_inputs,
+                scale,
+                parent_vertical,
+            );
             let body_lines = inline_layout.layout.lines().collect::<Vec<_>>();
             let parent_strut = inline_layout.layout.root_span_size_and_line_height();
             let body_font_size = parent_strut.map(|(font_size, _)| font_size).unwrap_or(0.0);
@@ -2951,6 +3182,20 @@ impl LayoutPassState<'_> {
         };
         inline_layout.block_offset = block_offset;
         let line_box_top = container_pb.top + block_offset;
+
+        if let Some(stream) = inline_layout.interline.as_ref() {
+            let container_size = final_size - content_box_inset.sum_axes();
+            self.place_inline_boxes_in_layout(
+                &stream.layout,
+                parent_size,
+                container_size,
+                container_pb,
+                line_box_top,
+                container_direction,
+                scale,
+                parent_vertical,
+            );
+        }
 
         // Store sizes and positions of inline boxes
         let mut ibox_order: u32 = 0;
