@@ -3,8 +3,8 @@ use anyrender::filters::{Filter, FilterEffect};
 use blitz_dom::{
     BaseDocument, NodeId,
     node::{
-        InlineNoteFragment, InlineNoteSource, TextBrush, TextLayout, TextOrientation,
-        VerticalTextPaint,
+        InlineNoteFragment, InlineNoteSource, MarginNotePageFragment, TextBrush, TextLayout,
+        TextOrientation, VerticalTextPaint,
     },
     util::ToColorColor,
 };
@@ -2105,6 +2105,7 @@ pub(crate) fn stroke_interline_notes(
 pub(crate) fn stroke_margin_note_group(
     scene: &mut impl PaintScene,
     group: &blitz_dom::node::MarginNoteGroup,
+    fragment: Option<&MarginNotePageFragment>,
     doc: &BaseDocument,
     transform: Affine,
     scale: f64,
@@ -2125,21 +2126,26 @@ pub(crate) fn stroke_margin_note_group(
         .resolve_to_absolute(&current_color)
         .as_srgb_color();
     let border = styles.get_border();
+    let content_box = fragment.map_or(group.content_box, |fragment| fragment.content_box);
+    let padding_box = fragment.map_or(group.padding_box, |fragment| fragment.padding_box);
+    let border_box = fragment.map_or(group.border_box, |fragment| fragment.border_box);
+    let line_start = fragment.map_or(0, |fragment| fragment.line_start);
+    let line_end = fragment.map_or(group.layout.len(), |fragment| fragment.line_end);
     let local_border = Rect::new(
-        f64::from(group.border_box.left - group.content_box.left) * scale,
-        f64::from(group.border_box.top - group.content_box.top) * scale,
-        f64::from(group.border_box.right - group.content_box.left) * scale,
-        f64::from(group.border_box.bottom - group.content_box.top) * scale,
+        f64::from(border_box.left - content_box.left) * scale,
+        f64::from(border_box.top - content_box.top) * scale,
+        f64::from(border_box.right - content_box.left) * scale,
+        f64::from(border_box.bottom - content_box.top) * scale,
     );
     if background.components[3] > 0.0 {
         scene.fill(Fill::NonZero, transform, background, None, &local_border);
     }
 
     let widths = [
-        (group.border_box.top - group.padding_box.top).max(0.0),
-        (group.border_box.right - group.padding_box.right).max(0.0),
-        (group.border_box.bottom - group.padding_box.bottom).max(0.0),
-        (group.border_box.left - group.padding_box.left).max(0.0),
+        (border_box.top - padding_box.top).max(0.0),
+        (border_box.right - padding_box.right).max(0.0),
+        (border_box.bottom - padding_box.bottom).max(0.0),
+        (border_box.left - padding_box.left).max(0.0),
     ];
     let resolve = |color: &style::values::computed::Color| {
         color.resolve_to_absolute(&current_color).as_srgb_color()
@@ -2208,7 +2214,11 @@ pub(crate) fn stroke_margin_note_group(
 
     draw_inline_backgrounds(
         scene,
-        group.layout.lines(),
+        group
+            .layout
+            .lines()
+            .skip(line_start)
+            .take(line_end.saturating_sub(line_start)),
         doc,
         transform,
         inline_root_id,
@@ -2216,7 +2226,11 @@ pub(crate) fn stroke_margin_note_group(
     );
     stroke_text_with_data(
         scene,
-        group.layout.lines(),
+        group
+            .layout
+            .lines()
+            .skip(line_start)
+            .take(line_end.saturating_sub(line_start)),
         doc,
         transform,
         scale,

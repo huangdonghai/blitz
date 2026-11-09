@@ -1449,21 +1449,43 @@ impl ElementCx<'_, '_> {
                 &mut draw_text_context,
             );
             for group in &text_layout.margin_note_groups {
-                let note_transform = transform
-                    * Affine::translate((
-                        f64::from(group.inline_dx) * self.scale,
-                        f64::from(group.inline_dy) * self.scale,
-                    ));
-                crate::text::stroke_margin_note_group(
-                    scene,
-                    group,
-                    self.context.dom,
-                    note_transform,
-                    self.scale,
-                    self.node.id,
-                    self.local_cull_rect(note_transform),
-                    &mut draw_text_context,
-                );
+                if group.page_fragments.is_empty() {
+                    let note_transform = transform
+                        * Affine::translate((
+                            f64::from(group.inline_dx) * self.scale,
+                            f64::from(group.inline_dy) * self.scale,
+                        ));
+                    crate::text::stroke_margin_note_group(
+                        scene,
+                        group,
+                        None,
+                        self.context.dom,
+                        note_transform,
+                        self.scale,
+                        self.node.id,
+                        self.local_cull_rect(note_transform),
+                        &mut draw_text_context,
+                    );
+                } else {
+                    for fragment in &group.page_fragments {
+                        let note_transform = transform
+                            * Affine::translate((
+                                f64::from(group.inline_dx + fragment.shift_x) * self.scale,
+                                f64::from(group.inline_dy + fragment.shift_y) * self.scale,
+                            ));
+                        crate::text::stroke_margin_note_group(
+                            scene,
+                            group,
+                            Some(fragment),
+                            self.context.dom,
+                            note_transform,
+                            self.scale,
+                            self.node.id,
+                            self.local_cull_rect(note_transform),
+                            &mut draw_text_context,
+                        );
+                    }
+                }
             }
         }
     }

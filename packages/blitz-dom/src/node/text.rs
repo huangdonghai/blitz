@@ -317,6 +317,29 @@ pub struct MarginNoteGroup {
     pub margin_box: MarginNoteRect,
     pub content_inline_extent: f32,
     pub content_block_extent: f32,
+    /// The piece of this group that belongs to one page, in page coordinates.
+    /// Empty for an unpaged document, where the group itself is the painting
+    /// unit. A paged group keeps one shared text layout and slices complete
+    /// lines into these fragments; cloning the layout per page would make a
+    /// long margin note cost O(pages x note length) to paint.
+    pub page_fragments: Vec<MarginNotePageFragment>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MarginNotePageFragment {
+    pub page_index: usize,
+    /// Half-open line range in the group's shared layout.
+    pub line_start: usize,
+    pub line_end: usize,
+    /// Physical shift from the group's continuous coordinates to this page's
+    /// fragment, in CSS pixels.
+    pub shift_x: f32,
+    pub shift_y: f32,
+    pub content_box: MarginNoteRect,
+    pub padding_box: MarginNoteRect,
+    pub border_box: MarginNoteRect,
+    pub margin_box: MarginNoteRect,
+    pub content_block_extent: f32,
 }
 
 impl InlineNoteFragment {

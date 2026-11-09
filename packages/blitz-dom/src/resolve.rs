@@ -116,6 +116,14 @@ impl BaseDocument {
         // Next we resolve layout with the data resolved by stlist
         self.resolve_layout();
         timer.record_time("layout");
+
+        // Cut the flow into pages, if this document is laid out for print. Runs after layout
+        // because it reads the laid-out flow, and before the paint tree because paint is what
+        // replays the pieces. Margin notes read those bands below, so they have to exist first;
+        // they are out of flow and cannot change the body's cuts.
+        self.resolve_fragmentation();
+        timer.record_time("fragment");
+
         crate::layout::margin::resolve_margin_notes(self);
         timer.record_time("margin_notes");
         self.nodes.bump_geometry_generation();
@@ -123,12 +131,6 @@ impl BaseDocument {
         // Resolve transforms
         self.resolve_transforms(root_node_id);
         timer.record_time("transform");
-
-        // Cut the flow into pages, if this document is laid out for print. Runs after layout
-        // because it reads the laid-out flow, and before the paint tree because paint is what
-        // replays the pieces.
-        self.resolve_fragmentation();
-        timer.record_time("fragment");
 
         // Build paint children / stacking contexts for damaged subtrees. Runs
         // after layout and transforms so that stacking-context roots created by

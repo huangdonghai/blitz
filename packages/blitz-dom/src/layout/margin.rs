@@ -6,8 +6,11 @@ use style::values::computed::CSSPixelLength;
 use taffy::{BoxSizing, CoreStyle as _, MaybeResolve as _, ResolveOrZero as _, Size};
 
 use crate::layout::construct::build_margin_note_content_layout;
+use crate::layout::fragmentation::{BreakPlan, FlowAxis};
 use crate::layout::resolve_calc_value;
-use crate::node::{MarginNoteGroup, MarginNoteRect, MarginNoteSide, TextBrush, TextLayout};
+use crate::node::{
+    MarginNoteGroup, MarginNotePageFragment, MarginNoteRect, MarginNoteSide, TextBrush, TextLayout,
+};
 use crate::stylo_to_parley;
 use crate::{BaseDocument, NodeId};
 
@@ -105,6 +108,18 @@ struct PendingNote {
     max_block: Option<f32>,
     border_box_sizing: bool,
     content: TextLayout,
+}
+
+struct PlacedGroup {
+    root_id: NodeId,
+    root: RootGeometry,
+    wm: stylo_taffy::WritingMode,
+    group: MarginNoteGroup,
+    block_start_inset: f32,
+    block_end_inset: f32,
+    margin: taffy::Rect<f32>,
+    padding: taffy::Rect<f32>,
+    border: taffy::Rect<f32>,
 }
 
 fn side_physical(wm: stylo_taffy::WritingMode, side: MarginNoteSide) -> PhysicalSide {
@@ -394,6 +409,254 @@ fn margin_box(border: Rect, margin: taffy::Rect<f32>) -> Rect {
     )
 }
 
+fn block_flow_start(plan: &BreakPlan, rect: MarginNoteRect) -> f32 {
+    match plan.axis {
+        FlowAxis::Y => rect.top,
+        FlowAxis::X if plan.reversed => plan.measure - rect.right,
+        FlowAxis::X => rect.left,
+    }
+}
+
+fn block_flow_end(plan: &BreakPlan, rect: MarginNoteRect) -> f32 {
+    match plan.axis {
+        FlowAxis::Y => rect.bottom,
+        FlowAxis::X if plan.reversed => plan.measure - rect.left,
+        FlowAxis::X => rect.right,
+    }
+}
+
+fn block_start_at_flow(
+    plan: &BreakPlan,
+    band: &crate::layout::fragmentation::Band,
+    flow: f32,
+) -> f32 {
+    let local = flow - band.start;
+    match plan.axis {
+        FlowAxis::Y => band.origin.y + local,
+        FlowAxis::X if plan.reversed => band.origin.x + plan.depth - local,
+        FlowAxis::X => band.origin.x + local,
+    }
+}
+
+fn expand_side(rect: &mut Rect, side: PhysicalSide, amount: f32) {
+    if amount == 0.0 {
+        return;
+    }
+    match side {
+        PhysicalSide::Top => rect.top -= amount,
+        PhysicalSide::Right => rect.right += amount,
+        PhysicalSide::Bottom => rect.bottom += amount,
+        PhysicalSide::Left => rect.left -= amount,
+    }
+}
+
+fn expand_fragment_box(
+    mut rect: Rect,
+    insets: taffy::Rect<f32>,
+    wm: stylo_taffy::WritingMode,
+    block_start: PhysicalSide,
+    block_end: PhysicalSide,
+    first: bool,
+    last: bool,
+) -> Rect {
+    expand_side(
+        &mut rect,
+        wm.inline_start_physical_side(),
+        rect_side(insets, wm.inline_start_physical_side()),
+    );
+    expand_side(
+        &mut rect,
+        wm.inline_end_physical_side(),
+        rect_side(insets, wm.inline_end_physical_side()),
+    );
+    if first {
+        expand_side(&mut rect, block_start, rect_side(insets, block_start));
+    }
+    if last {
+        expand_side(&mut rect, block_end, rect_side(insets, block_end));
+    }
+    rect
+}
+
+fn line_block_extents(group: &MarginNoteGroup, scale: f32) -> Vec<(f32, f32)> {
+    let Some(first) = group.layout.get(0) else {
+        return Vec::new();
+    };
+    let origin = first.metrics().block_min_coord;
+    group
+        .layout
+        .lines()
+        .map(|line| {
+            (
+                (line.metrics().block_min_coord - origin) / scale,
+                (line.metrics().block_max_coord - origin) / scale,
+            )
+        })
+        .collect()
+}
+
+/// Slice each placed note into page-local fragments at complete line boundaries.
+///
+/// The note is shaped and broken once in continuous coordinates. A page break
+/// only chooses a range of those lines and translates it to the next page's
+/// margin; it never re-breaks the note, so a long margin note costs one text
+/// layout regardless of how many pages it spans.
+fn paginate_margin_groups(plan: Option<&BreakPlan>, scale: f32, groups: &mut [PlacedGroup]) {
+    let Some(plan) = plan else {
+        return;
+    };
+    if plan.bands.is_empty() {
+        return;
+    }
+
+    let mut occupied = HashMap::<(usize, u8, bool, u8), f32>::new();
+    for placed in groups.iter_mut() {
+        let lines = line_block_extents(&placed.group, scale);
+        if lines.is_empty() {
+            continue;
+        }
+        let group_flow_start = block_flow_start(&plan, placed.group.content_box);
+        let group_flow_end = block_flow_end(&plan, placed.group.content_box);
+        let Some(start_band) = plan
+            .bands
+            .iter()
+            .position(|band| group_flow_start < band.end && group_flow_end > band.start)
+        else {
+            continue;
+        };
+
+        let side = side_physical(placed.wm, placed.group.side);
+        let stack_key = (
+            physical_side_index(side),
+            placed.root.vertical,
+            physical_side_index(placed.root.block_start_side),
+        );
+        let mut line_cursor = 0usize;
+        for (band_index, band) in plan.bands.iter().enumerate().skip(start_band) {
+            if line_cursor >= lines.len() {
+                break;
+            }
+            let page_depth = (band.end - band.start).max(1.0);
+            let first = line_cursor == 0;
+            let desired = if first {
+                (group_flow_start - band.start).max(0.0)
+            } else {
+                placed.block_start_inset
+            };
+            let key = (band_index, stack_key.0, stack_key.1, stack_key.2);
+            let start_local = desired.max(*occupied.get(&key).unwrap_or(&f32::NEG_INFINITY));
+            if start_local >= page_depth - 0.01 {
+                continue;
+            }
+
+            let mut end = line_cursor;
+            while end < lines.len() {
+                let extent = lines[end].1 - lines[line_cursor].0;
+                let end_inset = if end + 1 == lines.len() {
+                    placed.block_end_inset
+                } else {
+                    0.0
+                };
+                if start_local + extent + end_inset <= page_depth + 0.01 {
+                    end += 1;
+                } else if end == line_cursor {
+                    end += 1;
+                    break;
+                } else {
+                    break;
+                }
+            }
+            if end == line_cursor {
+                break;
+            }
+
+            let last = end == lines.len();
+            let extent = lines[end - 1].1 - lines[line_cursor].0;
+            let end_inset = if last { placed.block_end_inset } else { 0.0 };
+            let content_start = block_start_at_flow(
+                &plan,
+                band,
+                band.start + start_local,
+            );
+            let content_end = block_start_at_flow(
+                &plan,
+                band,
+                band.start + start_local + extent,
+            );
+            let content = if placed.root.vertical {
+                Rect::new(
+                    content_start.min(content_end),
+                    placed.group.content_box.top,
+                    content_start.max(content_end),
+                    placed.group.content_box.bottom,
+                )
+            } else {
+                Rect::new(
+                    placed.group.content_box.left,
+                    content_start.min(content_end),
+                    placed.group.content_box.right,
+                    content_start.max(content_end),
+                )
+            };
+            let padding = expand_fragment_box(
+                content,
+                placed.padding,
+                placed.wm,
+                placed.root.block_start_side,
+                placed.root.block_end_side,
+                first,
+                last,
+            );
+            let border = expand_fragment_box(
+                padding,
+                placed.border,
+                placed.wm,
+                placed.root.block_start_side,
+                placed.root.block_end_side,
+                first,
+                last,
+            );
+            let margin = expand_fragment_box(
+                border,
+                placed.margin,
+                placed.wm,
+                placed.root.block_start_side,
+                placed.root.block_end_side,
+                first,
+                last,
+            );
+            let selected_start = lines[line_cursor].0;
+            let original_content_start = match plan.axis {
+                FlowAxis::Y => placed.group.content_box.top + selected_start,
+                FlowAxis::X if plan.reversed => {
+                    placed.group.content_box.right - selected_start
+                }
+                FlowAxis::X => placed.group.content_box.left + selected_start,
+            };
+            let (shift_x, shift_y) = match plan.axis {
+                FlowAxis::Y => (0.0, content_start - original_content_start),
+                FlowAxis::X => (content_start - original_content_start, 0.0),
+            };
+
+            placed.group.page_fragments.push(MarginNotePageFragment {
+                page_index: band_index,
+                line_start: line_cursor,
+                line_end: end,
+                shift_x,
+                shift_y,
+                content_box: content.into(),
+                padding_box: padding.into(),
+                border_box: border.into(),
+                margin_box: margin.into(),
+                content_block_extent: extent,
+            });
+            *occupied.entry(key).or_insert(f32::NEG_INFINITY) =
+                start_local + extent + end_inset;
+            line_cursor = end;
+        }
+    }
+}
+
 fn inline_content_start(
     band: Rect,
     wm: stylo_taffy::WritingMode,
@@ -447,6 +710,9 @@ fn content_extent(value: Option<f32>, natural: f32, border_box: bool, noncontent
 pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
     let scale = doc.viewport().scale();
     let page = page_rect(doc);
+    let page_plan = doc
+        .try_root_element()
+        .and_then(|root| root.break_plan.as_deref().cloned());
     let mut anchors = Vec::new();
     for (root_id, node) in doc.nodes.iter_mut() {
         if let Some(text) = node
@@ -795,6 +1061,7 @@ pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
     });
     let mut occupied = f32::NEG_INFINITY;
     let mut stack_key = None;
+    let mut placed_groups = Vec::with_capacity(ordered.len());
     for plan in ordered {
         let key = (
             physical_side_index(side_physical(plan.wm, plan.side)),
@@ -937,14 +1204,38 @@ pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
             margin_box: margin_box.into(),
             content_inline_extent: plan.content_inline,
             content_block_extent: plan.content_block,
+            page_fragments: Vec::new(),
         };
-        let node = &mut pass.nodes[plan.root_id];
+        let block_start = plan.root.block_start_side;
+        let block_end = plan.root.block_end_side;
+        let block_start_inset = logical_rect_side(plan.margin, plan.wm, block_start)
+            + logical_rect_side(plan.border, plan.wm, block_start)
+            + logical_rect_side(plan.padding, plan.wm, block_start);
+        let block_end_inset = logical_rect_side(plan.margin, plan.wm, block_end)
+            + logical_rect_side(plan.border, plan.wm, block_end)
+            + logical_rect_side(plan.padding, plan.wm, block_end);
+        placed_groups.push(PlacedGroup {
+            root_id: plan.root_id,
+            root: plan.root,
+            wm: plan.wm,
+            group,
+            block_start_inset,
+            block_end_inset,
+            margin: plan.margin,
+            padding: plan.padding,
+            border: plan.border,
+        });
+        occupied = start + plan.outer_block;
+    }
+
+    paginate_margin_groups(page_plan.as_ref(), scale, &mut placed_groups);
+    for placed in placed_groups {
+        let node = &mut pass.nodes[placed.root_id];
         if let Some(text) = node
             .element_data_mut()
             .and_then(|element| element.inline_layout_data.as_mut())
         {
-            text.margin_note_groups.push(group);
+            text.margin_note_groups.push(placed.group);
         }
-        occupied = start + plan.outer_block;
     }
 }
