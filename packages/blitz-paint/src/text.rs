@@ -1,7 +1,11 @@
 use anyrender::PaintScene;
 use anyrender::filters::{Filter, FilterEffect};
 use blitz_dom::{
-    BaseDocument, NodeId, node::TextBrush, node::TextOrientation, node::VerticalTextPaint,
+    BaseDocument, NodeId,
+    node::{
+        InlineNoteFragment, InlineNoteSource, TextBrush, TextLayout, TextOrientation,
+        VerticalTextPaint,
+    },
     util::ToColorColor,
 };
 use icu_properties::{CodePointMapData, props::VerticalOrientation};
@@ -1855,6 +1859,1087 @@ pub(crate) fn stroke_text<'a>(
 
         // The line's text, over its decorations.
         draw_glyph_batches(scene, glyph_batches.drain(..));
+    }
+}
+
+/// Paint the two pre-shaped rows selected for each inline-note fragment.
+///
+/// Note shaping is shared across every fragment. This only walks the selected clusters and
+/// reuses their glyphs, applying Parley's normal spacing rules at each new row edge.
+pub(crate) fn stroke_inline_notes(
+    scene: &mut impl PaintScene,
+    text_layout: &TextLayout,
+    doc: &BaseDocument,
+    transform: Affine,
+    scale: f64,
+    inline_root_id: NodeId,
+    cull_rect: Rect,
+    context: &mut DrawTextContext,
+) {
+    #[cfg(feature = "writing-mode")]
+    let vertical = vertical_text(doc, inline_root_id, scale);
+    #[cfg(not(feature = "writing-mode"))]
+    let vertical: Option<VerticalTextPaint> = None;
+
+    if text_layout.inline_notes.is_empty() {
+        return;
+    }
+
+    for line in text_layout.layout.lines() {
+        let justification_amount = line.justification_amount_per_opportunity();
+        for item in line.items() {
+            let PositionedLayoutItem::InlineBox(inline_box) = item else {
+                continue;
+            };
+            if inline_box.kind != parley::InlineBoxKind::CustomInFlowCentered {
+                continue;
+            }
+            let Some(Some(fragment)) = text_layout.inline_note_fragments.get(inline_box.index)
+            else {
+                continue;
+            };
+            let Some(source) = text_layout.inline_notes.get(fragment.source_index) else {
+                continue;
+            };
+            let Some(segment) = source.segments.get(fragment.segment_index) else {
+                continue;
+            };
+            let Some(source_line) = source.layout.get(segment.line_index) else {
+                continue;
+            };
+
+            let mut note_vertical = vertical;
+            if let (Some(vertical), Some(orientation)) =
+                (note_vertical.as_mut(), source.vertical_text_orientation)
+            {
+                vertical.text_orientation = orientation;
+            }
+            let bounds = inline_note_box_extent(&inline_box, note_vertical.as_ref())
+                .inflate(f64::from(segment.line_height), f64::from(segment.line_height));
+            if bounds.x1 < cull_rect.x0
+                || bounds.x0 > cull_rect.x1
+                || bounds.y1 < cull_rect.y0
+                || bounds.y0 > cull_rect.y1
+            {
+                continue;
+            }
+
+            draw_inline_note_box_background(
+                scene,
+                source,
+                fragment,
+                &inline_box,
+                doc,
+                transform,
+                vertical.as_ref(),
+            );
+
+            let rows = [
+                (
+                    &fragment.first_range,
+                    &fragment.first_shaped_clusters,
+                    fragment.first_advance,
+                    fragment.first_justification_opportunities,
+                    0.0,
+                    fragment.first_line,
+                    fragment.first_line_height,
+                    fragment.first_hanging_start,
+                    fragment.first_hanging_end,
+                    fragment.first_hanging_advance,
+                    fragment.inline_start_edge,
+                    fragment.inline_end_edge,
+                    fragment.block_start_inset,
+                ),
+                (
+                    &fragment.second_range,
+                    &fragment.second_shaped_clusters,
+                    fragment.second_advance,
+                    fragment.second_justification_opportunities,
+                    fragment.first_line_height,
+                    false,
+                    fragment.second_line_height,
+                    false,
+                    fragment.second_hanging_end,
+                    fragment.second_hanging_advance,
+                    fragment.inline_start_edge,
+                    fragment.inline_end_edge,
+                    fragment.block_start_inset,
+                ),
+            ];
+            for (
+                range,
+                shaped_clusters,
+                row_advance,
+                row_justification_opportunities,
+                block_offset,
+                first_line,
+                row_height,
+                hanging_start,
+                hanging_end,
+                hanging_advance,
+                inline_start_edge,
+                inline_end_edge,
+                block_start_inset,
+            ) in rows
+            {
+                if range.is_empty() {
+                    continue;
+                }
+                paint_inline_note_row(
+                    scene,
+                    source,
+                    &source_line,
+                    &segment.run_spans,
+                    range,
+                    shaped_clusters,
+                    first_line,
+                    &inline_box,
+                    row_advance,
+                    row_justification_opportunities,
+                    justification_amount,
+                    block_offset,
+                    row_height,
+                    hanging_start,
+                    hanging_end,
+                    hanging_advance,
+                    inline_start_edge,
+                    inline_end_edge,
+                    block_start_inset,
+                    doc,
+                    transform,
+                    scale,
+                    note_vertical.as_ref(),
+                    context,
+                );
+            }
+        }
+    }
+}
+
+fn draw_inline_note_box_background(
+    scene: &mut impl PaintScene,
+    source: &InlineNoteSource,
+    fragment: &InlineNoteFragment,
+    inline_box: &parley::layout::PositionedInlineBox,
+    doc: &BaseDocument,
+    transform: Affine,
+    vertical: Option<&VerticalTextPaint>,
+) {
+    let Some(styles) = doc
+        .get_node(source.node_id)
+        .and_then(|node| node.primary_styles())
+    else {
+        return;
+    };
+    let current_color = styles.clone_color();
+    let background_color = styles
+        .get_background()
+        .background_color
+        .resolve_to_absolute(&current_color)
+        .as_srgb_color();
+    let edges = source.box_edges;
+    let include_start = edges.clone_decoration || fragment.first_fragment;
+    let include_end = edges.clone_decoration || fragment.last_fragment;
+    let margin_left = if include_start && !source.layout.is_rtl() {
+        edges.margin.left
+    } else if include_end && source.layout.is_rtl() {
+        edges.margin.left
+    } else {
+        0.0
+    };
+    let margin_right = if include_end && !source.layout.is_rtl() {
+        edges.margin.right
+    } else if include_start && source.layout.is_rtl() {
+        edges.margin.right
+    } else {
+        0.0
+    };
+    let block_start_margin = edges.margin.top;
+    let block_end_margin = edges.margin.bottom;
+    let inline_start = inline_box.x + margin_left;
+    let inline_end = inline_box.x + inline_box.width - margin_right;
+    let block_start = inline_box.y + block_start_margin;
+    let block_end = inline_box.y + inline_box.height - block_end_margin;
+    let rect = Rect::new(
+        f64::from(inline_start.min(inline_end)),
+        f64::from(block_start),
+        f64::from(inline_start.max(inline_end)),
+        f64::from(block_end),
+    );
+    #[cfg(feature = "writing-mode")]
+    let background_transform = vertical
+        .map(|vertical| transform * vertical_transform(vertical))
+        .unwrap_or(transform);
+    #[cfg(not(feature = "writing-mode"))]
+    let background_transform = transform;
+    if background_color != Color::TRANSPARENT {
+        scene.fill(
+            Fill::NonZero,
+            background_transform,
+            background_color,
+            None,
+            &rect,
+        );
+    }
+
+    let border = styles.get_border();
+    let (left_style, left_color, right_style, right_color, top_style, top_color, bottom_style, bottom_color) =
+        if let Some(vertical) = vertical {
+            let (block_start_style, block_start_color, block_end_style, block_end_color) =
+                if vertical.block_axis_starts_at_right {
+                    (
+                        border.border_right_style,
+                        &border.border_right_color,
+                        border.border_left_style,
+                        &border.border_left_color,
+                    )
+                } else {
+                    (
+                        border.border_left_style,
+                        &border.border_left_color,
+                        border.border_right_style,
+                        &border.border_right_color,
+                    )
+                };
+            (
+                border.border_top_style,
+                &border.border_top_color,
+                border.border_bottom_style,
+                &border.border_bottom_color,
+                block_start_style,
+                block_start_color,
+                block_end_style,
+                block_end_color,
+            )
+        } else {
+            (
+                border.border_left_style,
+                &border.border_left_color,
+                border.border_right_style,
+                &border.border_right_color,
+                border.border_top_style,
+                &border.border_top_color,
+                border.border_bottom_style,
+                &border.border_bottom_color,
+            )
+        };
+    let x0 = rect.x0 as f32;
+    let x1 = rect.x1 as f32;
+    let y0 = rect.y0 as f32;
+    let y1 = rect.y1 as f32;
+    let edges = source.box_edges;
+    let include_start = edges.clone_decoration || fragment.first_fragment;
+    let include_end = edges.clone_decoration || fragment.last_fragment;
+    let left_width = if source.layout.is_rtl() {
+        if include_end { edges.border.left } else { 0.0 }
+    } else if include_start {
+        edges.border.left
+    } else {
+        0.0
+    };
+    let right_width = if source.layout.is_rtl() {
+        if include_start { edges.border.right } else { 0.0 }
+    } else if include_end {
+        edges.border.right
+    } else {
+        0.0
+    };
+    let resolve_color = |color: &style::values::computed::Color| {
+        color.resolve_to_absolute(&current_color).as_srgb_color()
+    };
+    draw_inline_note_border_side(
+        scene,
+        background_transform,
+        left_style,
+        resolve_color(left_color),
+        NoteBorderSide::Left,
+        left_width,
+        Rect::new(f64::from(x0), f64::from(y0), f64::from(x0 + left_width), f64::from(y1)),
+    );
+    draw_inline_note_border_side(
+        scene,
+        background_transform,
+        right_style,
+        resolve_color(right_color),
+        NoteBorderSide::Right,
+        right_width,
+        Rect::new(f64::from(x1 - right_width), f64::from(y0), f64::from(x1), f64::from(y1)),
+    );
+    draw_inline_note_border_side(
+        scene,
+        background_transform,
+        top_style,
+        resolve_color(top_color),
+        NoteBorderSide::Top,
+        edges.border.top,
+        Rect::new(
+            f64::from(x0),
+            f64::from(y0),
+            f64::from(x1),
+            f64::from(y0 + edges.border.top),
+        ),
+    );
+    draw_inline_note_border_side(
+        scene,
+        background_transform,
+        bottom_style,
+        resolve_color(bottom_color),
+        NoteBorderSide::Bottom,
+        edges.border.bottom,
+        Rect::new(
+            f64::from(x0),
+            f64::from(y1 - edges.border.bottom),
+            f64::from(x1),
+            f64::from(y1),
+        ),
+    );
+}
+
+#[derive(Clone, Copy)]
+enum NoteBorderSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+fn draw_inline_note_border_side(
+    scene: &mut impl PaintScene,
+    transform: Affine,
+    style: style::values::computed::BorderStyle,
+    color: Color,
+    side: NoteBorderSide,
+    width: f32,
+    rect: Rect,
+) {
+    use style::values::computed::BorderStyle;
+    use crate::kurbo_css::Edge;
+
+    if width <= 0.0 || color.components[3] == 0.0 {
+        return;
+    }
+    if matches!(style, BorderStyle::None | BorderStyle::Hidden) {
+        return;
+    }
+    let edge = match side {
+        NoteBorderSide::Top => Edge::Top,
+        NoteBorderSide::Right => Edge::Right,
+        NoteBorderSide::Bottom => Edge::Bottom,
+        NoteBorderSide::Left => Edge::Left,
+    };
+    if matches!(style, BorderStyle::Inset | BorderStyle::Outset) {
+        let color = crate::render::border::beveled_edge_color(
+            color,
+            edge,
+            style == BorderStyle::Inset,
+        );
+        scene.fill(Fill::NonZero, transform, color, None, &rect);
+        return;
+    }
+    if matches!(style, BorderStyle::Groove | BorderStyle::Ridge) {
+        let (outer, inner) = crate::render::border::grooved_edge_colors(
+            color,
+            edge,
+            style == BorderStyle::Ridge,
+        );
+        match side {
+            NoteBorderSide::Top => {
+                let mid = (rect.y0 + rect.y1) * 0.5;
+                let outer_rect = Rect::new(rect.x0, rect.y0, rect.x1, mid);
+                let inner_rect = Rect::new(rect.x0, mid, rect.x1, rect.y1);
+                scene.fill(Fill::NonZero, transform, outer, None, &outer_rect);
+                scene.fill(Fill::NonZero, transform, inner, None, &inner_rect);
+            }
+            NoteBorderSide::Right => {
+                let mid = (rect.x0 + rect.x1) * 0.5;
+                let inner_rect = Rect::new(rect.x0, rect.y0, mid, rect.y1);
+                let outer_rect = Rect::new(mid, rect.y0, rect.x1, rect.y1);
+                scene.fill(Fill::NonZero, transform, outer, None, &outer_rect);
+                scene.fill(Fill::NonZero, transform, inner, None, &inner_rect);
+            }
+            NoteBorderSide::Bottom => {
+                let mid = (rect.y0 + rect.y1) * 0.5;
+                let inner_rect = Rect::new(rect.x0, rect.y0, rect.x1, mid);
+                let outer_rect = Rect::new(rect.x0, mid, rect.x1, rect.y1);
+                scene.fill(Fill::NonZero, transform, outer, None, &outer_rect);
+                scene.fill(Fill::NonZero, transform, inner, None, &inner_rect);
+            }
+            NoteBorderSide::Left => {
+                let mid = (rect.x0 + rect.x1) * 0.5;
+                let outer_rect = Rect::new(rect.x0, rect.y0, mid, rect.y1);
+                let inner_rect = Rect::new(mid, rect.y0, rect.x1, rect.y1);
+                scene.fill(Fill::NonZero, transform, outer, None, &outer_rect);
+                scene.fill(Fill::NonZero, transform, inner, None, &inner_rect);
+            }
+        }
+        return;
+    }
+    if !matches!(style, BorderStyle::Dotted | BorderStyle::Dashed | BorderStyle::Double) {
+        scene.fill(Fill::NonZero, transform, color, None, &rect);
+        return;
+    }
+
+    let (start, end, horizontal) = match side {
+        NoteBorderSide::Top => (
+            kurbo::Point::new(rect.x0, (rect.y0 + rect.y1) * 0.5),
+            kurbo::Point::new(rect.x1, (rect.y0 + rect.y1) * 0.5),
+            true,
+        ),
+        NoteBorderSide::Right => (
+            kurbo::Point::new((rect.x0 + rect.x1) * 0.5, rect.y0),
+            kurbo::Point::new((rect.x0 + rect.x1) * 0.5, rect.y1),
+            false,
+        ),
+        NoteBorderSide::Bottom => (
+            kurbo::Point::new(rect.x0, (rect.y0 + rect.y1) * 0.5),
+            kurbo::Point::new(rect.x1, (rect.y0 + rect.y1) * 0.5),
+            true,
+        ),
+        NoteBorderSide::Left => (
+            kurbo::Point::new((rect.x0 + rect.x1) * 0.5, rect.y0),
+            kurbo::Point::new((rect.x0 + rect.x1) * 0.5, rect.y1),
+            false,
+        ),
+    };
+    let length = if horizontal {
+        rect.width()
+    } else {
+        rect.height()
+    };
+    if length <= 0.0 {
+        return;
+    }
+
+    match style {
+        BorderStyle::Double if width >= 3.0 => {
+            let stroke_width = f64::from(width / 3.0);
+            let shift = f64::from(width / 3.0);
+            for sign in [-1.0, 1.0] {
+                let offset = sign * shift;
+                let (p0, p1) = if horizontal {
+                    (
+                        kurbo::Point::new(start.x, start.y + offset),
+                        kurbo::Point::new(end.x, end.y + offset),
+                    )
+                } else {
+                    (
+                        kurbo::Point::new(start.x + offset, start.y),
+                        kurbo::Point::new(end.x + offset, end.y),
+                    )
+                };
+                let stroke = Stroke::new(stroke_width).with_caps(Cap::Butt);
+                scene.stroke(&stroke, transform, color, None, &kurbo::Line::new(p0, p1));
+            }
+        }
+        BorderStyle::Double => {
+            scene.fill(Fill::NonZero, transform, color, None, &rect);
+        }
+        BorderStyle::Dashed => {
+            let dash_ratio = if width >= 3.0 { 2.0 } else { 3.0 };
+            let gap_ratio = if width >= 3.0 { 1.0 } else { 2.0 };
+            let dash0 = f64::from(width) * dash_ratio;
+            let gap0 = f64::from(width) * gap_ratio;
+            let count = ((length + gap0) / (dash0 + gap0)).round().max(1.0);
+            let ratio = dash_ratio / gap_ratio;
+            let gap = length / (count * ratio + count - 1.0);
+            let dash = ratio * gap;
+            let stroke = Stroke::new(f64::from(width))
+                .with_caps(Cap::Butt)
+                .with_dashes(0.0, [dash, gap]);
+            scene.stroke(&stroke, transform, color, None, &kurbo::Line::new(start, end));
+        }
+        BorderStyle::Dotted => {
+            let radius = f64::from(width) * 0.5;
+            let step = f64::from(width) * 2.0;
+            let mut position = radius;
+            while position <= length - radius {
+                let point = if horizontal {
+                    kurbo::Point::new(start.x + position, start.y)
+                } else {
+                    kurbo::Point::new(start.x, start.y + position)
+                };
+                let circle = Circle::new(point, radius);
+                scene.fill(Fill::NonZero, transform, color, None, &circle);
+                position += step;
+            }
+        }
+        _ => scene.fill(Fill::NonZero, transform, color, None, &rect),
+    }
+}
+
+fn inline_note_box_extent(
+    inline_box: &parley::layout::PositionedInlineBox,
+    vertical: Option<&VerticalTextPaint>,
+) -> Rect {
+    let (inline_start, inline_end) = (inline_box.x, inline_box.x + inline_box.width);
+    let (block_start, block_end) = (inline_box.y, inline_box.y + inline_box.height);
+    let Some(vertical) = vertical else {
+        return Rect::new(
+            f64::from(inline_start),
+            f64::from(block_start),
+            f64::from(inline_end),
+            f64::from(block_end),
+        );
+    };
+
+    let block_x = |block: f32| {
+        if vertical.block_axis_starts_at_right {
+            vertical.block_extent - block
+        } else {
+            block
+        }
+    };
+    let inline_y = |inline: f32| {
+        if vertical.inline_axis_needs_mirror {
+            vertical.inline_extent - inline
+        } else {
+            inline
+        }
+    };
+    let x0 = block_x(block_start);
+    let x1 = block_x(block_end);
+    let y0 = inline_y(inline_start);
+    let y1 = inline_y(inline_end);
+    Rect::new(
+        f64::from(x0.min(x1)),
+        f64::from(y0.min(y1)),
+        f64::from(x0.max(x1)),
+        f64::from(y0.max(y1)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_inline_note_row(
+    scene: &mut impl PaintScene,
+    source: &InlineNoteSource,
+    source_line: &Line<'_, TextBrush>,
+    run_spans: &[blitz_dom::node::InlineNoteRunSpan],
+    text_range: &std::ops::Range<usize>,
+    shaped_range: &std::ops::Range<u32>,
+    first_line: bool,
+    inline_box: &parley::layout::PositionedInlineBox,
+    row_advance: f32,
+    row_justification_opportunities: u32,
+    justification_amount: f32,
+    row_block_offset: f32,
+    row_height: f32,
+    hanging_start: bool,
+    hanging_end: bool,
+    hanging_advance: f32,
+    inline_start_edge: f32,
+    inline_end_edge: f32,
+    block_start_inset: f32,
+    doc: &BaseDocument,
+    transform: Affine,
+    scale: f64,
+    vertical: Option<&VerticalTextPaint>,
+    context: &mut DrawTextContext,
+) {
+    context.glyph_batches.clear();
+    context.shadow_batches.clear();
+    context.deco_boxes.clear();
+    context.stack.clear();
+    context.path_scratch.clear();
+
+    let row_advance =
+        row_advance + row_justification_opportunities as f32 * justification_amount;
+
+    let content_width = (inline_box.width - inline_start_edge - inline_end_edge).max(0.0);
+    let inline_origin = if source.layout.is_rtl() {
+        inline_box.x + inline_end_edge + (content_width - row_advance).max(0.0)
+            - hanging_advance
+    } else {
+        inline_box.x + inline_start_edge
+    };
+    let block_origin = inline_box.y
+        + row_block_offset
+        + block_start_inset
+        - source_line.metrics().block_min_coord;
+    let metrics = *source_line.metrics();
+    let relative_line_centre =
+        (metrics.block_min_coord + metrics.block_max_coord) * 0.5 - metrics.block_min_coord;
+    let relative_baseline = metrics.baseline - metrics.block_min_coord;
+    let mut row_pen = 0.0f32;
+    let mut base_centre = None;
+    #[cfg(feature = "writing-mode")]
+    let vo_map = CodePointMapData::<VerticalOrientation>::new();
+
+    let first_run = run_spans.partition_point(|span| span.text_range.end <= text_range.start);
+    let mut selected_run_indices: Vec<_> = run_spans[first_run..]
+        .iter()
+        .take_while(|span| span.text_range.start < text_range.end)
+        .map(|span| span.item_index)
+        .collect();
+    selected_run_indices.sort_unstable();
+    for item_index in selected_run_indices {
+        for item in source_line.items_for_text_item(item_index, shaped_range.clone()) {
+            let PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                continue;
+            };
+        let run = glyph_run.run();
+        let font = run.font();
+        let font_size = run.font_size();
+        let run_metrics = run.font_metrics();
+        let node_id = glyph_run.style().brush.id;
+        let glyph_xform = run
+            .synthesis()
+            .skew()
+            .map(|angle| Affine::skew(angle.to_radians().tan() as f64, 0.0));
+        let mut upright = Vec::new();
+        let mut rotated = Vec::new();
+        let mut selected_start = usize::MAX;
+        let mut selected_end = 0usize;
+        let mut run_ink_start = None;
+        let mut run_ink_end = None;
+        let mut run_hanging_extra = 0.0f32;
+        let mut run_hanging_start_extra = 0.0f32;
+        let run_inline_start = row_pen;
+
+        for cluster in glyph_run.visual_clusters() {
+            let cluster_range = cluster.text_range();
+            let shaped_range_for_cluster = cluster.shaped_clusters_range();
+            if cluster_range.start < text_range.start
+                || cluster_range.end > text_range.end
+                || !shaped_range.contains(&shaped_range_for_cluster.start)
+            {
+                continue;
+            }
+            selected_start = selected_start.min(cluster_range.start);
+            selected_end = selected_end.max(cluster_range.end);
+
+            let has_shape = cluster.shaped_advance() > 0.0;
+            let old_before = if has_shape { cluster.spacing_before() } else { 0.0 };
+            let cluster_hanging_start = hanging_start
+                && cluster_range.start == text_range.start
+                && cluster.first_hanging_at_line_start();
+            let cluster_hanging_end = hanging_end
+                && cluster_range.end == text_range.end
+                && (cluster.force_hanging_at_line_end()
+                    || cluster.allow_hanging_at_line_end()
+                    || cluster.last_hanging_at_line_end());
+            let hanging_for_paint = source.layout.is_rtl();
+            let (new_before, _) = if has_shape {
+                cluster.spacing_gaps_with_note_line_range_and_hanging(
+                    shaped_range.start,
+                    shaped_range.end,
+                    first_line,
+                    true,
+                    true,
+                    cluster_hanging_start,
+                    cluster_hanging_end,
+                    hanging_for_paint,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let base_advance = cluster.advance_with_note_line_range_and_hanging(
+                shaped_range.start,
+                shaped_range.end,
+                first_line,
+                true,
+                true,
+                cluster_hanging_start,
+                cluster_hanging_end,
+                hanging_for_paint,
+            );
+            let cluster_justification = if justification_amount > 0.0
+                && (cluster_range.end < text_range.end || !cluster.is_word_separator())
+                && !cluster_hanging_start
+                && !cluster_hanging_end
+                && cluster.is_justification_opportunity()
+            {
+                justification_amount
+            } else {
+                0.0
+            };
+            let advance = base_advance + cluster_justification;
+            let un_hung_advance = if cluster_hanging_start || cluster_hanging_end {
+                cluster.advance_with_note_line_range(
+                    shaped_range.start,
+                    shaped_range.end,
+                    first_line,
+                    true,
+                    true,
+                ) + cluster_justification
+            } else {
+                advance
+            };
+            let hanging_extra = (un_hung_advance - advance).max(0.0);
+            if cluster_hanging_start {
+                run_hanging_start_extra += hanging_extra;
+            }
+            if cluster_hanging_end {
+                run_hanging_extra += hanging_extra;
+            }
+            let cluster_origin = row_pen;
+            let is_annotation = source.ruby_ranges.iter().any(|annotation| {
+                annotation.start <= cluster_range.start && cluster_range.end <= annotation.end
+            });
+
+            if let Some(vertical) = vertical {
+                let sideways = match vertical.text_orientation {
+                    TextOrientation::Upright => false,
+                    TextOrientation::Sideways => true,
+                    TextOrientation::Mixed => source
+                        .text
+                        .get(cluster_range.clone())
+                        .and_then(|text| text.chars().next())
+                        .is_some_and(|character| {
+                            vo_map.get(character) == VerticalOrientation::Rotated
+                        }),
+                };
+                let mut glyph_pen = cluster_origin + new_before;
+                for glyph in cluster.glyphs() {
+                    let glyph_advance = glyph.advance;
+                    let (origin, step) = if sideways {
+                        (0.0, glyph_advance)
+                    } else {
+                        (glyph.vertical_origin, glyph.vertical_advance)
+                    };
+                    let inline_pos = inline_origin + glyph_pen;
+                    glyph_pen += if sideways { glyph_advance } else { step };
+
+                    let centre = block_origin
+                        + relative_baseline
+                        + if sideways { glyph.y } else { 0.0 }
+                        + (relative_line_centre - relative_baseline);
+                    let block_pos = if vertical.block_axis_starts_at_right {
+                        vertical.block_extent - centre
+                    } else {
+                        centre
+                    };
+                    let (x, y) = if sideways {
+                        let x = match vertical.text_orientation {
+                            TextOrientation::Sideways => {
+                                block_pos - (relative_baseline - relative_line_centre)
+                            }
+                            _ => block_pos - (run_metrics.ascent - run_metrics.descent) / 2.0,
+                        };
+                        let y = if vertical.inline_axis_needs_mirror {
+                            vertical.inline_extent - inline_pos - glyph_advance - glyph.x
+                        } else {
+                            inline_pos + glyph.x
+                        };
+                        (x, y)
+                    } else {
+                        let x = block_pos - glyph_advance / 2.0 + glyph.x;
+                        let y = if vertical.inline_axis_needs_mirror {
+                            vertical.inline_extent - inline_pos - step + origin
+                        } else {
+                            inline_pos + origin
+                        };
+                        (x, y + glyph.y)
+                    };
+                    let target = if sideways { &mut rotated } else { &mut upright };
+                    target.push(anyrender::Glyph {
+                        id: glyph.id as _,
+                        x,
+                        y,
+                    });
+                }
+            } else if is_annotation {
+                if let Some(centre) = base_centre {
+                    let annotation_glyphs: Vec<_> = cluster.glyphs().collect();
+                    let mut start = f64::INFINITY;
+                    let mut end = f64::NEG_INFINITY;
+                    for glyph in &annotation_glyphs {
+                        let advance = glyph_advance(font, glyph.id) * f64::from(font_size);
+                        start = start.min(f64::from(glyph.x));
+                        end = end.max(f64::from(glyph.x) + advance);
+                    }
+                    if start.is_finite() && end.is_finite() {
+                        let shift = f64::from(centre)
+                            - f64::from(inline_origin + cluster_origin)
+                            - (start + end) * 0.5;
+                        for glyph in annotation_glyphs {
+                            upright.push(anyrender::Glyph {
+                                id: glyph.id as _,
+                                x: (f64::from(inline_origin + cluster_origin + glyph.x) + shift)
+                                    as f32,
+                                y: block_origin + relative_baseline - run_metrics.ascent
+                                    - font_size * 0.75,
+                            });
+                        }
+                    }
+                }
+            } else {
+                base_centre = Some(inline_origin + cluster_origin + advance * 0.5);
+                for glyph in cluster.glyphs() {
+                    upright.push(anyrender::Glyph {
+                        id: glyph.id as _,
+                        x: inline_origin + cluster_origin + new_before - old_before + glyph.x,
+                        y: block_origin + relative_baseline + glyph.y,
+                    });
+                }
+            }
+            let is_space = source
+                .text
+                .get(cluster_range.clone())
+                .is_some_and(|text| text.chars().all(char::is_whitespace));
+            if !is_space {
+                let ink_start = f64::from(
+                    inline_origin + cluster_origin + new_before - old_before,
+                );
+                run_ink_start.get_or_insert(ink_start);
+                run_ink_end = Some(ink_start + f64::from(un_hung_advance));
+            }
+            row_pen += advance;
+        }
+
+        let run_inline_end = row_pen;
+        if upright.is_empty() && rotated.is_empty() {
+            if selected_start == usize::MAX {
+                continue;
+            }
+        }
+
+        context.stack.clear();
+        context.path_scratch.clear();
+        let mut walk = Some(node_id);
+        while let Some(id) = walk {
+            context.path_scratch.push(id);
+            walk = doc.get_node(id).and_then(|node| node.parent);
+        }
+        context.path_scratch.reverse();
+        for &id in &context.path_scratch {
+            context.stack.push(resolve_decoration_entry(doc, id));
+        }
+
+        let geometry = DecorationRunGeometry {
+            baseline: block_origin + relative_baseline,
+            ascent: run_metrics.ascent,
+            descent: run_metrics.descent,
+            underline_offset: run_metrics.underline_offset,
+            underline_size: run_metrics.underline_size,
+            strikethrough_size: run_metrics.strikethrough_size,
+            font: font.clone(),
+            font_size,
+            css_font_size: font_size as f64 / scale,
+        };
+        let run_node_id = node_id;
+        let run_x0 = f64::from(inline_origin + run_inline_start - run_hanging_start_extra);
+        let run_x1 = f64::from(inline_origin + run_inline_end + run_hanging_extra);
+        let (ink_start, ink_end) = (run_ink_start, run_ink_end);
+        for entry in &context.stack {
+            let Some(decoration) = entry.decoration.as_ref() else {
+                continue;
+            };
+            let index = context
+                .deco_boxes
+                .iter()
+                .position(|decoration| decoration.node_id == entry.node_id)
+                .unwrap_or_else(|| {
+                    let relative_offset = context.stack.iter().fold(
+                        (0.0f32, 0.0f32),
+                        |(x, y), entry| {
+                            (
+                                x + entry.relative_offset.0,
+                                y + entry.relative_offset.1,
+                            )
+                        },
+                    );
+                    context.deco_boxes.push(LineDecoration {
+                        node_id: entry.node_id,
+                        deco: decoration.clone(),
+                        min_x: f64::INFINITY,
+                        max_x: f64::NEG_INFINITY,
+                        first_ink_x: None,
+                        last_ink_end: None,
+                        own: None,
+                        first: None,
+                        offset: relative_offset,
+                        shadows: context
+                            .stack
+                            .iter()
+                            .flat_map(|entry| entry.shadows.iter().copied())
+                            .collect(),
+                    });
+                    context.deco_boxes.len() - 1
+                });
+            let accumulated = &mut context.deco_boxes[index];
+            accumulated.min_x = accumulated.min_x.min(run_x0);
+            accumulated.max_x = accumulated.max_x.max(run_x1);
+            if accumulated.first_ink_x.is_none()
+                && let Some(start) = ink_start
+            {
+                accumulated.first_ink_x = Some(start);
+            }
+            if let Some(end) = ink_end {
+                accumulated.last_ink_end = Some(end);
+            }
+            if accumulated.first.is_none() {
+                accumulated.first = Some(geometry.clone());
+            }
+            if entry.node_id == run_node_id {
+                accumulated.own = Some(geometry.clone());
+            }
+        }
+
+        let Some(styles) = doc.get_node(node_id).and_then(|node| node.primary_styles()) else {
+            continue;
+        };
+        let current_color = styles.clone_color();
+        let background_color = styles
+            .get_background()
+            .background_color
+            .resolve_to_absolute(&current_color)
+            .as_srgb_color();
+        if background_color != Color::TRANSPARENT && node_id != source.node_id {
+            let inline_start = inline_origin + run_inline_start - run_hanging_start_extra;
+            let inline_end = inline_origin + row_pen + run_hanging_extra;
+            let block_start = inline_box.y + row_block_offset + block_start_inset;
+            let block_end = block_start + (metrics.block_max_coord - metrics.block_min_coord);
+            let rect = Rect::new(
+                f64::from(inline_start.min(inline_end)),
+                f64::from(block_start),
+                f64::from(inline_start.max(inline_end)),
+                f64::from(block_end),
+            );
+            #[cfg(feature = "writing-mode")]
+            let background_transform = vertical
+                .map(|vertical| transform * vertical_transform(vertical))
+                .unwrap_or(transform);
+            #[cfg(not(feature = "writing-mode"))]
+            let background_transform = transform;
+            scene.fill(
+                Fill::NonZero,
+                background_transform,
+                background_color,
+                None,
+                &rect,
+            );
+        }
+        let mut color = styles.get_inherited_text().color.as_color_color();
+        if let Some((_, emphasis_color)) = source.emphasis_ranges.iter().find(|(range, _)| {
+            range.start < selected_end && selected_start < range.end
+        }) {
+            color = *emphasis_color;
+        }
+        if color.components[3] == 0.0 || (upright.is_empty() && rotated.is_empty()) {
+            continue;
+        }
+        let normalized_coords: &[i16] = bytemuck::cast_slice(run.normalized_coords());
+        let embolden = if FONT_EMBOLDEN_ENABLED {
+            let css_size = font_size as f64 / scale;
+            kurbo::Vec2::new((0.015125 * css_size).min(0.3), (0.0121 * css_size).min(0.3))
+        } else {
+            kurbo::Vec2::default()
+        };
+        let transform = inline_run_transform(doc, node_id, transform, scale);
+        let shadows = resolve_shadows(styles.get_inherited_text());
+        for shadow in shadows.iter().rev() {
+            let offset = Affine::translate((shadow.dx * scale, shadow.dy * scale));
+            let glyphs = upright.iter().chain(rotated.iter()).copied().collect();
+            context.shadow_batches.push(GlyphBatch {
+                blur: shadow.blur * scale,
+                font: font.clone(),
+                font_size,
+                normalized_coords: normalized_coords.to_vec(),
+                embolden,
+                color: shadow.color,
+                paint: anyrender::Paint::from(shadow.color),
+                transform: transform * offset,
+                glyph_xform,
+                glyphs,
+            });
+        }
+        if !upright.is_empty() {
+            context.glyph_batches.push(GlyphBatch {
+                blur: 0.0,
+                font: font.clone(),
+                font_size,
+                normalized_coords: normalized_coords.to_vec(),
+                embolden,
+                color,
+                paint: anyrender::Paint::from(color),
+                transform,
+                glyph_xform,
+                glyphs: upright,
+            });
+        }
+        if !rotated.is_empty() {
+            let turned = Affine::rotate(std::f64::consts::FRAC_PI_2)
+                * glyph_xform.unwrap_or(Affine::IDENTITY);
+            context.glyph_batches.push(GlyphBatch {
+                blur: 0.0,
+                font: font.clone(),
+                font_size,
+                normalized_coords: normalized_coords.to_vec(),
+                embolden,
+                color,
+                paint: anyrender::Paint::from(color),
+                transform,
+                glyph_xform: Some(turned),
+                glyphs: rotated,
+            });
+        }
+        }
+    }
+
+    if !context.deco_boxes.is_empty() {
+        let fragments: HashMap<_, _> = context
+            .deco_boxes
+            .iter()
+            .map(|decoration| {
+                let start = decoration.first_ink_x.unwrap_or(decoration.min_x);
+                let end = decoration.last_ink_end.unwrap_or(decoration.max_x);
+                (decoration.node_id, vec![(0, start, end)])
+            })
+            .collect();
+        let mut row_metrics = *source_line.metrics();
+        row_metrics.baseline = block_origin + relative_baseline;
+        row_metrics.block_min_coord = inline_box.y + row_block_offset;
+        row_metrics.block_max_coord = row_metrics.block_min_coord + row_height;
+        let DrawTextContext {
+            deco_boxes,
+            win_ascent_ratios,
+            ..
+        } = context;
+        flush_line_decorations(
+            scene,
+            transform,
+            scale,
+            deco_boxes,
+            win_ascent_ratios,
+            &row_metrics,
+            vertical,
+            0,
+            &fragments,
+        );
+    }
+
+    draw_glyph_batches(scene, context.shadow_batches.drain(..));
+    draw_glyph_batches(scene, context.glyph_batches.drain(..));
+}
+
+fn inline_run_transform(
+    doc: &BaseDocument,
+    node_id: NodeId,
+    transform: Affine,
+    scale: f64,
+) -> Affine {
+    let mut offset = (0.0f64, 0.0f64);
+    let mut current = Some(node_id);
+    while let Some(id) = current {
+        let Some(node) = doc.get_node(id) else {
+            break;
+        };
+        if let Some(styles) = node.primary_styles() {
+            let display = styles.clone_display();
+            if display.outside() == DisplayOutside::Inline
+                && display.inside() == DisplayInside::Flow
+            {
+                let relative = relative_offset(&styles);
+                offset.0 += f64::from(relative.0);
+                offset.1 += f64::from(relative.1);
+            }
+        }
+        current = node.parent;
+    }
+    if offset == (0.0, 0.0) {
+        transform
+    } else {
+        transform * Affine::translate((offset.0 * scale, offset.1 * scale))
     }
 }
 

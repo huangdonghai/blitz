@@ -1,5 +1,5 @@
 mod background;
-mod border;
+pub(crate) mod border;
 mod box_shadow;
 mod clip_path;
 mod form_controls;
@@ -1422,6 +1422,17 @@ impl ElementCx<'_, '_> {
             crate::text::stroke_text(
                 scene,
                 text_layout.layout.lines(),
+                self.context.dom,
+                transform,
+                self.scale,
+                self.node.id,
+                self.local_cull_rect(transform),
+                &mut draw_text_context,
+            );
+
+            crate::text::stroke_inline_notes(
+                scene,
+                text_layout,
                 self.context.dom,
                 transform,
                 self.scale,

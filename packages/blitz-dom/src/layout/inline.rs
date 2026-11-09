@@ -1,5 +1,5 @@
 use blitz_traits::node_id::NodeId;
-use parley::{AlignmentOptions, BreakReason, IndentOptions};
+use parley::{AlignmentOptions, BreakReason, IndentOptions, YieldData};
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use style::values::{
     computed::{BaselineSource, CSSPixelLength, Contain},
@@ -14,8 +14,6 @@ use taffy::{
 };
 
 #[cfg(feature = "floats")]
-use parley::YieldData;
-#[cfg(feature = "floats")]
 use taffy::{BlockItemStyle as _, Clear, Float, prelude::TaffyMaxContent};
 
 use stylo_taffy::StyleFlags;
@@ -24,6 +22,7 @@ use super::resolve_calc_value;
 use crate::layout::LayoutPassState;
 #[cfg(feature = "writing-mode")]
 use crate::node::{TextOrientation, VerticalTextPaint};
+use crate::node::{InlineNoteFragment, InlineNoteSource};
 use crate::stylo_to_parley;
 
 /// Make Parley resolve upright clusters' vertical metrics.
@@ -52,6 +51,738 @@ fn text_orientation(sideways: bool, upright: bool) -> TextOrientation {
         TextOrientation::Upright
     } else {
         TextOrientation::Mixed
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct InlineNoteCursor {
+    segment: usize,
+    unit: usize,
+}
+
+struct InlineNotePlan {
+    next: InlineNoteCursor,
+    segment: usize,
+    first_range: std::ops::Range<usize>,
+    second_range: std::ops::Range<usize>,
+    first_shaped_clusters: std::ops::Range<u32>,
+    second_shaped_clusters: std::ops::Range<u32>,
+    first_line: bool,
+    first_fragment: bool,
+    last_fragment: bool,
+    edges: NoteFragmentEdges,
+    first_hanging_start: bool,
+    first_hanging_end: bool,
+    second_hanging_end: bool,
+    first_advance: f32,
+    second_advance: f32,
+    first_hanging_advance: f32,
+    second_hanging_advance: f32,
+    first_justification_opportunities: u32,
+    second_justification_opportunities: u32,
+    first_line_height: f32,
+    second_line_height: f32,
+    continues: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NoteHanging {
+    start: bool,
+    force: bool,
+    allow: bool,
+    last: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct NoteFragmentEdges {
+    inline_start_margin: f32,
+    inline_start_padding_border: f32,
+    inline_end_margin: f32,
+    inline_end_padding_border: f32,
+    block_start_margin: f32,
+    block_start_padding_border: f32,
+    block_end_margin: f32,
+    block_end_padding_border: f32,
+}
+
+impl NoteFragmentEdges {
+    fn inline_start(self) -> f32 {
+        self.inline_start_margin + self.inline_start_padding_border
+    }
+
+    fn inline_end(self) -> f32 {
+        self.inline_end_margin + self.inline_end_padding_border
+    }
+
+    fn block_start(self) -> f32 {
+        self.block_start_margin + self.block_start_padding_border
+    }
+
+    fn block_end(self) -> f32 {
+        self.block_end_margin + self.block_end_padding_border
+    }
+}
+
+fn note_fragment_edges(
+    source: &InlineNoteSource,
+    first_fragment: bool,
+    last_fragment: bool,
+) -> NoteFragmentEdges {
+    let edges = source.box_edges;
+    let include_start = edges.clone_decoration || first_fragment;
+    let include_end = edges.clone_decoration || last_fragment;
+    let (margin_start, margin_end, padding_border_start, padding_border_end) =
+        if source.layout.is_rtl() {
+            (
+                edges.margin.right,
+                edges.margin.left,
+                edges.padding.right + edges.border.right,
+                edges.padding.left + edges.border.left,
+            )
+        } else {
+            (
+                edges.margin.left,
+                edges.margin.right,
+                edges.padding.left + edges.border.left,
+                edges.padding.right + edges.border.right,
+            )
+        };
+    NoteFragmentEdges {
+        inline_start_margin: if include_start { margin_start } else { 0.0 },
+        inline_start_padding_border: if include_start { padding_border_start } else { 0.0 },
+        inline_end_margin: if include_end { margin_end } else { 0.0 },
+        inline_end_padding_border: if include_end { padding_border_end } else { 0.0 },
+        block_start_margin: edges.margin.top,
+        block_start_padding_border: edges.padding.top + edges.border.top,
+        block_end_margin: edges.margin.bottom,
+        block_end_padding_border: edges.padding.bottom + edges.border.bottom,
+    }
+}
+
+fn inline_note_range_advance(
+    segment: &crate::node::InlineNoteSegment,
+    start: usize,
+    end: usize,
+    first_line: bool,
+    hanging: NoteHanging,
+) -> f32 {
+    if start >= end {
+        return 0.0;
+    }
+    if end - start == 1 {
+        let unit = &segment.units[start];
+        return note_unit_edge_advance(unit, first_line, hanging);
+    }
+
+    let first = &segment.units[start];
+    let last = &segment.units[end - 1];
+    let start_advance = if hanging.start && first.starts_with_hanging_opening {
+        if first_line {
+            first.first_line_start_hanging_advance
+        } else {
+            first.line_start_hanging_advance
+        }
+    } else if first_line {
+        first.first_line_start_advance
+    } else {
+        first.line_start_advance
+    };
+    segment.prefix_advances[end] - segment.prefix_advances[start]
+        + start_advance
+        - first.advance
+        + note_unit_end_advance(last, hanging)
+        - last.advance
+}
+
+fn note_unit_edge_advance(
+    unit: &crate::node::InlineNoteUnit,
+    first_line: bool,
+    hanging: NoteHanging,
+) -> f32 {
+    let normal = if first_line {
+        unit.first_line_edges_advance
+    } else {
+        unit.line_edges_advance
+    };
+    let end_hanging = if hanging.force && unit.force_hanging_at_end {
+        if first_line {
+            unit.first_line_edges_hanging_advance
+        } else {
+            unit.line_edges_hanging_advance
+        }
+    } else if hanging.allow && unit.allow_hanging_at_end {
+        if first_line {
+            unit.first_line_edges_allow_hanging_advance
+        } else {
+            unit.line_edges_allow_hanging_advance
+        }
+    } else if hanging.last && unit.last_hanging_at_end {
+        if first_line {
+            unit.first_line_edges_last_hanging_advance
+        } else {
+            unit.line_edges_last_hanging_advance
+        }
+    } else {
+        normal
+    };
+    if hanging.start && unit.starts_with_hanging_opening {
+        let start_hanging = if first_line {
+            unit.first_line_edges_start_hanging_advance
+        } else {
+            unit.line_edges_start_hanging_advance
+        };
+        end_hanging + start_hanging - normal
+    } else {
+        end_hanging
+    }
+}
+
+fn note_unit_end_advance(unit: &crate::node::InlineNoteUnit, hanging: NoteHanging) -> f32 {
+    if hanging.force && unit.force_hanging_at_end {
+        unit.line_end_hanging_advance
+    } else if hanging.allow && unit.allow_hanging_at_end {
+        unit.line_end_allow_hanging_advance
+    } else if hanging.last && unit.last_hanging_at_end {
+        unit.line_end_last_hanging_advance
+    } else {
+        unit.line_end_advance
+    }
+}
+
+fn inline_note_range_height(
+    source: &InlineNoteSource,
+    segment: &crate::node::InlineNoteSegment,
+    start: usize,
+    end: usize,
+) -> f32 {
+    if source.layout.is_vertical() {
+        segment.units[start..end]
+            .iter()
+            .fold(source.strut_line_height, |height, unit| {
+                height.max(unit.line_height)
+            })
+    } else {
+        let (over, under) = segment.units[start..end].iter().fold(
+            (source.strut_over, source.strut_under),
+            |(over, under), unit| (over.max(unit.line_over), under.max(unit.line_under)),
+        );
+        over + under
+    }
+}
+
+fn inline_note_justification_opportunities(
+    segment: &crate::node::InlineNoteSegment,
+    start: usize,
+    end: usize,
+    hanging_start: bool,
+    hanging_end: bool,
+) -> u32 {
+    if start >= end {
+        return 0;
+    }
+    let count = segment.units[start..end]
+        .iter()
+        .filter(|unit| unit.is_justification_opportunity)
+        .count() as u32;
+    let start_hang = hanging_start
+        && segment.units[start].starts_with_hanging_opening
+        && segment.units[start].is_justification_opportunity;
+    let last = &segment.units[end - 1];
+    let end_hang = hanging_end
+        && (last.force_hanging_at_end || last.allow_hanging_at_end || last.last_hanging_at_end)
+        && last.is_justification_opportunity;
+    let end_excluded = end_hang || segment.units[end - 1].is_word_separator;
+    count
+        .saturating_sub(u32::from(start_hang))
+        .saturating_sub(u32::from(end_excluded))
+}
+
+fn inline_note_balanced_split(
+    segment: &crate::node::InlineNoteSegment,
+    start: usize,
+    end: usize,
+    first_line: bool,
+    first_hanging: NoteHanging,
+    second_hanging: NoteHanging,
+    balanced: usize,
+) -> Option<usize> {
+    if end == start + 1 {
+        return Some(end);
+    }
+
+    let first_legal = segment
+        .legal_split_boundaries
+        .partition_point(|boundary| *boundary <= start);
+    let last_legal = segment
+        .legal_split_boundaries
+        .partition_point(|boundary| *boundary < end);
+    let legal = &segment.legal_split_boundaries[first_legal..last_legal];
+    if legal.is_empty() {
+        // Keep an unbreakable punctuation group together in the first row. There
+        // is no legal two-row split for this prefix, but the empty second row is
+        // still a valid composition and lets outer-line breaking make progress.
+        return Some(end);
+    }
+
+    let split_at = if segment.nonnegative_advances {
+        legal.partition_point(|split| {
+            inline_note_range_advance(segment, start, *split, first_line, first_hanging)
+                < inline_note_range_advance(segment, *split, end, false, second_hanging)
+        })
+    } else {
+        legal.partition_point(|boundary| *boundary < balanced)
+    };
+    let candidates = [
+        split_at.checked_sub(2).and_then(|index| legal.get(index)),
+        split_at.checked_sub(1).and_then(|index| legal.get(index)),
+        legal.get(split_at),
+        legal.get(split_at + 1),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .copied()
+        .min_by(|left, right| {
+            let width = |split: usize| {
+                inline_note_range_advance(segment, start, split, first_line, first_hanging).max(
+                    inline_note_range_advance(segment, split, end, false, second_hanging),
+                )
+            };
+            width(*left)
+                .total_cmp(&width(*right))
+                // On equal widths, keep more graphemes in the first subline.
+                .then_with(|| right.cmp(left))
+        })
+}
+
+fn plan_inline_note_fragment(
+    source: &InlineNoteSource,
+    cursor: InlineNoteCursor,
+    available: f32,
+    allow_overflow: bool,
+    allow_hanging_start: bool,
+    force_final_line_end: bool,
+) -> Option<InlineNotePlan> {
+    let mut segment_index = cursor.segment;
+    let mut start_unit = cursor.unit;
+    while segment_index < source.segments.len()
+        && start_unit >= source.segments[segment_index].units.len()
+        && !source.segments[segment_index].units.is_empty()
+    {
+        segment_index += 1;
+        start_unit = 0;
+    }
+    let segment = source.segments.get(segment_index)?;
+    if segment.units.is_empty() {
+        let next = InlineNoteCursor {
+            segment: segment_index + 1,
+            unit: 0,
+        };
+        let first_fragment = segment_index == 0 && start_unit == 0;
+        let last_fragment = next.segment >= source.segments.len();
+        return Some(InlineNotePlan {
+            next,
+            segment: segment_index,
+            first_range: segment.text_range.start..segment.text_range.start,
+            second_range: segment.text_range.end..segment.text_range.end,
+            first_shaped_clusters: 0..0,
+            second_shaped_clusters: 0..0,
+            first_line: false,
+            first_fragment,
+            last_fragment,
+            edges: note_fragment_edges(source, first_fragment, last_fragment),
+            first_hanging_start: false,
+            first_hanging_end: false,
+            second_hanging_end: false,
+            first_advance: 0.0,
+            second_advance: 0.0,
+            first_hanging_advance: 0.0,
+            second_hanging_advance: 0.0,
+            first_justification_opportunities: 0,
+            second_justification_opportunities: 0,
+            first_line_height: source.strut_line_height.max(segment.line_height),
+            second_line_height: source.strut_line_height.max(segment.line_height),
+            continues: next.segment < source.segments.len(),
+        });
+    }
+
+    if start_unit >= segment.units.len() {
+        return None;
+    }
+
+    let first_line = segment_index == 0 && start_unit == 0;
+    let first_hanging_start = allow_hanging_start && first_line;
+    let mut best = None;
+    let mut balanced = start_unit + 1;
+    for end_unit in start_unit + 1..=segment.units.len() {
+        if end_unit != segment.units.len() && !segment.units[end_unit - 1].can_split_after {
+            continue;
+        }
+        while balanced + 1 < end_unit {
+            let first = segment.prefix_advances[balanced] - segment.prefix_advances[start_unit];
+            let second = segment.prefix_advances[end_unit] - segment.prefix_advances[balanced];
+            if first >= second {
+                break;
+            }
+            balanced += 1;
+        }
+        let candidate_continues = end_unit < segment.units.len()
+            || segment_index + 1 < source.segments.len();
+        let first_fragment = segment_index == 0 && start_unit == 0;
+        let last_fragment = !candidate_continues;
+        let edges = note_fragment_edges(source, first_fragment, last_fragment);
+        let final_outer_line = !candidate_continues
+            && (!source.has_following_content || force_final_line_end);
+        let outer_line_end = candidate_continues || final_outer_line;
+        let first_split_hanging = NoteHanging {
+            start: first_hanging_start,
+            force: outer_line_end,
+            ..NoteHanging::default()
+        };
+        let second_split_hanging = NoteHanging {
+            force: outer_line_end,
+            last: final_outer_line,
+            ..NoteHanging::default()
+        };
+        let Some(split) = inline_note_balanced_split(
+            segment,
+            start_unit,
+            end_unit,
+            first_line,
+            first_split_hanging,
+            second_split_hanging,
+            balanced,
+        ) else {
+            continue;
+        };
+
+        let first_hanging = NoteHanging {
+            start: first_hanging_start,
+            force: outer_line_end,
+            last: final_outer_line && split == end_unit,
+            ..NoteHanging::default()
+        };
+        let second_hanging = NoteHanging {
+            force: outer_line_end,
+            last: final_outer_line && split < end_unit,
+            ..NoteHanging::default()
+        };
+
+        let first_force_advance =
+            inline_note_range_advance(segment, start_unit, split, first_line, first_hanging);
+        let second_force_advance =
+            inline_note_range_advance(segment, split, end_unit, false, second_hanging);
+        let first_normal_advance =
+            inline_note_range_advance(
+                segment,
+                start_unit,
+                split,
+                first_line,
+                NoteHanging {
+                    start: first_hanging_start,
+                    ..NoteHanging::default()
+                },
+            );
+        let second_normal_advance =
+            inline_note_range_advance(
+                segment,
+                split,
+                end_unit,
+                false,
+                NoteHanging::default(),
+            );
+        let mut first_hanging_end = outer_line_end && first_force_advance < first_normal_advance;
+        let mut second_hanging_end = outer_line_end && second_force_advance < second_normal_advance;
+        let mut first_advance = first_force_advance;
+        let mut second_advance = second_force_advance;
+        if outer_line_end && first_advance > available {
+            let allow = inline_note_range_advance(
+                segment,
+                start_unit,
+                split,
+                first_line,
+                NoteHanging {
+                    start: first_hanging_start,
+                    allow: true,
+                    last: final_outer_line && split == end_unit,
+                    ..NoteHanging::default()
+                },
+            );
+            if allow < first_advance && allow <= available {
+                first_advance = allow;
+                first_hanging_end = true;
+            }
+        }
+        if outer_line_end && second_advance > available {
+            let allow = inline_note_range_advance(
+                segment,
+                split,
+                end_unit,
+                false,
+                NoteHanging {
+                    allow: true,
+                    last: final_outer_line && split < end_unit,
+                    ..NoteHanging::default()
+                },
+            );
+            if allow < second_advance && allow <= available {
+                second_advance = allow;
+                second_hanging_end = true;
+            }
+        }
+        let first_hanging_advance = (first_normal_advance - first_advance).max(0.0);
+        let second_hanging_advance = (second_normal_advance - second_advance).max(0.0);
+        let width = first_advance.max(second_advance) + edges.inline_start() + edges.inline_end();
+        if width <= available || (allow_overflow && split == end_unit) {
+            best = Some((
+                end_unit,
+                split,
+                first_advance,
+                second_advance,
+                first_hanging_advance,
+                second_hanging_advance,
+                first_fragment,
+                last_fragment,
+                edges,
+                first_hanging_end,
+                second_hanging_end,
+            ));
+        } else if segment.nonnegative_advances {
+            break;
+        }
+    }
+
+    let (
+        end_unit,
+        split,
+        first_advance,
+        second_advance,
+        first_hanging_advance,
+        second_hanging_advance,
+        first_fragment,
+        last_fragment,
+        edges,
+        first_hanging_end,
+        second_hanging_end,
+    ) = best?;
+    let first_range = segment.units[start_unit].text_range.start
+        ..segment.units[split - 1].text_range.end;
+    let second_range = if split < end_unit {
+        segment.units[split].text_range.start..segment.units[end_unit - 1].text_range.end
+    } else {
+        let end = segment.units[end_unit - 1].text_range.end;
+        end..end
+    };
+    let first_shaped_clusters = segment.units[start_unit].shaped_clusters.start
+        ..segment.units[split - 1].shaped_clusters.end;
+    let second_shaped_clusters = if split < end_unit {
+        segment.units[split].shaped_clusters.start
+            ..segment.units[end_unit - 1].shaped_clusters.end
+    } else {
+        first_shaped_clusters.end..first_shaped_clusters.end
+    };
+    let next = if end_unit == segment.units.len() {
+        InlineNoteCursor {
+            segment: segment_index + 1,
+            unit: 0,
+        }
+    } else {
+        InlineNoteCursor {
+            segment: segment_index,
+            unit: end_unit,
+        }
+    };
+
+    Some(InlineNotePlan {
+        next,
+        segment: segment_index,
+        first_range,
+        second_range,
+        first_shaped_clusters,
+        second_shaped_clusters,
+        first_line,
+        first_fragment,
+        last_fragment,
+        edges,
+        first_hanging_start,
+        first_hanging_end,
+        second_hanging_end,
+        first_justification_opportunities: inline_note_justification_opportunities(
+            segment,
+            start_unit,
+            split,
+            first_hanging_start,
+            first_hanging_end,
+        ),
+        second_justification_opportunities: inline_note_justification_opportunities(
+            segment,
+            split,
+            end_unit,
+            false,
+            second_hanging_end,
+        ),
+        first_advance,
+        second_advance,
+        first_hanging_advance,
+        second_hanging_advance,
+        first_line_height: inline_note_range_height(source, segment, start_unit, split),
+        second_line_height: if split < end_unit {
+            inline_note_range_height(source, segment, split, end_unit)
+        } else {
+            source.strut_line_height
+        },
+        continues: next.segment < source.segments.len()
+            || next.unit < source.segments.get(next.segment).map_or(0, |next| next.units.len()),
+    })
+}
+
+fn resolve_inline_note_break(
+    breaker: &mut parley::layout::BreakLines<'_, crate::node::TextBrush>,
+    box_break: &parley::layout::BoxBreakData,
+    sources: &[InlineNoteSource],
+    source_indices: &std::collections::HashMap<u64, usize>,
+    cursors: &mut [InlineNoteCursor],
+    fragments: &mut [Option<InlineNoteFragment>],
+    parent_strut: Option<(f32, f32)>,
+    inline_wraps: bool,
+) -> Option<bool> {
+    let source_index = *source_indices.get(&box_break.inline_box_id)?;
+    let source = &sources[source_index];
+    let cursor = &mut cursors[source_index];
+    let inline_box_index = box_break.inline_box_index;
+
+    if cursor.segment >= source.segments.len() {
+        breaker.resolve_custom_inline_box(
+            inline_box_index,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            parley::InlineBoxKind::OutOfFlow,
+        );
+        return Some(false);
+    }
+
+    let available = if inline_wraps {
+        breaker.state().line_max_advance()
+            - breaker.current_line_indent()
+            - box_break.advance
+    } else {
+        f32::MAX
+    };
+    let allow_overflow = box_break.advance <= 0.0;
+    let mut plan = plan_inline_note_fragment(
+        source,
+        *cursor,
+        available,
+        allow_overflow,
+        box_break.advance <= 0.0,
+        false,
+    );
+    let force_final_line_end = plan.as_ref().is_some_and(|plan| {
+        !plan.continues
+            && source.has_following_content
+            && !breaker.following_content_fits_after_custom_box(
+                inline_box_index,
+                plan.first_advance.max(plan.second_advance)
+                    + plan.edges.inline_start()
+                    + plan.edges.inline_end(),
+                inline_wraps,
+            )
+    });
+    if force_final_line_end {
+        plan = plan_inline_note_fragment(
+            source,
+            *cursor,
+            available,
+            allow_overflow,
+            box_break.advance <= 0.0,
+            true,
+        );
+    }
+    let Some(plan) = plan else {
+        if box_break.advance > 0.0 {
+            breaker.break_current_line();
+            return Some(true);
+        }
+        breaker.resolve_custom_inline_box(
+            inline_box_index,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            parley::InlineBoxKind::OutOfFlow,
+        );
+        return Some(false);
+    };
+
+    let content_height = plan.first_line_height + plan.second_line_height;
+    let box_height = content_height + plan.edges.block_start() + plan.edges.block_end();
+    let (body_font_size, body_line_height) =
+        parent_strut.unwrap_or((box_height.max(1.0), box_height));
+    let body_gap = ((body_line_height - body_font_size) * 0.5).max(0.0);
+    let extent = if box_height > body_line_height {
+        box_height + 2.0 * body_gap
+    } else {
+        box_height
+    };
+    let (ascent, descent) = if box_height > body_line_height {
+        (extent * 0.5, extent * 0.5)
+    } else {
+        (box_height * 0.5, box_height * 0.5)
+    };
+
+    fragments[inline_box_index] = Some(InlineNoteFragment {
+        source_index,
+        segment_index: plan.segment,
+        first_range: plan.first_range,
+        second_range: plan.second_range,
+        first_shaped_clusters: plan.first_shaped_clusters,
+        second_shaped_clusters: plan.second_shaped_clusters,
+        first_line: plan.first_line,
+        first_fragment: plan.first_fragment,
+        last_fragment: plan.last_fragment,
+        first_hanging_start: plan.first_hanging_start,
+        first_hanging_end: plan.first_hanging_end,
+        second_hanging_end: plan.second_hanging_end,
+        first_advance: plan.first_advance,
+        second_advance: plan.second_advance,
+        first_hanging_advance: plan.first_hanging_advance,
+        second_hanging_advance: plan.second_hanging_advance,
+        first_justification_opportunities: plan.first_justification_opportunities,
+        second_justification_opportunities: plan.second_justification_opportunities,
+        first_line_height: plan.first_line_height,
+        second_line_height: plan.second_line_height,
+        inline_start_edge: plan.edges.inline_start(),
+        inline_end_edge: plan.edges.inline_end(),
+        block_start_inset: plan.edges.block_start(),
+        block_end_inset: plan.edges.block_end(),
+    });
+    *cursor = plan.next;
+    breaker.resolve_custom_inline_box(
+        inline_box_index,
+        plan.first_advance.max(plan.second_advance) + plan.edges.inline_start() + plan.edges.inline_end(),
+        box_height,
+        box_height * 0.5,
+        ascent,
+        descent,
+        parley::InlineBoxKind::CustomInFlowCentered,
+    );
+    breaker.set_custom_inline_box_justification_profile(
+        inline_box_index,
+        plan.first_advance,
+        plan.first_justification_opportunities,
+        plan.second_advance,
+        plan.second_justification_opportunities,
+    );
+
+    if plan.continues {
+        breaker.break_current_line();
+        Some(true)
+    } else {
+        Some(false)
     }
 }
 
@@ -281,6 +1012,123 @@ impl LayoutPassState<'_> {
             .take_inline_layout()
             .unwrap();
 
+        let note_ids: std::collections::HashSet<_> = inline_layout
+            .inline_notes
+            .iter()
+            .map(|note| note.node_id.as_u64())
+            .collect();
+        let note_box_indices: Vec<_> = inline_layout
+            .layout
+            .inline_boxes()
+            .enumerate()
+            .filter_map(|(index, inline_box)| {
+                note_ids.contains(&inline_box.id).then_some(index)
+            })
+            .collect();
+        for index in note_box_indices {
+            inline_layout.layout.reset_custom_inline_box(index);
+        }
+        inline_layout.inline_note_fragments.fill(None);
+
+        use style::properties::generated::longhands::box_decoration_break::computed_value::T as BoxDecorationBreak;
+        for note in &mut inline_layout.inline_notes {
+            let style = self.child_layout_style(&self.nodes[note.node_id]);
+            let margin = style
+                .margin()
+                .resolve_or_zero(parent_size, resolve_calc_value);
+            let padding = style
+                .padding()
+                .resolve_or_zero(parent_size, resolve_calc_value);
+            let border = style
+                .border()
+                .resolve_or_zero(parent_size, resolve_calc_value);
+            let clone_decoration = self.nodes[note.node_id]
+                .primary_styles()
+                .is_some_and(|styles| {
+                    matches!(
+                        styles.get_border().box_decoration_break,
+                        BoxDecorationBreak::Clone
+                    )
+                });
+            note.box_edges = crate::node::InlineNoteBoxEdges {
+                margin: taffy::Rect {
+                    left: margin.left * scale,
+                    right: margin.right * scale,
+                    top: margin.top * scale,
+                    bottom: margin.bottom * scale,
+                },
+                padding: taffy::Rect {
+                    left: padding.left * scale,
+                    right: padding.right * scale,
+                    top: padding.top * scale,
+                    bottom: padding.bottom * scale,
+                },
+                border: taffy::Rect {
+                    left: border.left * scale,
+                    right: border.right * scale,
+                    top: border.top * scale,
+                    bottom: border.bottom * scale,
+                },
+                clone_decoration,
+            };
+        }
+        let note_intrinsic_by_id: std::collections::HashMap<_, _> = inline_layout
+            .inline_notes
+            .iter()
+            .map(|note| {
+                (
+                    note.node_id.as_u64(),
+                    (
+                        note.min_content_advance,
+                        note.max_content_advance,
+                        note.box_edges,
+                        note.layout.is_rtl(),
+                    ),
+                )
+            })
+            .collect();
+        let mut assigned_note_ids = std::collections::HashSet::new();
+        let intrinsic_note_widths: Vec<_> = inline_layout
+            .layout
+            .inline_boxes()
+            .enumerate()
+            .filter_map(|(index, inline_box)| {
+                if inline_box.kind != parley::InlineBoxKind::CustomInFlow
+                    || !assigned_note_ids.insert(inline_box.id)
+                {
+                    return None;
+                }
+                let (min_content, max_content, edges, is_rtl) =
+                    *note_intrinsic_by_id.get(&inline_box.id)?;
+                let (start, end) = if is_rtl {
+                    (
+                        edges.margin.right + edges.padding.right + edges.border.right,
+                        edges.margin.left + edges.padding.left + edges.border.left,
+                    )
+                } else {
+                    (
+                        edges.margin.left + edges.padding.left + edges.border.left,
+                        edges.margin.right + edges.padding.right + edges.border.right,
+                    )
+                };
+                let min_extra = if edges.clone_decoration {
+                    start + end
+                } else {
+                    start.max(end)
+                };
+                Some((
+                    index,
+                    min_content + min_extra,
+                    max_content + start + end,
+                ))
+            })
+            .collect();
+        for (index, min, max) in intrinsic_note_widths {
+            inline_layout
+                .layout
+                .set_inline_box_intrinsic_widths(index, min, max);
+        }
+
         let style = self.nodes[node_id].layout_style();
 
         // Note: both horizontal and vertical percentage padding/borders are resolved against the container's inline size (i.e. width).
@@ -430,7 +1278,11 @@ impl LayoutPassState<'_> {
         for ibox in inline_layout.layout.inline_boxes_mut() {
             if matches!(
                 ibox.kind,
-                parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+                parley::InlineBoxKind::HangBoundary
+                    | parley::InlineBoxKind::InlineEdge
+                    | parley::InlineBoxKind::OutOfFlow
+                    | parley::InlineBoxKind::CustomOutOfFlow
+                    | parley::InlineBoxKind::CustomInFlow
             ) {
                 continue;
             }
@@ -514,6 +1366,52 @@ impl LayoutPassState<'_> {
                     (margin_box_height.max(0.0) * scale).min(f32::MAX)
                 };
             }
+        }
+
+        let inline_boxes: Vec<_> = inline_layout.layout.inline_boxes().collect();
+        let mut visible_box_suffix = vec![false; inline_boxes.len() + 1];
+        for index in (0..inline_boxes.len()).rev() {
+            let inline_box = inline_boxes[index];
+            let visible = match inline_box.kind {
+                parley::InlineBoxKind::InFlow => inline_box.width > 0.0 || inline_box.height > 0.0,
+                parley::InlineBoxKind::CustomInFlow
+                | parley::InlineBoxKind::CustomInFlowCentered => true,
+                parley::InlineBoxKind::InlineEdge => inline_box.width != 0.0,
+                parley::InlineBoxKind::OutOfFlow
+                | parley::InlineBoxKind::CustomOutOfFlow
+                | parley::InlineBoxKind::HangBoundary => false,
+            };
+            visible_box_suffix[index] = visible || visible_box_suffix[index + 1];
+        }
+        let mut visible_text_suffix = vec![false; inline_layout.text.len() + 1];
+        let mut text_has_visible = false;
+        for (index, character) in inline_layout.text.char_indices().rev() {
+            text_has_visible |= !character.is_whitespace();
+            visible_text_suffix[index] = text_has_visible;
+        }
+        let following_content: Vec<_> = inline_layout
+            .inline_notes
+            .iter()
+            .map(|note| {
+                let marker = inline_boxes.iter().enumerate().find(|(_, inline_box)| {
+                    inline_box.kind == parley::InlineBoxKind::CustomInFlow
+                        && inline_box.id == note.node_id.as_u64()
+                });
+                let Some((first_index, marker)) = marker else {
+                    return false;
+                };
+                let has_text = visible_text_suffix
+                    .get(marker.index)
+                    .copied()
+                    .unwrap_or(false);
+                let next_box = first_index.saturating_add(note.slot_count).min(inline_boxes.len());
+                has_text || visible_box_suffix[next_box]
+            })
+            .collect();
+        for (note, has_following_content) in
+            inline_layout.inline_notes.iter_mut().zip(following_content)
+        {
+            note.has_following_content = has_following_content;
         }
 
         let text_indent = self.nodes[node_id]
@@ -714,6 +1612,18 @@ impl LayoutPassState<'_> {
             .layout
             .set_text_indent(resolved_text_indent * scale, indent_options);
 
+        let inline_wraps = self.nodes[node_id]
+            .primary_styles()
+            .or_else(|| {
+                self.nodes[node_id]
+                    .parent
+                    .and_then(|parent| self.nodes[parent].primary_styles())
+            })
+            .is_none_or(|styles| {
+                stylo_to_parley::text_wrap_mode(styles.clone_text_wrap_mode())
+                    == parley::TextWrapMode::Wrap
+            });
+
         // A ruby annotation is drawn but takes no room in the line (CSS Ruby 1: the annotation
         // is laid out over its base), so its advances are cleared before the lines are broken.
         inline_layout
@@ -738,7 +1648,57 @@ impl LayoutPassState<'_> {
 
         #[cfg(not(feature = "floats"))]
         {
-            inline_layout.layout.break_all_lines(Some(width));
+            if inline_layout.inline_notes.is_empty() {
+                inline_layout.layout.break_all_lines(Some(width));
+            } else {
+                let parent_strut = inline_layout.layout.root_span_size_and_line_height();
+                let notes = &inline_layout.inline_notes;
+                let source_indices: std::collections::HashMap<_, _> = notes
+                    .iter()
+                    .enumerate()
+                    .map(|(index, note)| (note.node_id.as_u64(), index))
+                    .collect();
+                let mut cursors = vec![InlineNoteCursor::default(); notes.len()];
+                let fragments = &mut inline_layout.inline_note_fragments;
+                fragments.fill(None);
+                let mut breaker = inline_layout.layout.break_lines();
+                {
+                    let state = breaker.state_mut();
+                    state.set_layout_max_advance(width);
+                    state.set_line_max_advance(width);
+                }
+
+                while let Some(yield_data) = breaker.break_next() {
+                    match yield_data {
+                        YieldData::InlineBoxBreak(box_break) => {
+                            if resolve_inline_note_break(
+                                &mut breaker,
+                                &box_break,
+                                notes,
+                                &source_indices,
+                                &mut cursors,
+                                fragments,
+                                parent_strut,
+                                inline_wraps,
+                            )
+                            .is_none()
+                            {
+                                breaker.resolve_custom_inline_box(
+                                    box_break.inline_box_index,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    0.0,
+                                    parley::InlineBoxKind::OutOfFlow,
+                                );
+                            }
+                        }
+                        YieldData::LineBreak(_) | YieldData::MaxHeightExceeded(_) => {}
+                    }
+                }
+                breaker.finish();
+            }
         }
 
         // Out-of-flow candidates bubbled up from this container and its in-flow subtree.
@@ -765,6 +1725,16 @@ impl LayoutPassState<'_> {
                     );
                 }
             }
+            let parent_strut = inline_layout.layout.root_span_size_and_line_height();
+            let notes = &inline_layout.inline_notes;
+            let source_indices: std::collections::HashMap<_, _> = notes
+                .iter()
+                .enumerate()
+                .map(|(index, note)| (note.node_id.as_u64(), index))
+                .collect();
+            let mut note_cursors = vec![InlineNoteCursor::default(); notes.len()];
+            let note_fragments = &mut inline_layout.inline_note_fragments;
+            note_fragments.fill(None);
             let mut breaker = inline_layout.layout.break_lines();
             let initial_slot = block_ctx.find_content_slot(0.0, Clear::None, None);
             let mut has_active_floats = initial_slot.segment_id.is_some();
@@ -810,6 +1780,29 @@ impl LayoutPassState<'_> {
                         continue;
                     }
                     YieldData::InlineBoxBreak(box_break_data) => {
+                        if let Some(line_broken) = resolve_inline_note_break(
+                            &mut breaker,
+                            &box_break_data,
+                            notes,
+                            &source_indices,
+                            &mut note_cursors,
+                            note_fragments,
+                            parent_strut,
+                            inline_wraps,
+                        ) {
+                            if line_broken {
+                                let state = breaker.state_mut();
+                                let min_y = (state.line_y() / scale as f64) as f32;
+                                let next_slot =
+                                    block_ctx.find_content_slot(min_y, Clear::None, None);
+                                has_active_floats = next_slot.segment_id.is_some();
+                                state.set_line_max_advance(next_slot.width * scale);
+                                state.set_line_x(next_slot.x * scale);
+                                state.set_line_y((next_slot.y * scale) as f64);
+                            }
+                            continue;
+                        }
+
                         let state = breaker.state_mut();
                         let node_id = NodeId::from_u64(box_break_data.inline_box_id);
 
@@ -1015,7 +2008,9 @@ impl LayoutPassState<'_> {
                 if let parley::layout::PositionedLayoutItem::InlineBox(ibox) = item {
                     if matches!(
                         ibox.kind,
-                        parley::InlineBoxKind::HangBoundary | parley::InlineBoxKind::InlineEdge
+                        parley::InlineBoxKind::HangBoundary
+                            | parley::InlineBoxKind::InlineEdge
+                            | parley::InlineBoxKind::CustomInFlowCentered
                     ) {
                         continue;
                     }

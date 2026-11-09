@@ -26,6 +26,13 @@ pub struct TextLayout {
     pub text: String,
     pub content_widths: Option<ContentWidths>,
     pub layout: parley::layout::Layout<TextBrush>,
+    /// Pre-shaped content for inline-note compositions, keyed by their defining DOM node.
+    /// The paragraph line breaker will choose and position fragments from these layouts;
+    /// the note text is not duplicated into the paragraph's line stream.
+    pub inline_notes: Vec<InlineNoteSource>,
+    /// The fragment ranges selected by the line breaker, indexed by the
+    /// corresponding Parley inline-box index.
+    pub inline_note_fragments: Vec<Option<InlineNoteFragment>>,
     /// Block-axis offset (in CSS px) of the line boxes from the top of the container's content
     /// box, as applied by `align-content`.
     pub block_offset: f32,
@@ -53,6 +60,137 @@ pub struct TextLayout {
     /// therefore needs the physical block extent in order to map — and, for
     /// `vertical-rl`, mirror — line box positions onto the screen.
     pub vertical_text: Option<VerticalTextPaint>,
+}
+
+#[derive(Clone)]
+pub struct InlineNoteSource {
+    pub node_id: NodeId,
+    pub text: String,
+    pub layout: parley::layout::Layout<TextBrush>,
+    pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    pub emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
+    pub segments: Vec<InlineNoteSegment>,
+    pub strut_line_height: f32,
+    pub strut_over: f32,
+    pub strut_under: f32,
+    pub vertical_text_orientation: Option<TextOrientation>,
+    pub min_content_advance: f32,
+    pub max_content_advance: f32,
+    pub has_following_content: bool,
+    pub box_edges: InlineNoteBoxEdges,
+    pub slot_count: usize,
+}
+
+/// Resolved box edges for one inline-note element, in Parley's layout units.
+#[derive(Clone, Copy, Default)]
+pub struct InlineNoteBoxEdges {
+    pub margin: taffy::Rect<f32>,
+    pub padding: taffy::Rect<f32>,
+    pub border: taffy::Rect<f32>,
+    pub clone_decoration: bool,
+}
+
+#[derive(Clone)]
+pub struct InlineNoteSegment {
+    pub line_index: usize,
+    pub text_range: std::ops::Range<usize>,
+    pub line_height: f32,
+    pub run_spans: Vec<InlineNoteRunSpan>,
+    pub units: Vec<InlineNoteUnit>,
+    pub prefix_advances: Vec<f32>,
+    pub legal_split_boundaries: Vec<usize>,
+    pub nonnegative_advances: bool,
+    pub min_content_advance: f32,
+    pub max_content_advance: f32,
+}
+
+#[derive(Clone)]
+pub struct InlineNoteRunSpan {
+    pub text_range: std::ops::Range<usize>,
+    /// Run item index within the pre-shaped Parley line.
+    pub item_index: usize,
+}
+
+#[derive(Clone)]
+pub struct InlineNoteUnit {
+    pub text_range: std::ops::Range<usize>,
+    pub shaped_clusters: std::ops::Range<u32>,
+    pub line_height: f32,
+    pub line_over: f32,
+    pub line_under: f32,
+    /// Advance when this unit is inside a note subline.
+    pub advance: f32,
+    /// Advance when this unit starts a subline (without ending it).
+    pub line_start_advance: f32,
+    /// Advance when opening punctuation hangs at the start of this subline.
+    pub line_start_hanging_advance: f32,
+    /// Advance when this unit ends a subline (without starting it).
+    pub line_end_advance: f32,
+    /// Advance at a subline end when force-end hanging applies.
+    pub line_end_hanging_advance: f32,
+    /// Advance at a subline end when allow-end hanging applies.
+    pub line_end_allow_hanging_advance: f32,
+    /// Advance at a subline end when last-line hanging applies.
+    pub line_end_last_hanging_advance: f32,
+    /// Advance when this unit starts the first formatted line of the note.
+    pub first_line_start_advance: f32,
+    /// First-line start advance with opening-punctuation hanging.
+    pub first_line_start_hanging_advance: f32,
+    pub starts_with_hanging_opening: bool,
+    /// Advance when this unit is the entire subline.
+    pub line_edges_advance: f32,
+    /// Advance for a single-unit subline with force-end hanging.
+    pub line_edges_hanging_advance: f32,
+    /// Single-unit subline advance with opening-punctuation hanging.
+    pub line_edges_start_hanging_advance: f32,
+    /// Single-unit subline advance with allow-end hanging.
+    pub line_edges_allow_hanging_advance: f32,
+    /// Single-unit subline advance with last-line hanging.
+    pub line_edges_last_hanging_advance: f32,
+    /// As above, for the first formatted line of the note.
+    pub first_line_edges_advance: f32,
+    /// First-line single-unit advance with force-end hanging.
+    pub first_line_edges_hanging_advance: f32,
+    /// First-line single-unit advance with allow-end hanging.
+    pub first_line_edges_allow_hanging_advance: f32,
+    /// First-line single-unit advance with last-line hanging.
+    pub first_line_edges_last_hanging_advance: f32,
+    /// First-line single-unit advance with opening-punctuation hanging.
+    pub first_line_edges_start_hanging_advance: f32,
+    pub force_hanging_at_end: bool,
+    pub allow_hanging_at_end: bool,
+    pub last_hanging_at_end: bool,
+    pub is_justification_opportunity: bool,
+    pub is_word_separator: bool,
+    pub can_split_after: bool,
+}
+
+#[derive(Clone)]
+pub struct InlineNoteFragment {
+    pub source_index: usize,
+    pub segment_index: usize,
+    pub first_range: std::ops::Range<usize>,
+    pub second_range: std::ops::Range<usize>,
+    pub first_shaped_clusters: std::ops::Range<u32>,
+    pub second_shaped_clusters: std::ops::Range<u32>,
+    pub first_line: bool,
+    pub first_fragment: bool,
+    pub last_fragment: bool,
+    pub first_hanging_start: bool,
+    pub first_hanging_end: bool,
+    pub second_hanging_end: bool,
+    pub first_advance: f32,
+    pub second_advance: f32,
+    pub first_hanging_advance: f32,
+    pub second_hanging_advance: f32,
+    pub first_justification_opportunities: u32,
+    pub second_justification_opportunities: u32,
+    pub first_line_height: f32,
+    pub second_line_height: f32,
+    pub inline_start_edge: f32,
+    pub inline_end_edge: f32,
+    pub block_start_inset: f32,
+    pub block_end_inset: f32,
 }
 
 /// Physical geometry needed to paint an inline root laid out in a vertical

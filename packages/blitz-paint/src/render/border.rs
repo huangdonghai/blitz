@@ -51,7 +51,7 @@ fn lighten(color: Color) -> Color {
 /// * The lighter edge keeps the base colour unchanged, *except* for colours dark
 ///   enough that the darkened edge wouldn't have enough contrast against the base
 ///   colour, which are lightened instead so the bevel stays visible.
-fn beveled_edge_color(color: Color, edge: Edge, inset: bool) -> Color {
+pub(crate) fn beveled_edge_color(color: Color, edge: Edge, inset: bool) -> Color {
     let top_or_left = matches!(edge, Edge::Top | Edge::Left);
     let should_darken = top_or_left == inset;
 
@@ -83,7 +83,7 @@ fn beveled_edge_color(color: Color, edge: Edge, inset: bool) -> Color {
 ///
 /// A `groove` looks carved into the page: its outer half is shaded like `inset`
 /// and its inner half like `outset`. `ridge` is the reverse (raised).
-fn grooved_edge_colors(color: Color, edge: Edge, ridge: bool) -> (Color, Color) {
+pub(crate) fn grooved_edge_colors(color: Color, edge: Edge, ridge: bool) -> (Color, Color) {
     let outer = beveled_edge_color(color, edge, !ridge);
     let inner = beveled_edge_color(color, edge, ridge);
     (outer, inner)

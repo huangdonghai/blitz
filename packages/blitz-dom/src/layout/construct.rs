@@ -1072,6 +1072,338 @@ fn emphasis_char(styles: &style::properties::ComputedValues) -> Option<char> {
     }
 }
 
+fn collect_inline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeId> {
+    fn walk(
+        nodes: &crate::NodeTree,
+        node_id: NodeId,
+        inside_ruby: bool,
+        notes: &mut Vec<NodeId>,
+    ) {
+        let node = &nodes[node_id];
+        let Some(element) = node.element_data() else {
+            return;
+        };
+        if let Some(display) = node.display_style()
+            && matches!(display.outside(), DisplayOutside::None)
+            && matches!(display.inside(), DisplayInside::None)
+        {
+            return;
+        }
+
+        let is_ruby_text = matches!(&*element.name.local, "rt" | "rtc");
+        let in_ruby = inside_ruby || is_ruby_text;
+        let is_inline_note = !in_ruby
+            && node.primary_styles().is_some_and(|style| {
+                style.clone__hutu_note_placement()
+                    == stylo_to_parley::stylo::HutuNotePlacement::Inline
+            });
+        if is_inline_note {
+            notes.push(node_id);
+            return;
+        }
+
+        if let Some(before) = node.before() {
+            walk(nodes, before, in_ruby, notes);
+        }
+        for child in node.children.iter().copied() {
+            walk(nodes, child, in_ruby, notes);
+        }
+        if let Some(after) = node.after() {
+            walk(nodes, after, in_ruby, notes);
+        }
+    }
+
+    let mut notes = Vec::new();
+    let node = &nodes[root];
+    if let Some(before) = node.before() {
+        walk(nodes, before, false, &mut notes);
+    }
+    for child in node.children.iter().copied() {
+        walk(nodes, child, false, &mut notes);
+    }
+    if let Some(after) = node.after() {
+        walk(nodes, after, false, &mut notes);
+    }
+    notes
+}
+
+fn inline_note_segments(
+    layout: &parley::layout::Layout<TextBrush>,
+    text: &str,
+    annotations: &[std::ops::Range<usize>],
+) -> Vec<crate::node::InlineNoteSegment> {
+    let mut segments = Vec::with_capacity(layout.len());
+    let mut annotation_ranges = annotations.to_vec();
+    annotation_ranges.sort_by_key(|range| range.start);
+    let mut merged_annotations = Vec::<std::ops::Range<usize>>::with_capacity(annotation_ranges.len());
+    for range in annotation_ranges {
+        match merged_annotations.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => merged_annotations.push(range),
+        }
+    }
+    let is_annotation = |text_range: std::ops::Range<usize>| {
+        let index = merged_annotations.partition_point(|range| range.end <= text_range.start);
+        merged_annotations.get(index).is_some_and(|range| {
+            range.start <= text_range.start && text_range.end <= range.end
+        })
+    };
+    let categories = icu_properties::CodePointMapData::<
+        icu_properties::props::GeneralCategory,
+    >::new();
+    let break_sensitive = |character: char| {
+        use icu_properties::props::GeneralCategory as Category;
+        character.is_whitespace()
+            || matches!(
+                categories.get(character),
+                Category::SpaceSeparator
+                    | Category::LineSeparator
+                    | Category::ParagraphSeparator
+                    | Category::ConnectorPunctuation
+                    | Category::DashPunctuation
+                    | Category::OpenPunctuation
+                    | Category::ClosePunctuation
+                    | Category::InitialPunctuation
+                    | Category::FinalPunctuation
+                    | Category::OtherPunctuation
+            )
+    };
+
+    for (line_index, line) in layout.lines().enumerate() {
+        let mut run_spans: Vec<_> = line
+            .runs()
+            .map(|run| crate::node::InlineNoteRunSpan {
+                text_range: run.text_range(),
+                item_index: run.index(),
+            })
+            .collect();
+        run_spans.sort_by_key(|span| span.text_range.start);
+        let mut clusters: Vec<_> = line
+            .runs()
+            .flat_map(|run| run.clusters())
+            .collect();
+        clusters.sort_by_key(|cluster| cluster.text_range().start);
+        let mut units = Vec::with_capacity(clusters.len());
+        let mut at = 0;
+
+        while at < clusters.len() {
+            let start = at;
+            let mut end = at + 1;
+            while end < clusters.len()
+                && (clusters[end].is_ligature_continuation()
+                    || is_annotation(clusters[end].text_range()))
+            {
+                end += 1;
+            }
+
+            let start_byte = clusters[start].text_range().start;
+            let end_byte = clusters[end - 1].text_range().end;
+            let shaped_clusters = clusters[start].shaped_clusters_range().start
+                ..clusters[end - 1].shaped_clusters_range().end;
+            let measure = |first_line,
+                           line_start,
+                           line_end,
+                           hanging_start,
+                           force_hanging,
+                           allow_hanging,
+                           last_hanging| {
+                clusters[start..end]
+                    .iter()
+                    .map(|cluster| {
+                        cluster.advance_with_note_line_range_and_hanging(
+                            shaped_clusters.start,
+                            shaped_clusters.end,
+                            first_line,
+                            line_start,
+                            line_end,
+                            hanging_start && cluster.first_hanging_at_line_start(),
+                            force_hanging && cluster.force_hanging_at_line_end()
+                                || allow_hanging && cluster.allow_hanging_at_line_end()
+                                || last_hanging && cluster.last_hanging_at_line_end(),
+                            false,
+                        )
+                    })
+                    .sum::<f32>()
+            };
+            let advance = measure(false, false, false, false, false, false, false);
+            let line_start_advance = measure(false, true, false, false, false, false, false);
+            let line_start_hanging_advance = measure(false, true, false, true, false, false, false);
+            let line_end_advance = measure(false, false, true, false, false, false, false);
+            let line_end_hanging_advance = measure(false, false, true, false, true, false, false);
+            let line_end_allow_hanging_advance = measure(false, false, true, false, false, true, false);
+            let line_end_last_hanging_advance = measure(false, false, true, false, false, false, true);
+            let first_line_start_advance = measure(true, true, false, false, false, false, false);
+            let first_line_start_hanging_advance = measure(true, true, false, true, false, false, false);
+            let line_edges_advance = measure(false, true, true, false, false, false, false);
+            let line_edges_hanging_advance = measure(false, true, true, false, true, false, false);
+            let line_edges_allow_hanging_advance = measure(false, true, true, false, false, true, false);
+            let line_edges_last_hanging_advance = measure(false, true, true, false, false, false, true);
+            let line_edges_start_hanging_advance = measure(false, true, true, true, false, false, false);
+            let first_line_edges_advance = measure(true, true, true, false, false, false, false);
+            let first_line_edges_hanging_advance = measure(true, true, true, false, true, false, false);
+            let first_line_edges_allow_hanging_advance = measure(true, true, true, false, false, true, false);
+            let first_line_edges_last_hanging_advance = measure(true, true, true, false, false, false, true);
+            let first_line_edges_start_hanging_advance = measure(true, true, true, true, false, false, false);
+            let (line_over, line_under) = clusters[start..end]
+                .iter()
+                .map(|cluster| cluster.line_box_over_under())
+                .fold((0.0_f32, 0.0_f32), |(over, under), (next_over, next_under)| {
+                    (over.max(next_over), under.max(next_under))
+                });
+            let can_split_after = if end == clusters.len() {
+                true
+            } else {
+                let before = text
+                    .get(..end_byte)
+                    .and_then(|slice| slice.chars().next_back());
+                let after_range = clusters[end].text_range();
+                let after = text
+                    .get(after_range)
+                    .and_then(|slice| slice.chars().next());
+                clusters[end].is_soft_wrap_opportunity_before()
+                    || !(before.is_some_and(break_sensitive) || after.is_some_and(break_sensitive))
+            };
+
+            units.push(crate::node::InlineNoteUnit {
+                text_range: start_byte..end_byte,
+                shaped_clusters,
+                line_height: clusters[start].line_height(),
+                line_over,
+                line_under,
+                advance,
+                line_start_advance,
+                line_start_hanging_advance,
+                line_end_advance,
+                line_end_hanging_advance,
+                line_end_allow_hanging_advance,
+                line_end_last_hanging_advance,
+                first_line_start_advance,
+                first_line_start_hanging_advance,
+                starts_with_hanging_opening: clusters[start].first_hanging_at_line_start(),
+                line_edges_advance,
+                line_edges_hanging_advance,
+                line_edges_start_hanging_advance,
+                line_edges_allow_hanging_advance,
+                line_edges_last_hanging_advance,
+                first_line_edges_advance,
+                first_line_edges_hanging_advance,
+                first_line_edges_allow_hanging_advance,
+                first_line_edges_last_hanging_advance,
+                first_line_edges_start_hanging_advance,
+                force_hanging_at_end: clusters[start..end]
+                    .iter()
+                    .any(|cluster| cluster.force_hanging_at_line_end()),
+                allow_hanging_at_end: clusters[start..end]
+                    .iter()
+                    .any(|cluster| cluster.allow_hanging_at_line_end()),
+                last_hanging_at_end: clusters[start..end]
+                    .iter()
+                    .any(|cluster| cluster.last_hanging_at_line_end()),
+                is_justification_opportunity: clusters[start].is_justification_opportunity(),
+                is_word_separator: clusters[start].is_word_separator(),
+                can_split_after,
+            });
+            at = end;
+        }
+
+        let mut prefix_advances = Vec::<f32>::with_capacity(units.len() + 1);
+        prefix_advances.push(0.0);
+        for unit in &units {
+            prefix_advances.push(prefix_advances.last().copied().unwrap_or(0.0) + unit.advance);
+        }
+        let legal_split_boundaries = units
+            .iter()
+            .enumerate()
+            .filter_map(|(index, unit)| unit.can_split_after.then_some(index + 1))
+            .collect::<Vec<_>>();
+        let first_line = line_index == 0;
+        let range_advance = |start: usize, end: usize, first_line: bool| {
+            if start >= end {
+                return 0.0;
+            }
+            if end - start == 1 {
+                return if first_line {
+                    units[start].first_line_edges_advance
+                } else {
+                    units[start].line_edges_advance
+                };
+            }
+            let first = &units[start];
+            let last = &units[end - 1];
+            let start_advance = if first_line {
+                first.first_line_start_advance
+            } else {
+                first.line_start_advance
+            };
+            prefix_advances[end] - prefix_advances[start] + start_advance - first.advance
+                + last.line_end_advance
+                - last.advance
+        };
+        let min_content_advance = units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| {
+                if first_line && index == 0 {
+                    unit.first_line_edges_advance
+                } else {
+                    unit.line_edges_advance
+                }
+            })
+            .fold(0.0, f32::max);
+        let max_content_advance = if units.is_empty() {
+            0.0
+        } else if units.len() == 1 {
+            range_advance(0, 1, first_line)
+        } else {
+            let mut best = range_advance(0, units.len(), first_line);
+            for split in legal_split_boundaries
+                .iter()
+                .copied()
+                .filter(|split| *split > 0 && *split < units.len())
+            {
+                let width = range_advance(0, split, first_line)
+                    .max(range_advance(split, units.len(), false));
+                best = best.min(width);
+            }
+            best
+        };
+        segments.push(crate::node::InlineNoteSegment {
+            line_index,
+            text_range: line.text_range(),
+            line_height: line.metrics().line_height,
+            run_spans,
+            min_content_advance,
+            max_content_advance,
+            nonnegative_advances: units.iter().all(|unit| {
+                unit.advance >= 0.0
+                    && unit.line_start_advance >= 0.0
+                    && unit.line_start_hanging_advance >= 0.0
+                    && unit.line_end_advance >= 0.0
+                    && unit.line_end_hanging_advance >= 0.0
+                    && unit.line_end_allow_hanging_advance >= 0.0
+                    && unit.line_end_last_hanging_advance >= 0.0
+                    && unit.line_edges_advance >= 0.0
+                    && unit.line_edges_start_hanging_advance >= 0.0
+                    && unit.line_edges_hanging_advance >= 0.0
+                    && unit.line_edges_allow_hanging_advance >= 0.0
+                    && unit.line_edges_last_hanging_advance >= 0.0
+                    && unit.first_line_start_advance >= 0.0
+                    && unit.first_line_start_hanging_advance >= 0.0
+                    && unit.first_line_edges_advance >= 0.0
+                    && unit.first_line_edges_hanging_advance >= 0.0
+                    && unit.first_line_edges_allow_hanging_advance >= 0.0
+                    && unit.first_line_edges_last_hanging_advance >= 0.0
+                    && unit.first_line_edges_start_hanging_advance >= 0.0
+            }),
+            units,
+            prefix_advances,
+            legal_split_boundaries,
+        });
+    }
+
+    segments
+}
+
 pub(crate) fn build_inline_layout_into(
     nodes: &crate::NodeTree,
     layout_ctx: &mut LayoutContext<TextBrush>,
@@ -1079,6 +1411,152 @@ pub(crate) fn build_inline_layout_into(
     text_layout: &mut TextLayout,
     scale: f32,
     inline_context_root_node_id: NodeId,
+) {
+    let note_nodes = collect_inline_note_nodes(nodes, inline_context_root_node_id);
+    let mut inline_notes = Vec::with_capacity(note_nodes.len());
+    for note_node_id in note_nodes {
+        let mut note_layout = TextLayout::default();
+        build_inline_layout_into_inner(
+            nodes,
+            layout_ctx,
+            font_ctx,
+            &mut note_layout,
+            scale,
+            note_node_id,
+            Some(note_node_id),
+            &[],
+        );
+        if note_layout.text.is_empty() && note_layout.layout.inline_boxes().len() == 0 {
+            continue;
+        }
+        #[cfg(feature = "writing-mode")]
+        {
+            let note_node = &nodes[note_node_id];
+            let writing_mode = note_node.writing_mode();
+            note_layout.layout.set_vertical(writing_mode.is_vertical());
+            if writing_mode.is_vertical() {
+                let orientation = note_node
+                    .primary_styles()
+                    .map(|style| stylo_to_parley::text_orientation(style.clone_text_orientation()))
+                    .unwrap_or(parley::TextOrientation::Mixed);
+                note_layout
+                    .layout
+                    .set_vertical_advances(&note_layout.text, orientation);
+            }
+        }
+        note_layout
+            .layout
+            .clear_advances(&note_layout.text, &note_layout.ruby_ranges);
+        note_layout.layout.break_all_lines(None);
+        let segments = inline_note_segments(
+            &note_layout.layout,
+            &note_layout.text,
+            &note_layout.ruby_ranges,
+        );
+        let strut_line_height = note_layout
+            .layout
+            .root_span_size_and_line_height()
+            .map(|(_, line_height)| line_height)
+            .or_else(|| segments.first().map(|segment| segment.line_height))
+            .unwrap_or(0.0);
+        let (strut_over, strut_under) = note_layout
+            .layout
+            .root_span_line_box_extents()
+            .unwrap_or((strut_line_height, 0.0));
+        #[cfg(feature = "writing-mode")]
+        let vertical_text_orientation = {
+            let note_node = &nodes[note_node_id];
+            note_node.writing_mode().is_vertical().then(|| {
+                note_node
+                    .primary_styles()
+                    .map(|style| stylo_to_parley::text_orientation(style.clone_text_orientation()))
+                    .unwrap_or(parley::TextOrientation::Mixed)
+            })
+        };
+        #[cfg(not(feature = "writing-mode"))]
+        let vertical_text_orientation = None;
+        let min_content_advance = segments
+            .iter()
+            .map(|segment| segment.min_content_advance)
+            .fold(0.0, f32::max);
+        let max_content_advance = segments
+            .iter()
+            .map(|segment| segment.max_content_advance)
+            .fold(0.0, f32::max)
+            .max(min_content_advance);
+        let unit_count = segments.iter().map(|segment| segment.units.len()).sum::<usize>();
+        let slot_count = unit_count
+            .saturating_add(segments.len())
+            .max(1);
+        inline_notes.push(crate::node::InlineNoteSource {
+            node_id: note_node_id,
+            text: note_layout.text,
+            layout: note_layout.layout,
+            ruby_ranges: note_layout.ruby_ranges,
+            emphasis_ranges: note_layout.emphasis_ranges,
+            segments,
+            strut_line_height,
+            strut_over,
+            strut_under,
+            vertical_text_orientation,
+            min_content_advance,
+            max_content_advance,
+            has_following_content: false,
+            box_edges: crate::node::InlineNoteBoxEdges::default(),
+            slot_count,
+        });
+    }
+
+    build_inline_layout_into_inner(
+        nodes,
+        layout_ctx,
+        font_ctx,
+        text_layout,
+        scale,
+        inline_context_root_node_id,
+        None,
+        &inline_notes,
+    );
+    let mut assigned = std::collections::HashSet::new();
+    let source_intrinsics: std::collections::HashMap<_, _> = inline_notes
+        .iter()
+        .map(|source| {
+            (
+                source.node_id.as_u64(),
+                (source.min_content_advance, source.max_content_advance),
+            )
+        })
+        .collect();
+    let intrinsic_widths: Vec<_> = text_layout
+        .layout
+        .inline_boxes()
+        .enumerate()
+        .filter_map(|(index, inline_box)| {
+            if inline_box.kind != InlineBoxKind::CustomInFlow || !assigned.insert(inline_box.id) {
+                return None;
+            }
+            let (min, max) = *source_intrinsics.get(&inline_box.id)?;
+            Some((index, min, max))
+        })
+        .collect();
+    for (index, min, max) in intrinsic_widths {
+        text_layout
+            .layout
+            .set_inline_box_intrinsic_widths(index, min, max);
+    }
+    text_layout.inline_notes = inline_notes;
+    text_layout.inline_note_fragments = vec![None; text_layout.layout.inline_boxes().len()];
+}
+
+fn build_inline_layout_into_inner(
+    nodes: &crate::NodeTree,
+    layout_ctx: &mut LayoutContext<TextBrush>,
+    font_ctx: &mut FontContext,
+    text_layout: &mut TextLayout,
+    scale: f32,
+    inline_context_root_node_id: NodeId,
+    note_root: Option<NodeId>,
+    note_sources: &[crate::node::InlineNoteSource],
 ) {
     // Get the inline context's root node's text styles
     let root_node = &nodes[inline_context_root_node_id];
@@ -1147,6 +1625,8 @@ pub(crate) fn build_inline_layout_into(
             &text_transform,
             &mut ruby,
             scale,
+            note_root,
+            note_sources,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -1158,6 +1638,8 @@ pub(crate) fn build_inline_layout_into(
             &text_transform,
             &mut ruby,
             scale,
+            note_root,
+            note_sources,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -1169,13 +1651,14 @@ pub(crate) fn build_inline_layout_into(
             &text_transform,
             &mut ruby,
             scale,
+            note_root,
+            note_sources,
         );
     }
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
     text_layout.ruby_ranges = ruby.ranges;
     text_layout.emphasis_ranges = ruby.emphasis;
-    return;
 
     /// Walk one node, recording the byte range of a ruby annotation's text around it.
     fn build_inline_layout_recursive(
@@ -1186,6 +1669,8 @@ pub(crate) fn build_inline_layout_into(
         parent_text_transform: &CaseTransform,
         ruby: &mut RubyBuild,
         scale: f32,
+        note_root: Option<NodeId>,
+        note_sources: &[crate::node::InlineNoteSource],
     ) {
         let is_annotation = nodes[node_id]
             .element_data()
@@ -1199,6 +1684,8 @@ pub(crate) fn build_inline_layout_into(
             parent_text_transform,
             ruby,
             scale,
+            note_root,
+            note_sources,
         );
         if let Some(start) = start {
             ruby.ranges.push(start..builder.text().len());
@@ -1213,6 +1700,8 @@ pub(crate) fn build_inline_layout_into(
         parent_text_transform: &CaseTransform,
         ruby: &mut RubyBuild,
         scale: f32,
+        note_root: Option<NodeId>,
+        note_sources: &[crate::node::InlineNoteSource],
     ) {
         let node = &nodes[node_id];
 
@@ -1222,6 +1711,35 @@ pub(crate) fn build_inline_layout_into(
         let text_transform = style
             .map(|s| CaseTransform::from_style(s))
             .unwrap_or(CaseTransform::NONE);
+
+        if note_root.is_none()
+            && note_sources.iter().any(|note| note.node_id == node_id)
+            && matches!(&node.data, NodeData::Element(_))
+            && style.is_some_and(|style| {
+                style.clone__hutu_note_placement()
+                    == stylo_to_parley::stylo::HutuNotePlacement::Inline
+            })
+        {
+            let display = node.display_style().unwrap_or(Display::inline());
+            if !matches!(display.outside(), DisplayOutside::None)
+                && !matches!(display.inside(), DisplayInside::None)
+            {
+                if let Some(note) = note_sources.iter().find(|note| note.node_id == node_id) {
+                    for _ in 0..note.slot_count {
+                        builder.push_inline_box(InlineBox {
+                            id: node_id.as_u64(),
+                            kind: InlineBoxKind::CustomInFlow,
+                            index: 0,
+                            width: 0.0,
+                            height: 0.0,
+                            baseline: None,
+                            vertical_align: parley::VerticalAlign::BASELINE,
+                        });
+                    }
+                }
+            }
+            return;
+        }
 
         match &node.data {
             NodeData::Element(element_data) | NodeData::AnonymousBlock(element_data) => {
@@ -1237,7 +1755,9 @@ pub(crate) fn build_inline_layout_into(
                     .map(|s| s.clone_position())
                     .unwrap_or(PositionProperty::Static);
                 let float = style.map(|s| s.clone_float()).unwrap_or(Float::None);
-                let box_kind = if position.is_absolutely_positioned() {
+                let box_kind = if note_root == Some(node_id) {
+                    InlineBoxKind::InFlow
+                } else if position.is_absolutely_positioned() {
                     InlineBoxKind::OutOfFlow
                 } else if float.is_floating() {
                     InlineBoxKind::CustomOutOfFlow
@@ -1277,6 +1797,8 @@ pub(crate) fn build_inline_layout_into(
                                 &text_transform,
                                 ruby,
                                 scale,
+                                note_root,
+                                note_sources,
                             );
                         }
                         builder.pop_style_span();
@@ -1373,6 +1895,8 @@ pub(crate) fn build_inline_layout_into(
                                     &text_transform,
                                     ruby,
                                     scale,
+                                    note_root,
+                                    note_sources,
                                 );
                             }
 
@@ -1385,6 +1909,8 @@ pub(crate) fn build_inline_layout_into(
                                     &text_transform,
                                     ruby,
                                     scale,
+                                    note_root,
+                                    note_sources,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -1396,6 +1922,8 @@ pub(crate) fn build_inline_layout_into(
                                     &text_transform,
                                     ruby,
                                     scale,
+                                    note_root,
+                                    note_sources,
                                 );
                             }
 
@@ -1504,4 +2032,5 @@ pub(crate) fn build_inline_layout_into(
             NodeData::Document(_) => unreachable!(),
         }
     }
+
 }
