@@ -205,6 +205,38 @@ fn inline_note_range_advance(
     advance
 }
 
+fn inline_note_range_advance_with_allow(
+    segment: &crate::node::InlineNoteSegment,
+    start: usize,
+    end: usize,
+    first_line: bool,
+    hanging: NoteHanging,
+    available: f32,
+) -> (f32, bool) {
+    let advance = inline_note_range_advance(segment, start, end, first_line, hanging);
+    if !hanging.force || advance <= available {
+        return (advance, false);
+    }
+
+    let allow = inline_note_range_advance(
+        segment,
+        start,
+        end,
+        first_line,
+        NoteHanging {
+            start: hanging.start,
+            allow: true,
+            last: hanging.last,
+            ..NoteHanging::default()
+        },
+    );
+    if allow < advance && allow <= available {
+        (allow, true)
+    } else {
+        (advance, false)
+    }
+}
+
 fn inline_note_text_range(
     segment: &crate::node::InlineNoteSegment,
     start: usize,
@@ -461,6 +493,7 @@ fn inline_note_balanced_split(
     first_line: bool,
     first_hanging: NoteHanging,
     second_hanging: NoteHanging,
+    available: f32,
 ) -> Option<usize> {
     if end == start + 1 {
         return Some(end);
@@ -480,11 +513,35 @@ fn inline_note_balanced_split(
         return Some(end);
     }
 
+    let first_hanging_for_split = |split: usize| NoteHanging {
+        last: second_hanging.last && split == end,
+        ..first_hanging
+    };
+    let second_hanging_for_split = |split: usize| NoteHanging {
+        last: second_hanging.last && split < end,
+        ..second_hanging
+    };
     let first_width = |split: usize| {
-        inline_note_range_advance(segment, start, split, first_line, first_hanging)
+        inline_note_range_advance_with_allow(
+            segment,
+            start,
+            split,
+            first_line,
+            first_hanging_for_split(split),
+            available,
+        )
+        .0
     };
     let second_width = |split: usize| {
-        inline_note_range_advance(segment, split, end, false, second_hanging)
+        inline_note_range_advance_with_allow(
+            segment,
+            split,
+            end,
+            false,
+            second_hanging_for_split(split),
+            available,
+        )
+        .0
     };
     let score = |split: usize| first_width(split).max(second_width(split));
     let mut best = None;
@@ -611,6 +668,7 @@ fn plan_inline_note_fragment(
             first_line,
             first_split_hanging,
             second_split_hanging,
+            available,
         ) else {
             continue;
         };
@@ -650,44 +708,28 @@ fn plan_inline_note_fragment(
                 false,
                 NoteHanging::default(),
             );
-        let mut first_hanging_end = outer_line_end && first_force_advance < first_normal_advance;
-        let mut second_hanging_end = outer_line_end && second_force_advance < second_normal_advance;
-        let mut first_advance = first_force_advance;
-        let mut second_advance = second_force_advance;
-        if outer_line_end && first_advance > available {
-            let allow = inline_note_range_advance(
-                segment,
-                start_unit,
-                split,
-                first_line,
-                NoteHanging {
-                    start: first_hanging_start,
-                    allow: true,
-                    last: final_outer_line && split == end_unit,
-                    ..NoteHanging::default()
-                },
-            );
-            if allow < first_advance && allow <= available {
-                first_advance = allow;
-                first_hanging_end = true;
-            }
-        }
-        if outer_line_end && second_advance > available {
-            let allow = inline_note_range_advance(
-                segment,
-                split,
-                end_unit,
-                false,
-                NoteHanging {
-                    allow: true,
-                    last: final_outer_line && split < end_unit,
-                    ..NoteHanging::default()
-                },
-            );
-            if allow < second_advance && allow <= available {
-                second_advance = allow;
-                second_hanging_end = true;
-            }
+        let (first_advance, first_allow_hanging) = inline_note_range_advance_with_allow(
+            segment,
+            start_unit,
+            split,
+            first_line,
+            first_hanging,
+            available,
+        );
+        let (second_advance, second_allow_hanging) = inline_note_range_advance_with_allow(
+            segment,
+            split,
+            end_unit,
+            false,
+            second_hanging,
+            available,
+        );
+        let first_hanging_end = outer_line_end
+            && (first_force_advance < first_normal_advance || first_allow_hanging);
+        let second_hanging_end = outer_line_end
+            && (second_force_advance < second_normal_advance || second_allow_hanging);
+        if first_advance < second_advance {
+            continue;
         }
         let first_hanging_advance = (first_normal_advance - first_advance).max(0.0);
         let second_hanging_advance = (second_normal_advance - second_advance).max(0.0);
