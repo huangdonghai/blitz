@@ -344,7 +344,7 @@ fn inline_note_atomic_positions(
     hanging_start: bool,
     hanging_end: bool,
     hanging_advance: f32,
-) -> Vec<(u64, f32, f32)> {
+) -> Vec<(u64, f32, f32, f32, f32)> {
     if unit_range.is_empty() {
         return Vec::new();
     }
@@ -410,6 +410,8 @@ fn inline_note_atomic_positions(
                 atomic_node_id,
                 inline_origin + inline_pen,
                 block_origin + unit.inline_box_block_offset,
+                unit.advance,
+                unit.line_height,
             ));
         }
 
@@ -1456,13 +1458,54 @@ impl LayoutPassState<'_> {
                 let exports_baseline = !(baseline_source == BaselineSource::Auto
                     && is_block_axis_scroll_container)
                     && !contain_layout;
-                let child_inputs = inline_box_inputs(style.size().width, margin, child_inputs);
+                let auto_inline_size = style.size().width.is_auto();
+                let inline_insets = padding.horizontal_axis_sum() + border.horizontal_axis_sum();
+                let cached_max_content_inline_size = auto_inline_size
+                    .then(|| {
+                        self.nodes[child_node_id]
+                            .element_data()
+                            .and_then(|element| element.inline_layout_data.as_ref())
+                            .filter(|layout| layout.layout.lines().count() == 1)
+                            .map(|layout| layout.layout.calculate_content_widths().max / scale)
+                    })
+                    .flatten();
+                // A note subline treats an inline-block as one atomic item. Its auto inline
+                // size must therefore see its max-content line, so the note's outer two-row
+                // split cannot introduce extra rows inside the atom. Explicit width sizing
+                // keywords are still resolved by `inline_box_inputs` below.
+                let mut note_child_inputs = child_inputs;
+                note_child_inputs.available_space = Size::MAX_CONTENT;
+                let mut child_inputs =
+                    inline_box_inputs(style.size().width, margin, note_child_inputs);
+                if let Some(max_content_inline_size) = cached_max_content_inline_size {
+                    child_inputs.known_dimensions.width =
+                        Some(max_content_inline_size + inline_insets);
+                }
                 drop(style);
 
-                let output = self.compute_child_layout(
+                let mut output = self.compute_child_layout(
                     crate::taffy_node_id(child_node_id),
                     child_inputs,
                 );
+                if auto_inline_size {
+                    let max_content_inline_size = self.nodes[child_node_id]
+                        .element_data()
+                        .and_then(|element| element.inline_layout_data.as_ref())
+                        .map(|layout| layout.layout.calculate_content_widths().max / scale);
+                    if let Some(max_content_inline_size) = max_content_inline_size {
+                        let current_content_size =
+                            (output.size.width - inline_insets).max(0.0);
+                        let max_content_border_box = output.size.width
+                            + (max_content_inline_size - current_content_size).max(0.0);
+                        if max_content_border_box > output.size.width {
+                            child_inputs.known_dimensions.width = Some(max_content_border_box);
+                            output = self.compute_child_layout(
+                                crate::taffy_node_id(child_node_id),
+                                child_inputs,
+                            );
+                        }
+                    }
+                }
                 inline_box.width = (margin.left + margin.right + output.size.width) * scale;
                 inline_box.baseline = if exports_baseline {
                     let baseline = if uses_last_baseline {
@@ -2360,7 +2403,13 @@ impl LayoutPassState<'_> {
                             {
                                 continue;
                             }
-                            for (atomic_node_id, inline_position, block_position) in
+                            for (
+                                atomic_node_id,
+                                inline_position,
+                                block_position,
+                                margin_box_inline_size,
+                                margin_box_block_size,
+                            ) in
                                 inline_note_atomic_positions(
                                     source,
                                     segment,
@@ -2428,6 +2477,16 @@ impl LayoutPassState<'_> {
                                     (margin, inset_offset)
                                 };
                                 let child_layout = self.nodes[child].unrounded_layout_mut();
+                                child_layout.size = Size {
+                                    width: (margin_box_inline_size / scale
+                                        - margin.left
+                                        - margin.right)
+                                        .max(0.0),
+                                    height: (margin_box_block_size / scale
+                                        - margin.top
+                                        - margin.bottom)
+                                        .max(0.0),
+                                };
                                 child_layout.location = Point {
                                     x: inline_position / scale
                                         + margin.left
