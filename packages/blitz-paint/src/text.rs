@@ -1924,6 +1924,30 @@ pub(crate) fn stroke_inline_notes(
                 continue;
             }
 
+            let first_common_width = fragment.first_advance
+                + fragment.first_justification_opportunities as f32 * justification_amount;
+            let second_common_width = fragment.second_advance
+                + fragment.second_justification_opportunities as f32 * justification_amount;
+            let justified_note_width = first_common_width.max(second_common_width);
+            let first_row_fill = if fragment.outer_line_end
+                && justification_amount > 0.0
+                && fragment.first_justification_opportunities > 0
+            {
+                (fragment.first_justification_opportunities as f32).recip()
+                    * (justified_note_width - first_common_width).max(0.0)
+            } else {
+                0.0
+            };
+            let second_row_fill = if fragment.outer_line_end
+                && justification_amount > 0.0
+                && fragment.second_justification_opportunities > 0
+            {
+                (fragment.second_justification_opportunities as f32).recip()
+                    * (justified_note_width - second_common_width).max(0.0)
+            } else {
+                0.0
+            };
+
             draw_inline_note_box_background(
                 scene,
                 source,
@@ -1940,6 +1964,7 @@ pub(crate) fn stroke_inline_notes(
                     &fragment.first_shaped_clusters,
                     fragment.first_advance,
                     fragment.first_justification_opportunities,
+                    first_row_fill,
                     0.0,
                     fragment.first_line,
                     fragment.first_line_height,
@@ -1955,6 +1980,7 @@ pub(crate) fn stroke_inline_notes(
                     &fragment.second_shaped_clusters,
                     fragment.second_advance,
                     fragment.second_justification_opportunities,
+                    second_row_fill,
                     fragment.first_line_height,
                     false,
                     fragment.second_line_height,
@@ -1971,6 +1997,7 @@ pub(crate) fn stroke_inline_notes(
                 shaped_clusters,
                 row_advance,
                 row_justification_opportunities,
+                row_fill_amount,
                 block_offset,
                 first_line,
                 row_height,
@@ -1996,6 +2023,7 @@ pub(crate) fn stroke_inline_notes(
                     &inline_box,
                     row_advance,
                     row_justification_opportunities,
+                    row_fill_amount,
                     justification_amount,
                     block_offset,
                     row_height,
@@ -2420,6 +2448,7 @@ fn paint_inline_note_row(
     inline_box: &parley::layout::PositionedInlineBox,
     row_advance: f32,
     row_justification_opportunities: u32,
+    row_fill_amount: f32,
     justification_amount: f32,
     row_block_offset: f32,
     row_height: f32,
@@ -2441,8 +2470,9 @@ fn paint_inline_note_row(
     context.stack.clear();
     context.path_scratch.clear();
 
+    let row_justification_amount = justification_amount + row_fill_amount;
     let row_advance =
-        row_advance + row_justification_opportunities as f32 * justification_amount;
+        row_advance + row_justification_opportunities as f32 * row_justification_amount;
 
     let content_width = (inline_box.width - inline_start_edge - inline_end_edge).max(0.0);
     let inline_origin = if source.layout.is_rtl() {
@@ -2548,7 +2578,7 @@ fn paint_inline_note_row(
                 && !cluster_hanging_end
                 && cluster.is_justification_opportunity()
             {
-                justification_amount
+                row_justification_amount
             } else {
                 0.0
             };

@@ -115,6 +115,10 @@ pub struct InlineNoteRunSpan {
 pub struct InlineNoteUnit {
     pub text_range: std::ops::Range<usize>,
     pub shaped_clusters: std::ops::Range<u32>,
+    /// Layout box represented by this indivisible unit, when it is atomic inline content.
+    pub inline_box_index: Option<usize>,
+    /// Visual line-item index used to place atomic content beside shaped text runs.
+    pub line_item_index: usize,
     pub line_height: f32,
     pub line_over: f32,
     pub line_under: f32,
@@ -171,11 +175,14 @@ pub struct InlineNoteFragment {
     pub segment_index: usize,
     pub first_range: std::ops::Range<usize>,
     pub second_range: std::ops::Range<usize>,
+    pub first_unit_range: std::ops::Range<usize>,
+    pub second_unit_range: std::ops::Range<usize>,
     pub first_shaped_clusters: std::ops::Range<u32>,
     pub second_shaped_clusters: std::ops::Range<u32>,
     pub first_line: bool,
     pub first_fragment: bool,
     pub last_fragment: bool,
+    pub outer_line_end: bool,
     pub first_hanging_start: bool,
     pub first_hanging_end: bool,
     pub second_hanging_end: bool,

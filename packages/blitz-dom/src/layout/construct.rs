@@ -1127,12 +1127,13 @@ fn collect_inline_note_nodes(nodes: &crate::NodeTree, root: NodeId) -> Vec<NodeI
     notes
 }
 
-fn inline_note_segments(
+pub(crate) fn inline_note_segments(
     layout: &parley::layout::Layout<TextBrush>,
     text: &str,
     annotations: &[std::ops::Range<usize>],
 ) -> Vec<crate::node::InlineNoteSegment> {
     let mut segments = Vec::with_capacity(layout.len());
+    let inline_boxes: Vec<_> = layout.inline_boxes().collect();
     let mut annotation_ranges = annotations.to_vec();
     annotation_ranges.sort_by_key(|range| range.start);
     let mut merged_annotations = Vec::<std::ops::Range<usize>>::with_capacity(annotation_ranges.len());
@@ -1267,6 +1268,8 @@ fn inline_note_segments(
             units.push(crate::node::InlineNoteUnit {
                 text_range: start_byte..end_byte,
                 shaped_clusters,
+                inline_box_index: None,
+                line_item_index: clusters[start].run().index(),
                 line_height: clusters[start].line_height(),
                 line_over,
                 line_under,
@@ -1305,6 +1308,71 @@ fn inline_note_segments(
             });
             at = end;
         }
+
+        for item in line.items() {
+            let parley::layout::PositionedLayoutItem::InlineBox(inline_box) = item else {
+                continue;
+            };
+            if !matches!(
+                inline_box.kind,
+                InlineBoxKind::InFlow
+                    | InlineBoxKind::InlineEdge
+                    | InlineBoxKind::HangBoundary
+            ) {
+                continue;
+            }
+            let Some(layout_box) = inline_boxes.get(inline_box.index) else {
+                continue;
+            };
+            let baseline = inline_box.baseline.unwrap_or(inline_box.height);
+            let (line_over, line_under) = if inline_box.kind == InlineBoxKind::InFlow {
+                (baseline, inline_box.height - baseline)
+            } else {
+                (0.0, 0.0)
+            };
+            units.push(crate::node::InlineNoteUnit {
+                text_range: layout_box.index..layout_box.index,
+                shaped_clusters: 0..0,
+                inline_box_index: Some(inline_box.index),
+                line_item_index: inline_box.item_index,
+                line_height: inline_box.height,
+                line_over,
+                line_under,
+                advance: inline_box.width,
+                line_start_advance: inline_box.width,
+                line_start_hanging_advance: inline_box.width,
+                line_end_advance: inline_box.width,
+                line_end_hanging_advance: inline_box.width,
+                line_end_allow_hanging_advance: inline_box.width,
+                line_end_last_hanging_advance: inline_box.width,
+                first_line_start_advance: inline_box.width,
+                first_line_start_hanging_advance: inline_box.width,
+                starts_with_hanging_opening: false,
+                line_edges_advance: inline_box.width,
+                line_edges_hanging_advance: inline_box.width,
+                line_edges_start_hanging_advance: inline_box.width,
+                line_edges_allow_hanging_advance: inline_box.width,
+                line_edges_last_hanging_advance: inline_box.width,
+                first_line_edges_advance: inline_box.width,
+                first_line_edges_hanging_advance: inline_box.width,
+                first_line_edges_allow_hanging_advance: inline_box.width,
+                first_line_edges_last_hanging_advance: inline_box.width,
+                first_line_edges_start_hanging_advance: inline_box.width,
+                force_hanging_at_end: false,
+                allow_hanging_at_end: false,
+                last_hanging_at_end: false,
+                is_justification_opportunity: false,
+                is_word_separator: false,
+                can_split_after: true,
+            });
+        }
+        units.sort_by_key(|unit| {
+            (
+                unit.text_range.start,
+                u8::from(unit.inline_box_index.is_none()),
+                unit.line_item_index,
+            )
+        });
 
         let mut prefix_advances = Vec::<f32>::with_capacity(units.len() + 1);
         prefix_advances.push(0.0);
