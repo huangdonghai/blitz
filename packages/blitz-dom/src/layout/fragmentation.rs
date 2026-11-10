@@ -1667,7 +1667,23 @@ impl<'a> Planner<'a> {
         } else {
             node.final_layout()
         };
-        let origin = top + (layout.padding.top + layout.border.top) + text.block_offset;
+        // Read the line's place from the box's physical position rather than
+        // reconstructing it from `top` and the rounded border box. A vertical
+        // inline root's block extent comes from the unrounded inline layout,
+        // while `final_layout` has whole-pixel size; adding the line metrics to
+        // the rounded edge shifted every line by the difference (about 0.6px on
+        // the 32-kai sample) and left a sliver of the line on the previous page.
+        let physical = node.absolute_position(0.0, 0.0);
+        let content_left = physical.x + layout.border.left + layout.padding.left;
+        let content_top = physical.y + layout.border.top + layout.padding.top;
+        let origin = match (self.axis, self.reversed, text.vertical_text) {
+            (FlowAxis::Y, _, None) => content_top + text.block_offset,
+            (FlowAxis::X, true, Some(vertical)) if vertical.block_axis_starts_at_right => {
+                self.measure - (content_left + vertical.block_extent) + text.block_offset
+            }
+            (FlowAxis::X, false, Some(_)) => content_left + text.block_offset,
+            _ => top + text.block_offset,
+        };
         let scale = text.layout.scale();
         let widows = styles.clone_widows().max(1) as usize;
         let orphans = styles.clone_orphans().max(1) as usize;
@@ -1676,8 +1692,17 @@ impl<'a> Planner<'a> {
             let content_end = origin + text.layout.height() / scale;
             let mut groups = Vec::<(f32, f32)>::new();
             for (index, line) in body_lines.iter().enumerate() {
-                let body_top = origin + line.metrics().block_min_coord / scale;
-                let body_bottom = origin + line.metrics().block_max_coord / scale;
+                let metrics = line.metrics();
+                let body_top = origin
+                    + metrics
+                        .block_min_coord
+                        .min(metrics.content_block_min_coord)
+                        / scale;
+                let body_bottom = origin
+                    + metrics
+                        .block_max_coord
+                        .max(metrics.content_block_max_coord)
+                        / scale;
                 let note_top = text
                     .interline_lines
                     .iter()
@@ -1726,17 +1751,31 @@ impl<'a> Planner<'a> {
             }
             return;
         }
-        let lines: Vec<f32> = text
+        let lines: Vec<(f32, f32)> = text
             .layout
             .lines()
-            .map(|line| origin + line.metrics().block_max_coord / scale)
+            .map(|line| {
+                let metrics = line.metrics();
+                (
+                    origin
+                        + metrics
+                            .block_min_coord
+                            .min(metrics.content_block_min_coord)
+                            / scale,
+                    origin
+                        + metrics
+                            .block_max_coord
+                            .max(metrics.content_block_max_coord)
+                            / scale,
+                )
+            })
             .collect();
         let mut top = origin;
-        for (index, y) in lines.iter().enumerate() {
+        for (index, (start, end)) in lines.iter().enumerate() {
             // A line box is the smallest thing a flow can be cut between: no break falls inside
             // one, so a fragmentainer has to be tall enough to hold the tallest of them.
-            self.units.push(Unit::whole(top, *y));
-            top = *y;
+            self.units.push(Unit::whole(top.min(*start), *end));
+            top = *end;
             let before = index + 1;
             // The last line's bottom is where the block ends, which is the break between two
             // blocks and not one inside this one.
@@ -1746,7 +1785,7 @@ impl<'a> Planner<'a> {
             }
             // Whether the counts bar this point is the question balancing asks: a column height that
             // leaves a fragment fewer lines than `widows`/`orphans` demands is not a balanced one.
-            self.push_at(*y, line_rank(before, after, orphans, widows), true, true);
+            self.push_at(*end, line_rank(before, after, orphans, widows), true, true);
         }
     }
 
@@ -1821,8 +1860,13 @@ pub(crate) fn cut_bands(
     content_end: f32,
 ) -> ThinVec<Band> {
     let mut bands = ThinVec::new();
-    // The most fragmentainers content could need if it broke at its own edges and nowhere else.
-    let limit_pages = (content_end / extent.max(1.0)).ceil() as usize + 2;
+    // Each pass advances to at least the next recorded edge or whole unit, so
+    // their count bounds the number of fragmentainers. Counting pages by
+    // `content_end / extent` is not an upper bound: a page may stop well before
+    // its edge to keep a line whole, and a long vertical flow then hit the cap
+    // with content still to print.
+    let limit_pages = ((content_end / extent.max(1.0)).ceil() as usize + 2)
+        .max(edges.len() + units.len() + 2);
     // Where a flex item starts that no empty fragmentainer could hold *and* that has no legal point
     // to break at inside it. Moving such an item on wins nothing — the next fragmentainer would
     // have to break it at its end anyway — so the point at its start is not taken and this
