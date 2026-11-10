@@ -79,11 +79,6 @@ impl<'a> PhysicalTracks<'a> {
         }
     }
 
-    /// Iterate track positions in physical order
-    pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = taffy::Line<f32>> + 'a {
-        (0..self.positions.len()).map(move |index| self.get(index))
-    }
-
     /// Iterate tracks in physical order together with their logical index.
     pub(crate) fn iter_indexed(
         self,
@@ -958,7 +953,7 @@ struct ElementCx<'dom, 'a> {
     text_input: Option<&'dom TextInputData>,
     list_item: Option<&'dom ListItemLayout>,
     devtools: &'dom DevtoolSettings,
-    #[cfg_attr(not(feature = "custom-widget"), expect(unused))]
+    #[cfg_attr(not(feature = "custom-widget"), allow(dead_code))]
     custom_widget_scene: Option<&'a Scene>,
 }
 

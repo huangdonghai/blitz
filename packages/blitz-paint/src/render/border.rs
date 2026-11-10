@@ -23,6 +23,7 @@ use crate::{
 /// Taffy stores grid detail in the writing-mode axes it laid the table out
 /// in. A vertical table therefore needs its columns mapped to the physical y
 /// axis and its rows mapped to x, with `vertical-rl` mirroring the rows.
+#[cfg(test)]
 fn physical_table_tracks(
     columns: impl IntoIterator<Item = taffy::Line<f32>>,
     rows: impl IntoIterator<Item = taffy::Line<f32>>,
