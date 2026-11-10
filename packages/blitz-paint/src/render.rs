@@ -83,24 +83,6 @@ impl<'a> PhysicalTracks<'a> {
     pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = taffy::Line<f32>> + 'a {
         (0..self.positions.len()).map(move |index| self.get(index))
     }
-
-    /// The physical start position of the first track
-    pub(crate) fn origin(self) -> f32 {
-        if self.positions.is_empty() {
-            0.0
-        } else {
-            self.get(0).start
-        }
-    }
-
-    /// Total distance from the start of the first track to the end of the last track
-    pub(crate) fn span(self) -> f32 {
-        if self.positions.is_empty() {
-            0.0
-        } else {
-            self.get(self.positions.len() - 1).end - self.get(0).start
-        }
-    }
 }
 
 /// A short-lived struct which holds a bunch of parameters for rendering a scene so

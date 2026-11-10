@@ -14,6 +14,40 @@ use crate::{
     render::{ElementCx, PhysicalTracks},
 };
 
+/// Place the logical grid tracks in physical paint coordinates.
+///
+/// Taffy stores grid detail in the writing-mode axes it laid the table out
+/// in. A vertical table therefore needs its columns mapped to the physical y
+/// axis and its rows mapped to x, with `vertical-rl` mirroring the rows.
+fn physical_table_tracks(
+    columns: impl IntoIterator<Item = taffy::Line<f32>>,
+    rows: impl IntoIterator<Item = taffy::Line<f32>>,
+    vertical: bool,
+    vertical_rl: bool,
+    table_width: f32,
+) -> (Vec<taffy::Line<f32>>, Vec<taffy::Line<f32>>) {
+    let columns: Vec<_> = columns.into_iter().collect();
+    if !vertical {
+        return (columns, rows.into_iter().collect());
+    }
+
+    let mut x_tracks: Vec<_> = rows
+        .into_iter()
+        .map(|row| {
+            if vertical_rl {
+                taffy::Line {
+                    start: table_width - row.end,
+                    end: table_width - row.start,
+                }
+            } else {
+                row
+            }
+        })
+        .collect();
+    x_tracks.sort_by(|a, b| a.start.total_cmp(&b.start));
+    (x_tracks, columns)
+}
+
 /// A darker version of a colour (mirrors WebKit/Blink's `Color::Dark`): the
 /// brightest channel is reduced by a fixed amount and the others scaled to match,
 /// preserving hue.
@@ -530,6 +564,18 @@ impl ElementCx<'_, '_> {
         let cols = PhysicalTracks::from_tracks(&grid_info.columns);
         let rows = PhysicalTracks::from_tracks(&grid_info.rows);
 
+        // Taffy stores the tracks in the table's writing-mode axes. Map them
+        // back to the physical axes paint uses before drawing.
+        let writing_mode = self.node.writing_mode();
+        let vertical = writing_mode.is_vertical();
+        let (x_tracks, y_tracks) = physical_table_tracks(
+            cols.iter(),
+            rows.iter(),
+            vertical,
+            writing_mode.is_vertical_rl(),
+            self.node.final_layout().size.width,
+        );
+
         // TODO: support different colors for different borders
         let current_color = self.style.clone_color();
         let border_color = border_style
@@ -551,38 +597,47 @@ impl ElementCx<'_, '_> {
         // The borders are laid out as the gutters between the tracks, and as the border
         // of the table around them. Track positions are relative to the table's border box.
         let border_width = table.style.gap.map(|gap| gap.into_raw().value() as f64);
-        let left = cols.origin() as f64 - border_width.width;
-        let right = (cols.origin() + cols.span()) as f64 + border_width.width;
-        let top = rows.origin() as f64 - border_width.height;
-        let bottom = (rows.origin() + rows.span()) as f64 + border_width.height;
+        let (x_border, y_border) = if vertical {
+            (border_width.height, border_width.width)
+        } else {
+            (border_width.width, border_width.height)
+        };
+        let x_origin = x_tracks.first().map_or(0.0, |track| track.start) as f64;
+        let x_end = x_tracks.last().map_or(0.0, |track| track.end) as f64;
+        let y_origin = y_tracks.first().map_or(0.0, |track| track.start) as f64;
+        let y_end = y_tracks.last().map_or(0.0, |track| track.end) as f64;
+        let left = x_origin - x_border;
+        let right = x_end + x_border;
+        let top = y_origin - y_border;
+        let bottom = y_end + y_border;
 
         let mut fill = |x0: f64, y0: f64, x1: f64, y1: f64| {
             let shape = Rect::new(x0, y0, x1, y1).scale_from_origin(self.scale);
             scene.fill(Fill::NonZero, self.transform, border_color, None, &shape);
         };
 
-        // Horizontal borders: the outer edges, then the gutters between adjacent row tracks.
+        // Horizontal borders: the outer edges, then the gutters between adjacent tracks.
         // The vertical borders are drawn between them so that no corner is painted twice.
         if outer_border_style.border_top_style != BorderStyle::Hidden {
-            fill(left, top, right, top + border_width.height);
+            fill(left, top, right, top + y_border);
         }
         if outer_border_style.border_bottom_style != BorderStyle::Hidden {
-            fill(left, bottom - border_width.height, right, bottom);
+            fill(left, bottom - y_border, right, bottom);
         }
-        for (prev, next) in rows.iter().zip(rows.iter().skip(1)) {
+        for (prev, next) in y_tracks.iter().zip(y_tracks.iter().skip(1)) {
             fill(left, prev.end as f64, right, next.start as f64);
         }
 
-        // Vertical borders, one segment per row
-        for row in rows.iter() {
+        // Vertical borders, one segment per y track
+        for row in y_tracks.iter() {
             let (y0, y1) = (row.start as f64, row.end as f64);
             if outer_border_style.border_left_style != BorderStyle::Hidden {
-                fill(left, y0, left + border_width.width, y1);
+                fill(left, y0, left + x_border, y1);
             }
             if outer_border_style.border_right_style != BorderStyle::Hidden {
-                fill(right - border_width.width, y0, right, y1);
+                fill(right - x_border, y0, right, y1);
             }
-            for (prev, next) in cols.iter().zip(cols.iter().skip(1)) {
+            for (prev, next) in x_tracks.iter().zip(x_tracks.iter().skip(1)) {
                 fill(prev.end as f64, y0, next.start as f64, y1);
             }
         }
@@ -627,5 +682,38 @@ impl ElementCx<'_, '_> {
         };
 
         scene.fill(Fill::NonZero, self.transform, color, None, &path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::physical_table_tracks;
+    use taffy::Line;
+
+    fn line(start: f32, end: f32) -> Line<f32> {
+        Line { start, end }
+    }
+
+    #[test]
+    fn horizontal_table_tracks_stay_on_their_axes() {
+        let columns = [line(10.0, 30.0), line(30.0, 60.0)];
+        let rows = [line(5.0, 15.0), line(15.0, 40.0)];
+        let (x, y) = physical_table_tracks(columns, rows, false, false, 60.0);
+        assert_eq!(x, columns);
+        assert_eq!(y, rows);
+    }
+
+    #[test]
+    fn vertical_table_tracks_follow_the_physical_axes() {
+        let columns = [line(0.0, 40.0), line(40.0, 90.0)];
+        let rows = [line(0.0, 20.0), line(20.0, 70.0)];
+
+        let (x, y) = physical_table_tracks(columns, rows, true, false, 70.0);
+        assert_eq!(x, rows);
+        assert_eq!(y, columns);
+
+        let (x, y) = physical_table_tracks(columns, rows, true, true, 70.0);
+        assert_eq!(x, [line(0.0, 50.0), line(50.0, 70.0)]);
+        assert_eq!(y, columns);
     }
 }
