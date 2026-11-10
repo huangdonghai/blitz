@@ -92,7 +92,10 @@ impl BaseDocument {
         }
 
         // Propagate damage flags (from mutation and restyles) up and down the tree
-        self.propagate_damage_flags(root_node_id);
+        let damage = self.propagate_damage_flags(root_node_id);
+        if !damage.is_empty() {
+            self.invalidate_page_paint_membership();
+        }
         timer.record_time("damage");
 
         // Fix up tree for layout (insert anonymous blocks as necessary, etc)

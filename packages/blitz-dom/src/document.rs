@@ -241,6 +241,12 @@ pub struct BaseDocument {
     /// The paper a paged document prints on, read from `@page` before layout so that the page
     /// area can be the root box's containing block. `None` for a document that is not paged.
     pub(crate) page_box: Option<crate::layout::fragmentation::PageBox>,
+    /// Conservative per-page node membership, rebuilt when geometry changes.
+    page_paint_membership: RefCell<Option<Arc<crate::layout::fragmentation::PagePaintMembership>>>,
+    /// Bumped whenever layout or a scroll offset can invalidate the page
+    /// membership. `resolve` bumps it for actual damage, not for every no-op
+    /// resolve, so turning a page can reuse the index.
+    pub(crate) page_paint_epoch: u64,
     /// Changes to the stylist [`Device`] that have been requested since the
     /// last [`resolve`](Self::resolve), to be applied (coalesced into a single
     /// device rebuild) at the start of the next resolve.
@@ -485,6 +491,8 @@ impl BaseDocument {
             viewport,
             media_type,
             page_box: None,
+            page_paint_membership: RefCell::new(None),
+            page_paint_epoch: 1,
             pending_device_changes: DeviceChanges::empty(),
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
@@ -599,6 +607,31 @@ impl BaseDocument {
 
     pub fn tree(&self) -> &NodeTree {
         &self.nodes
+    }
+
+    /// The current page membership index, rebuilt after layout or scroll damage.
+    ///
+    /// This is only an index, not a fragment tree: it records which nodes can
+    /// paint on each page so a page paint can skip unrelated subtrees. A node
+    /// that may paint on a page through a transform or fixed/sticky ancestry is
+    /// conservatively listed on every page.
+    pub fn page_paint_membership(
+        &self,
+    ) -> Option<Arc<crate::layout::fragmentation::PagePaintMembership>> {
+        if let Some(index) = self.page_paint_membership.borrow().as_ref()
+            && index.is_current(self)
+        {
+            return Some(index.clone());
+        }
+
+        let index = Arc::new(crate::layout::fragmentation::build_page_membership(self)?);
+        *self.page_paint_membership.borrow_mut() = Some(index.clone());
+        Some(index)
+    }
+
+    pub(crate) fn invalidate_page_paint_membership(&mut self) {
+        self.page_paint_epoch = self.page_paint_epoch.wrapping_add(1);
+        *self.page_paint_membership.borrow_mut() = None;
     }
 
     pub fn id(&self) -> usize {
@@ -2096,6 +2129,7 @@ impl BaseDocument {
         if changes.is_empty() {
             return;
         }
+        self.invalidate_page_paint_membership();
         self.pending_device_changes |= changes;
         self.shell_provider.request_redraw();
     }
@@ -2262,6 +2296,9 @@ impl BaseDocument {
     }
 
     pub fn set_viewport_scroll(&mut self, scroll: crate::Point<f64>) {
+        if scroll != self.nodes.viewport_scroll() {
+            self.invalidate_page_paint_membership();
+        }
         self.nodes.set_viewport_scroll(scroll);
     }
 

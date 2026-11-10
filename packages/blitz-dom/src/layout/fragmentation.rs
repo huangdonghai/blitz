@@ -160,20 +160,24 @@
 //! second, when the island stops being whole.
 
 use blitz_traits::node_id::NodeId;
+use std::collections::{HashMap, HashSet};
 use style::computed_values::flex_direction::T as FlexDirection;
 use style::computed_values::flex_wrap::T as FlexWrap;
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
 use style::values::computed::length::NonNegativeLengthOrAuto;
 use style::properties::PropertyDeclaration;
-use style::values::computed::{BreakBetween, BreakWithin, ColumnCount, Float, Overflow, PageName};
+use style::values::computed::{
+    BorderStyle, BreakBetween, BreakWithin, ColumnCount, Float, OutlineStyle, Overflow, PageName,
+    TextDecorationLine,
+};
 use style::values::specified::box_::{DisplayInside, DisplayOutside};
 use taffy::{CoreStyle as _, Point, Rect, ResolveOrZero as _, Size};
 use thin_vec::ThinVec;
 
 use super::resolve_calc_value;
 use crate::layout::is_replaced_element;
-use crate::{BaseDocument, Node};
+use crate::{BaseDocument, Node, NodeData};
 
 /// The physical direction a fragmented flow advances along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -605,6 +609,375 @@ impl PageBox {
             },
         }
     }
+}
+
+/// The state a membership index was built from. The epoch covers layout and
+/// scroll damage; the page fields make the cache safe if a caller changes the
+/// paper without rebuilding the document.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageIndexKey {
+    epoch: u64,
+    page_count: usize,
+    paper: Option<[u32; 4]>,
+    axis: FlowAxis,
+    reversed: bool,
+    measure: u32,
+    depth: u32,
+    stride: u32,
+    flow_end: u32,
+    cross_start: u32,
+    band_hash: u64,
+}
+
+impl PageIndexKey {
+    fn new(doc: &BaseDocument, plan: &BreakPlan) -> Self {
+        let paper = doc.page_box.map(|page| {
+            [
+                page.size.width.to_bits(),
+                page.size.height.to_bits(),
+                page.margin.left.to_bits(),
+                page.margin.top.to_bits(),
+            ]
+        });
+        let mut band_hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut mix = |bits: u32| {
+            band_hash ^= u64::from(bits);
+            band_hash = band_hash.wrapping_mul(0x0000_0100_0000_01b3);
+        };
+        for band in &plan.bands {
+            mix(band.start.to_bits());
+            mix(band.end.to_bits());
+            mix(band.origin.x.to_bits());
+            mix(band.origin.y.to_bits());
+            mix(band.cross.to_bits());
+            mix(band.depth.to_bits());
+        }
+        Self {
+            epoch: doc.page_paint_epoch,
+            page_count: plan.bands.len(),
+            paper,
+            axis: plan.axis,
+            reversed: plan.reversed,
+            measure: plan.measure.to_bits(),
+            depth: plan.depth.to_bits(),
+            stride: plan.stride.to_bits(),
+            flow_end: plan.flow_end.to_bits(),
+            cross_start: plan.cross_start.to_bits(),
+            band_hash,
+        }
+    }
+}
+
+/// A conservative index of the nodes paint may need on each page.
+///
+/// This is deliberately cheaper and coarser than a fragment tree: a node is
+/// listed on a page when its painted box, shifted to that page, reaches the
+/// paper; every listed node also pulls in its ancestors so paint can reach it.
+/// Nodes absent from the page cannot paint there, so paint skips their whole
+/// subtree instead of walking it only to clip it away.
+#[derive(Debug)]
+pub struct PagePaintMembership {
+    key: PageIndexKey,
+    pages: Vec<HashSet<NodeId>>,
+}
+
+impl PagePaintMembership {
+    pub(crate) fn is_current(&self, doc: &BaseDocument) -> bool {
+        let Some(root) = doc.try_root_element() else {
+            return false;
+        };
+        let Some(plan) = root.break_plan.as_deref() else {
+            return false;
+        };
+        self.key == PageIndexKey::new(doc, plan)
+    }
+
+    /// Whether `node_id`, or an ancestor needed to reach painted content below
+    /// it, belongs to `page_index`.
+    pub fn contains(&self, page_index: usize, node_id: NodeId) -> bool {
+        self.pages
+            .get(page_index)
+            .is_some_and(|nodes| nodes.contains(&node_id))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Bleed {
+    left: f32,
+    top: f32,
+    right: f32,
+    bottom: f32,
+}
+
+impl Bleed {
+    fn uniform(amount: f32) -> Self {
+        Self {
+            left: amount,
+            top: amount,
+            right: amount,
+            bottom: amount,
+        }
+    }
+
+    fn widen(self, other: Self) -> Self {
+        Self {
+            left: self.left.max(other.left),
+            top: self.top.max(other.top),
+            right: self.right.max(other.right),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+}
+
+/// How far this box can paint outside its border box, without consulting its
+/// descendants. The paint crate has the same rules; keeping the conservative
+/// answer here avoids a page missing a shadow or outline whose box ends on the
+/// previous page.
+fn paint_bleed(node: &Node) -> Bleed {
+    let Some(styles) = node.primary_styles() else {
+        return Bleed::default();
+    };
+    let mut bleed = Bleed::default();
+
+    let outline = styles.get_outline();
+    if let OutlineStyle::BorderStyle(style) = outline.outline_style
+        && !matches!(style, BorderStyle::None | BorderStyle::Hidden)
+    {
+        let amount = (f64::from(outline.outline_width.0.to_f32_px())
+            + outline.outline_offset.to_f64_px())
+        .max(0.0) as f32;
+        bleed = bleed.widen(Bleed::uniform(amount));
+    }
+
+    let effects = styles.get_effects();
+    for shadow in effects.box_shadow.0.iter().filter(|shadow| !shadow.inset) {
+        let reach = f64::from(shadow.spread.px()) + f64::from(shadow.base.blur.px()) * 2.5;
+        let x = f64::from(shadow.base.horizontal.px());
+        let y = f64::from(shadow.base.vertical.px());
+        bleed = bleed.widen(Bleed {
+            left: (reach - x).max(0.0) as f32,
+            top: (reach - y).max(0.0) as f32,
+            right: (reach + x).max(0.0) as f32,
+            bottom: (reach + y).max(0.0) as f32,
+        });
+    }
+
+    let font_size = styles.get_font().font_size.computed_size().px();
+    let text = styles.get_inherited_text();
+    for shadow in text.text_shadow.0.iter() {
+        let blur = shadow.blur.px();
+        let dx = shadow.horizontal.px();
+        let dy = shadow.vertical.px();
+        // Text shadows are painted as blurred glyph copies. A glyph is at
+        // most about one em wide, and the layer's own bounds add the blur.
+        bleed = bleed.widen(Bleed::uniform(font_size + blur + dx.abs().max(dy.abs())));
+    }
+
+    let drawn = TextDecorationLine::UNDERLINE
+        | TextDecorationLine::OVERLINE
+        | TextDecorationLine::LINE_THROUGH;
+    if styles.get_text().text_decoration_line.intersects(drawn) {
+        bleed = bleed.widen(Bleed::uniform(font_size));
+    }
+    if node
+        .element_data()
+        .is_some_and(|element| element.list_item_data.is_some())
+    {
+        bleed = bleed.widen(Bleed::uniform(font_size));
+    }
+
+    bleed
+}
+
+/// A node's painted extent in continuous document coordinates.
+fn box_paint_bounds(doc: &BaseDocument, node: &Node) -> Option<(f32, f32, f32, f32)> {
+    let bleed = paint_bleed(node);
+    let (pos, layout) = doc.physical_unrounded_geometry(node.id);
+    let overflow = layout.scrollable_overflow_rect;
+    let (left, top, right, bottom) = (
+        pos.x + overflow.left.min(0.0),
+        pos.y + overflow.top.min(0.0),
+        pos.x + layout.size.width.max(overflow.right),
+        pos.y + layout.size.height.max(overflow.bottom),
+    );
+
+    let left = left - bleed.left;
+    let top = top - bleed.top;
+    let right = right + bleed.right;
+    let bottom = bottom + bleed.bottom;
+    (left.is_finite() && top.is_finite() && right.is_finite() && bottom.is_finite())
+        .then_some((left, top, right, bottom))
+}
+
+/// The paper rectangle one page is drawn on. Content may live in its margin
+/// (margin notes), so membership is tested against the paper rather than the
+/// body's narrower fragment clip.
+fn page_paper_rect(doc: &BaseDocument, plan: &BreakPlan, band: &Band) -> Rect<f32> {
+    let Some(page) = doc.page_box else {
+        return plan.fragment_rect(band);
+    };
+    let left = band.origin.x - page.margin.left;
+    let top = band.origin.y - page.margin.top;
+    Rect {
+        left,
+        top,
+        right: left + page.size.width,
+        bottom: top + page.size.height,
+    }
+}
+
+/// Whether a box, drawn with this page's translation, can be seen on its
+/// paper. This mirrors paint's placement exactly: a box crossing a break may
+/// be cut by a page but still reach the next page's margin.
+fn band_contains(bounds: (f32, f32, f32, f32), shift: Point<f32>, paper: Rect<f32>) -> bool {
+    let (left, top, right, bottom) = bounds;
+    right + shift.x > paper.left
+        && left + shift.x < paper.right
+        && bottom + shift.y > paper.top
+        && top + shift.y < paper.bottom
+}
+
+/// Build the conservative page-member index for the current geometry.
+///
+/// The page plan knows the flow's cuts but not which box produced each
+/// fragment yet. Rather than duplicate paint's fragment walk per page, this
+/// uses each node's absolute box, shifted by every page's translation. It is
+/// conservative: transforms, fixed/sticky positioning and filters may list a
+/// node on extra pages, never omit one it can paint on.
+pub(crate) fn build_page_membership(doc: &BaseDocument) -> Option<PagePaintMembership> {
+    let root = doc.try_root_element()?;
+    let plan = root.break_plan.as_deref()?;
+    if plan.bands.is_empty() {
+        return None;
+    }
+
+    let page_count = plan.bands.len();
+    let key = PageIndexKey::new(doc, plan);
+    let mut pages = vec![HashSet::new(); page_count];
+    let page_geometry: Vec<_> = plan
+        .bands
+        .iter()
+        .map(|band| (plan.translate(band), page_paper_rect(doc, plan, band)))
+        .collect();
+    let mut inline_root_bounds = HashMap::new();
+
+    for (_, node) in doc.tree().iter() {
+        if !matches!(
+            node.data,
+            NodeData::Element(_) | NodeData::AnonymousBlock(_)
+        ) {
+            continue;
+        }
+        if node.taffy_display() == taffy::Display::None {
+            continue;
+        }
+        let conservative_pages = {
+            let mut current = Some(node.id);
+            let mut all = false;
+            while let Some(id) = current {
+                let Some(ancestor) = doc.get_node(id) else {
+                    break;
+                };
+                if !matches!(
+                    ancestor.data,
+                    NodeData::Element(_) | NodeData::AnonymousBlock(_)
+                ) {
+                    current = ancestor.parent;
+                    continue;
+                }
+                if matches!(
+                    ancestor.taffy_position(),
+                    taffy::Position::Fixed | taffy::Position::Sticky
+                ) || (ancestor.element_data().is_some() && ancestor.transform().is_some())
+                    || ancestor.primary_styles().is_some_and(|styles| {
+                        let effects = styles.get_effects();
+                        !effects.filter.0.is_empty() || !effects.backdrop_filter.0.is_empty()
+                    })
+                {
+                    all = true;
+                    break;
+                }
+                current = ancestor.containing_block().or(ancestor.parent);
+            }
+            all
+        };
+
+        if conservative_pages {
+            for page in &mut pages {
+                page.insert(node.id);
+            }
+            continue;
+        }
+
+        // A non-atomic inline has no layout box of its own. Its lines are part
+        // of its inline root, whose box already covers every page those lines
+        // can reach; using that root avoids rescanning the whole paragraph for
+        // every span in it.
+        let bounds = if node.is_non_atomic_inline() {
+            let root_id = node.inline_root_ancestor().map(|root| root.id);
+            root_id.and_then(|root_id| {
+                *inline_root_bounds.entry(root_id).or_insert_with(|| {
+                    doc.get_node(root_id)
+                        .and_then(|root| box_paint_bounds(doc, root))
+                })
+            })
+        } else {
+            box_paint_bounds(doc, node)
+        };
+        let Some(bounds) = bounds else {
+            continue;
+        };
+
+        for (page_index, &(shift, paper)) in page_geometry.iter().enumerate() {
+            if band_contains(bounds, shift, paper) {
+                pages[page_index].insert(node.id);
+            }
+        }
+
+        // A margin note is painted by the inline root that owns its text
+        // layout, not by its anchor box. A long note can continue onto pages
+        // past that root's own box, so the fragmentainer that holds each note
+        // fragment must retain the root even when no line of body text does.
+        if let Some(layout) = node
+            .element_data()
+            .and_then(|element| element.inline_layout_data.as_ref())
+        {
+            for group in &layout.margin_note_groups {
+                for fragment in &group.page_fragments {
+                    if let Some(page) = pages.get_mut(fragment.page_index) {
+                        page.insert(node.id);
+                    }
+                }
+            }
+        }
+    }
+
+    // Paint reaches a fragment through its DOM/containing-block ancestry, and
+    // hoisted stacking-context children through their containing chain too.
+    // Close over both chains transitively so traversal never stops before a
+    // visible descendant, even when the two chains interleave.
+    for page in &mut pages {
+        let mut pending: Vec<NodeId> = page.iter().copied().collect();
+        while let Some(id) = pending.pop() {
+            let Some(node) = doc.get_node(id) else {
+                continue;
+            };
+            let mut ancestors = vec![node.parent, node.containing_block()];
+            while let Some(parent) = ancestors.pop().flatten() {
+                if !matches!(
+                    doc.get_node(parent).map(|node| &node.data),
+                    Some(NodeData::Element(_) | NodeData::AnonymousBlock(_))
+                ) {
+                    continue;
+                }
+                if page.insert(parent) {
+                    pending.push(parent);
+                }
+            }
+        }
+    }
+
+    Some(PagePaintMembership { key, pages })
 }
 
 /// The window the document was given, in CSS pixels.

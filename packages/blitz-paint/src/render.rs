@@ -23,7 +23,9 @@ use blitz_dom::node::{
     ListItemLayout, ListItemLayoutPosition, Marker, NodeData, RasterImageData, TextInputData,
     TextNodeData,
 };
-use blitz_dom::{BaseDocument, ElementData, FlowAxis, Node, NodeId, local_name};
+use blitz_dom::{
+    BaseDocument, ElementData, FlowAxis, Node, NodeId, PagePaintMembership, local_name,
+};
 use blitz_traits::devtools::DevtoolSettings;
 
 use style::values::computed::{BorderCornerRadius, ColorOrAuto};
@@ -113,6 +115,8 @@ pub struct BlitzDomPainter<'dom, 'a> {
     pub(crate) initial_y: f64,
     /// The id of the document's root element (cached to avoid re-resolving it for every element)
     pub(crate) root_element_id: Option<NodeId>,
+    /// Nodes that can paint on each page, used to skip whole off-page subtrees.
+    page_paint_membership: Option<Arc<PagePaintMembership>>,
     /// Boxes on the path from the root to a paged margin note. Their content
     /// boxes clip the flow at fragment boundaries, but a margin note lives
     /// outside that flow in the page margin.
@@ -151,6 +155,14 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         let layer_manager = LayerManager::default();
         let root_element_id = dom.try_root_element().map(|el| el.id);
+        // A development escape hatch for comparing the indexed and full
+        // traversals on the same build.
+        let page_paint_membership =
+            if std::env::var_os("CUOTUO_DISABLE_PAGE_MEMBERSHIP").is_some() {
+                None
+            } else {
+                dom.page_paint_membership()
+            };
         let margin_note_ancestors = {
             let mut ancestors = HashSet::new();
             for (_, node) in dom.tree().iter() {
@@ -184,6 +196,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             initial_x,
             initial_y,
             root_element_id,
+            page_paint_membership,
             margin_note_ancestors,
             #[cfg(feature = "scrollbars")]
             hovered_scrollbar: dom.hovered_scrollbar(),
@@ -390,6 +403,15 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         frag: Option<Fragmentainer>,
     ) {
         let node = &self.dom.as_ref().tree()[node_id];
+        if let Some(frag) = frag
+            && frag.page_flow
+            && self
+                .page_paint_membership
+                .as_ref()
+                .is_some_and(|membership| !membership.contains(frag.index, node_id))
+        {
+            return;
+        }
 
         // Early return if the element is hidden
         if matches!(node.taffy_display(), taffy::Display::None) {
@@ -1882,6 +1904,14 @@ impl ElementCx<'_, '_> {
         clip_rect: Rect,
     ) {
         let child = &self.context.dom.as_ref().tree()[child_id];
+        if frag.page_flow
+            && self
+                .page_paint_membership
+                .as_ref()
+                .is_some_and(|membership| !membership.contains(frag.index, child_id))
+        {
+            return;
+        }
         if let Some(on_canvas) = box_on_canvas(child, transform, self.scale) {
             let slack = 256.0 * self.scale;
             let cull = clip_rect.inflate(slack, slack);
