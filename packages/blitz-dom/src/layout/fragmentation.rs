@@ -160,6 +160,7 @@
 //! second, when the island stops being whole.
 
 use blitz_traits::node_id::NodeId;
+use markup5ever::local_name;
 use std::collections::{HashMap, HashSet};
 use style::computed_values::flex_direction::T as FlexDirection;
 use style::computed_values::flex_wrap::T as FlexWrap;
@@ -177,6 +178,7 @@ use thin_vec::ThinVec;
 
 use super::resolve_calc_value;
 use crate::layout::is_replaced_element;
+use crate::node::SpecialElementData;
 use crate::{BaseDocument, Node, NodeData};
 
 /// The physical direction a fragmented flow advances along.
@@ -314,16 +316,33 @@ pub(crate) struct Unit {
     /// asked to keep whole does (`single-line-column-flex-fragmentation-071` against
     /// `table-page-break-inside-avoid-1`).
     pub(crate) flex_item: bool,
+    /// A table row that CSS Tables 3 calls freely fragmentable. It may be cut
+    /// at the fragmentainer edge even when none of its descendants offers a
+    /// break point, so `carry_before` must not move the row whole.
+    freely_fragmentable: bool,
 }
 
 impl Unit {
     /// A stretch of the flow that moves as one.
-    fn whole(start: f32, end: f32) -> Self {
+    pub(crate) fn whole(start: f32, end: f32) -> Self {
         Self {
             start,
             end,
             box_start: start,
             flex_item: false,
+            freely_fragmentable: false,
+        }
+    }
+
+    /// A stretch a CSS layout model allows slicing when no finer break point
+    /// exists, as opposed to a line box or an `avoid` box that must be carried.
+    fn splittable(start: f32, end: f32) -> Self {
+        Self {
+            start,
+            end,
+            box_start: start,
+            flex_item: false,
+            freely_fragmentable: true,
         }
     }
 
@@ -335,6 +354,7 @@ impl Unit {
             end,
             box_start: start,
             flex_item: true,
+            freely_fragmentable: false,
         }
     }
 
@@ -909,11 +929,33 @@ pub(crate) fn build_page_membership(doc: &BaseDocument) -> Option<PagePaintMembe
             continue;
         }
 
+        // A clone box's descendants may paint on a page their own box does not
+        // reach: the clone's padding at a break shifts the continuation. Use
+        // the clone root's bounds for the whole subtree so membership remains
+        // conservative without teaching this index the paint-time shift.
+        let mut clone_root = None;
+        let mut current = node.parent;
+        while let Some(id) = current {
+            let Some(ancestor) = doc.get_node(id) else {
+                break;
+            };
+            if ancestor
+                .primary_styles()
+                .is_some_and(|styles| clones_decoration(&styles))
+            {
+                clone_root = Some(ancestor);
+                break;
+            }
+            current = ancestor.parent.or(ancestor.containing_block());
+        }
+
         // A non-atomic inline has no layout box of its own. Its lines are part
         // of its inline root, whose box already covers every page those lines
         // can reach; using that root avoids rescanning the whole paragraph for
         // every span in it.
-        let bounds = if node.is_non_atomic_inline() {
+        let bounds = if let Some(clone_root) = clone_root {
+            box_paint_bounds(doc, clone_root)
+        } else if node.is_non_atomic_inline() {
             let root_id = node.inline_root_ancestor().map(|root| root.id);
             root_id.and_then(|root_id| {
                 *inline_root_bounds.entry(root_id).or_insert_with(|| {
@@ -1240,10 +1282,15 @@ pub(crate) fn is_multicol(style: &ComputedValues) -> bool {
 /// The rank a `break-before`/`break-after` value gives the edge it applies to.
 fn rank_between(break_value: BreakBetween) -> Option<Rank> {
     match break_value {
-        BreakBetween::Always | BreakBetween::Page | BreakBetween::Left | BreakBetween::Right => {
-            Some(Rank::Forced)
+        BreakBetween::Always
+        | BreakBetween::Page
+        | BreakBetween::Left
+        | BreakBetween::Right
+        | BreakBetween::Column
+        | BreakBetween::Region => Some(Rank::Forced),
+        BreakBetween::Avoid | BreakBetween::AvoidColumn | BreakBetween::AvoidRegion => {
+            Some(Rank::Forbidden)
         }
-        BreakBetween::Avoid => Some(Rank::Forbidden),
         BreakBetween::Auto => None,
     }
 }
@@ -1277,6 +1324,11 @@ struct Planner<'a> {
     /// from. A horizontal flow sets neither.
     reversed: bool,
     measure: f32,
+    /// The fragmentainer's block and cross sizes, when the caller knows them before
+    /// planning. Table rows use them for the CSS Tables “preserve the row whole”
+    /// test; column balancing learns its depth later, so it leaves these unset.
+    fragmentainer_depth: Option<f32>,
+    fragmentainer_cross: Option<f32>,
     edges: Vec<Edge>,
     /// The stretches of this flow that cannot be cut (see [`Unit`]).
     units: Vec<Unit>,
@@ -1526,16 +1578,106 @@ impl<'a> Planner<'a> {
             // A box that clones the decoration of its fragments holds less content in each one than
             // the fragmentainer is deep, and a cut inside it moves the next band back by that much.
             if breakable_inside && clones_decoration(&styles) {
+                let insets = match self.axis {
+                    FlowAxis::Y => {
+                        layout.border.top
+                            + layout.padding.top
+                            + layout.border.bottom
+                            + layout.padding.bottom
+                    }
+                    FlowAxis::X => {
+                        layout.border.left
+                            + layout.padding.left
+                            + layout.border.right
+                            + layout.padding.right
+                    }
+                };
                 self.spans.push(CloneSpan {
                     start: top,
                     end: bottom,
-                    insets: layout.border.top + layout.padding.top
-                        + layout.border.bottom + layout.padding.bottom,
+                    insets,
                 });
+                self.units.push(Unit::splittable(top, bottom));
             }
             // A line box ends where the flow may be cut (CSS Break 3 §4.1): a text block taller
             // than the fragmentainer is otherwise cut rather than carried on.
             self.line_edges(child, top, breakable_inside);
+            let table = child.element_data().and_then(|element| {
+                let SpecialElementData::TableRoot(table) = &element.special_data else {
+                    return None;
+                };
+                Some(table.clone())
+            });
+            if let Some(table) = table {
+                let table_breakable = breakable
+                    && !foreign_axis
+                    && !scroll_container
+                    && !avoids_inside(styles.clone_break_inside());
+                let forced_before = table
+                    .cells
+                    .iter()
+                    .any(|cell| self.subtree_has_forced_break(cell.node_id, true))
+                    || table
+                        .rows
+                        .iter()
+                        .any(|row| self.subtree_has_forced_break(row.node_id, true));
+                if forced_before {
+                    self.push(outer_top, Rank::Forced, breakable);
+                }
+                let forced_after = table
+                    .cells
+                    .iter()
+                    .any(|cell| self.subtree_has_forced_break(cell.node_id, false))
+                    || table
+                        .rows
+                        .iter()
+                        .any(|row| self.subtree_has_forced_break(row.node_id, false));
+                if forced_after {
+                    self.push(outer_bottom, Rank::Forced, breakable);
+                }
+                self.table_edges(&table, table_breakable);
+                if table_breakable && clones_decoration(&styles) {
+                    let insets = match self.axis {
+                        FlowAxis::Y => {
+                            layout.border.top
+                                + layout.padding.top
+                                + layout.border.bottom
+                                + layout.padding.bottom
+                        }
+                        FlowAxis::X => {
+                            layout.border.left
+                                + layout.padding.left
+                                + layout.border.right
+                                + layout.padding.right
+                        }
+                    };
+                    self.spans.push(CloneSpan {
+                        start: top,
+                        end: bottom,
+                        insets,
+                    });
+                    self.units.push(Unit::splittable(top, bottom));
+                }
+            }
+            // A block container with no break point inside cannot push content
+            // to the next line or row, but its background and border still
+            // fragment. Treat the empty stretch as splittable so a page can
+            // fill up to its edge instead of stopping at the box's start.
+            let empty_block = breakable_inside
+                && in_flow_block
+                && !child.flags.is_inline_root()
+                && !replaced
+                && self.fragmentainer_depth.is_some()
+                && self.axis == FlowAxis::Y
+                && child
+                    .layout_children
+                    .borrow()
+                    .as_ref()
+                    .is_none_or(|children| children.is_empty());
+            if empty_block {
+                self.units.push(Unit::splittable(top, bottom));
+                self.push(bottom, Rank::Legal, breakable);
+            }
 
             if breakable_inside {
                 let border = layout.border;
@@ -1647,6 +1789,32 @@ impl<'a> Planner<'a> {
         self.last_page_name(*children, &used)
     }
 
+    fn inline_origin(
+        &self,
+        node: &Node,
+        layout: &taffy::Layout,
+        text: &crate::node::TextLayout,
+        top: f32,
+    ) -> f32 {
+        // Read the line's place from the box's physical position rather than
+        // reconstructing it from `top` and the rounded border box. A vertical
+        // inline root's block extent comes from the unrounded inline layout,
+        // while `final_layout` has whole-pixel size; adding the line metrics to
+        // the rounded edge shifted every line by the difference (about 0.6px on
+        // the 32-kai sample) and left a sliver of the line on the previous page.
+        let physical = node.absolute_position(0.0, 0.0);
+        let content_left = physical.x + layout.border.left + layout.padding.left;
+        let content_top = physical.y + layout.border.top + layout.padding.top;
+        match (self.axis, self.reversed, text.vertical_text) {
+            (FlowAxis::Y, _, None) => content_top + text.block_offset,
+            (FlowAxis::X, true, Some(vertical)) if vertical.block_axis_starts_at_right => {
+                self.measure - (content_left + vertical.block_extent) + text.block_offset
+            }
+            (FlowAxis::X, false, Some(_)) => content_left + text.block_offset,
+            _ => top + text.block_offset,
+        }
+    }
+
     /// The break points at the ends of one block's own line boxes, filtered by widows and
     /// orphans. `top` is where the block's border box sits in the flow.
     fn line_edges(&mut self, node: &Node, top: f32, breakable: bool) {
@@ -1667,23 +1835,7 @@ impl<'a> Planner<'a> {
         } else {
             node.final_layout()
         };
-        // Read the line's place from the box's physical position rather than
-        // reconstructing it from `top` and the rounded border box. A vertical
-        // inline root's block extent comes from the unrounded inline layout,
-        // while `final_layout` has whole-pixel size; adding the line metrics to
-        // the rounded edge shifted every line by the difference (about 0.6px on
-        // the 32-kai sample) and left a sliver of the line on the previous page.
-        let physical = node.absolute_position(0.0, 0.0);
-        let content_left = physical.x + layout.border.left + layout.padding.left;
-        let content_top = physical.y + layout.border.top + layout.padding.top;
-        let origin = match (self.axis, self.reversed, text.vertical_text) {
-            (FlowAxis::Y, _, None) => content_top + text.block_offset,
-            (FlowAxis::X, true, Some(vertical)) if vertical.block_axis_starts_at_right => {
-                self.measure - (content_left + vertical.block_extent) + text.block_offset
-            }
-            (FlowAxis::X, false, Some(_)) => content_left + text.block_offset,
-            _ => top + text.block_offset,
-        };
+        let origin = self.inline_origin(node, &layout, text, top);
         let scale = text.layout.scale();
         let widows = styles.clone_widows().max(1) as usize;
         let orphans = styles.clone_orphans().max(1) as usize;
@@ -1789,6 +1941,193 @@ impl<'a> Planner<'a> {
         }
     }
 
+    fn flow_box(&self, node: &Node, layout: &taffy::Layout) -> (f32, f32) {
+        let physical = node.absolute_position(0.0, 0.0);
+        match self.axis {
+            FlowAxis::Y => (physical.y, physical.y + layout.size.height),
+            FlowAxis::X if self.reversed => (
+                self.measure - (physical.x + layout.size.width),
+                self.measure - physical.x,
+            ),
+            FlowAxis::X => (physical.x, physical.x + layout.size.width),
+        }
+    }
+
+    fn collect_table_line_boxes(&self, node_id: NodeId, out: &mut Vec<(f32, f32)>) {
+        let node = &self.doc.nodes[node_id];
+        if let Some(text) = node
+            .element_data()
+            .and_then(|element| element.inline_layout_data.as_deref())
+        {
+            let layout = node.final_layout();
+            let origin = self.inline_origin(node, &layout, text, 0.0);
+            let scale = text.layout.scale();
+            out.extend(text.layout.lines().filter_map(|line| {
+                let metrics = line.metrics();
+                let start = origin
+                    + metrics
+                        .block_min_coord
+                        .min(metrics.content_block_min_coord)
+                        / scale;
+                let end = origin
+                    + metrics
+                        .block_max_coord
+                        .max(metrics.content_block_max_coord)
+                        / scale;
+                (end > start).then_some((start, end))
+            }));
+        }
+
+        let children = node.layout_children.borrow();
+        if let Some(children) = children.as_ref() {
+            for &child in children.iter() {
+                self.collect_table_line_boxes(child, out);
+            }
+        }
+    }
+
+    /// A table lays its cells out itself, so the page walk does not see the
+    /// line boxes inside them. Cut the table only where every cell in one row
+    /// has finished a line: otherwise one cell's glyph column is sliced even
+    /// though another cell happened to offer a legal edge.
+    fn table_edges(
+        &mut self,
+        table: &crate::layout::table::TableContext,
+        breakable: bool,
+    ) {
+        if !breakable {
+            return;
+        }
+        let mut row_cells = vec![Vec::new(); table.rows.len()];
+        for cell in &table.cells {
+            if let Some(cells) = row_cells.get_mut(cell.row as usize) {
+                cells.push(cell);
+            }
+        }
+        for (row_index, cells) in row_cells.into_iter().enumerate() {
+            let mut lines = Vec::new();
+            let mut row_start = f32::INFINITY;
+            let mut row_end = f32::NEG_INFINITY;
+            for cell in cells.iter() {
+                let node = &self.doc.nodes[cell.node_id];
+                let layout = node.final_layout();
+                let (start, end) = self.flow_box(node, &layout);
+                row_start = row_start.min(start);
+                row_end = row_end.max(end);
+            }
+            if !row_start.is_finite() || row_end <= row_start {
+                continue;
+            }
+
+            // CSS Tables 3 §6.1 keeps a row whole when no cell spans a later row
+            // and the row is at most half the fragmentainer in both directions.
+            // A rowspan is read from the DOM because the table context keeps only
+            // the cell's origin row, not the cells it covers later.
+            let has_rowspan = cells.iter().any(|cell| {
+                self.doc.nodes[cell.node_id]
+                    .attr(local_name!("rowspan"))
+                    .and_then(|span| span.trim().parse::<u16>().ok())
+                    .is_some_and(|span| span != 1)
+            });
+            let has_caption = cells.iter().any(|cell| cell.caption);
+            let row_group = table.rows.get(row_index).and_then(|row| row.group);
+            let group_avoids = row_group
+                .and_then(|group| self.doc.nodes[group].primary_styles())
+                .is_some_and(|styles| avoids_inside(styles.clone_break_inside()));
+            let preserve = has_caption
+                || group_avoids
+                || (!has_rowspan
+                    && self.fragmentainer_depth.zip(self.fragmentainer_cross).is_some_and(
+                        |(depth, cross)| {
+                            let row_size = row_end - row_start;
+                            row_size <= depth * 0.5 && row_size <= cross * 0.5
+                        },
+                    ));
+            if preserve {
+                self.units.push(Unit::whole(row_start, row_end));
+                self.push(row_end, Rank::Legal, breakable);
+                continue;
+            }
+
+            for cell in cells {
+                self.collect_table_line_boxes(cell.node_id, &mut lines);
+            }
+            lines.retain_mut(|(start, end)| {
+                *start = start.clamp(row_start, row_end);
+                *end = end.clamp(row_start, row_end);
+                *end > *start
+            });
+            lines.sort_by(|left, right| left.0.total_cmp(&right.0));
+            let mut merged = Vec::<(f32, f32)>::new();
+            for (start, end) in lines {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 + 0.01 => last.1 = last.1.max(end),
+                    _ => merged.push((start, end)),
+                }
+            }
+
+            let mut cursor = row_start;
+            for (start, end) in merged {
+                if cursor < start {
+                    self.units.push(Unit::splittable(cursor, start));
+                }
+                self.push(start, Rank::Legal, breakable);
+                self.units.push(Unit::whole(start.max(cursor), end));
+                self.push(end, Rank::Legal, breakable);
+                cursor = cursor.max(end);
+            }
+            if cursor < row_end {
+                self.units.push(Unit::splittable(cursor, row_end));
+            }
+            self.push(row_end, Rank::Legal, breakable);
+        }
+
+        // A table with only captions still has its own box between them. That
+        // box is not a row, so none of the edges above describe it; without
+        // this unit a column would jump from the top caption straight to the
+        // bottom one and the table box would lose its middle fragment.
+        if !table.cells.iter().any(|cell| !cell.caption) {
+            let mut grid_start = f32::NEG_INFINITY;
+            let mut grid_end = f32::INFINITY;
+            for cell in table.cells.iter().filter(|cell| cell.caption) {
+                let node = &self.doc.nodes[cell.node_id];
+                let layout = node.final_layout();
+                let (start, end) = self.flow_box(node, &layout);
+                if cell.caption_top {
+                    grid_start = grid_start.max(end);
+                } else {
+                    grid_end = grid_end.min(start);
+                }
+            }
+            if grid_start.is_finite() && grid_end.is_finite() && grid_end > grid_start {
+                self.units.push(Unit::splittable(grid_start, grid_end));
+                self.push(grid_start, Rank::Legal, breakable);
+                self.push(grid_end, Rank::Legal, breakable);
+            }
+        }
+    }
+
+    fn subtree_has_forced_break(&self, node_id: NodeId, before: bool) -> bool {
+        let node = &self.doc.nodes[node_id];
+        let forced = node.primary_styles().is_some_and(|styles| {
+            let value = if before {
+                styles.clone_break_before()
+            } else {
+                styles.clone_break_after()
+            };
+            rank_between(value) == Some(Rank::Forced)
+        });
+        if forced {
+            return true;
+        }
+        let children = node.layout_children.borrow();
+        children.as_ref().is_some_and(|children| {
+            children
+                .iter()
+                .any(|&child| self.subtree_has_forced_break(child, before))
+        })
+    }
+
     fn push(&mut self, at: f32, rank: Rank, breakable: bool) {
         self.push_at(at, rank, breakable, false);
     }
@@ -1810,6 +2149,11 @@ impl<'a> Planner<'a> {
         self.edges.sort_by(|a, b| a.at.total_cmp(&b.at));
         self.units.sort_by(|a, b| a.start.total_cmp(&b.start));
         self.spans.sort_by(|a, b| a.start.total_cmp(&b.start));
+        #[cfg(debug_assertions)]
+        if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
+            eprintln!("fragmentation units: {:?}", self.units);
+            eprintln!("fragmentation spans: {:?}", self.spans);
+        }
         cut_bands(&self.edges, &self.units, &self.spans, start, extent, cross, content_end)
     }
 }
@@ -1836,7 +2180,13 @@ fn line_rank(before: usize, after: usize, orphans: usize, widows: usize) -> Rank
 fn carry_before(units: &[Unit], limit: f32, cursor: f32, extent: f32) -> Option<f32> {
     units
         .iter()
-        .find(|unit| unit.start > cursor && unit.start < limit && unit.end > limit && unit.height() <= extent)
+        .find(|unit| {
+            !unit.freely_fragmentable
+                && unit.start > cursor
+                && unit.start < limit
+                && unit.end > limit
+                && unit.height() <= extent
+        })
         .map(|unit| unit.start)
 }
 
@@ -1887,13 +2237,23 @@ pub(crate) fn cut_bands(
             .get(from..)
             .is_some_and(|rest| rest.first().is_some_and(|at| *at < unit.end - 0.5))
     };
-    let mut too_tall: Vec<f32> = units
+    let too_tall: Vec<f32> = units
         .iter()
         .filter(|unit| unit.flex_item && unit.box_height() > extent && !has_inside(unit))
         .map(|unit| unit.start)
         .collect();
-    too_tall.sort_by(|a, b| a.total_cmp(b));
-    too_tall.dedup();
+    let mut dangling_starts: Vec<f32> = units
+        .iter()
+        .filter(|unit| {
+            !unit.flex_item
+                && !unit.freely_fragmentable
+                && unit.box_height() > extent
+                && !has_inside(unit)
+        })
+        .map(|unit| unit.start)
+        .collect();
+    dangling_starts.sort_by(|a, b| a.total_cmp(b));
+    dangling_starts.dedup();
     let mut cursor = start;
     loop {
         let limit = cursor + extent;
@@ -1912,7 +2272,15 @@ pub(crate) fn cut_bands(
                     break;
                 }
                 Rank::Legal => {
-                    if too_tall.binary_search_by(|at| at.total_cmp(&edge.at)).is_err() {
+                    let dangling = dangling_starts
+                        .binary_search_by(|at| at.total_cmp(&edge.at))
+                        .is_ok()
+                        && !units.iter().any(|unit| {
+                            unit.start < edge.at - 0.5 && unit.end > cursor + 0.5
+                        });
+                    if too_tall.binary_search_by(|at| at.total_cmp(&edge.at)).is_err()
+                        && !dangling
+                    {
                         legal = Some(edge.at);
                     }
                 }
@@ -1926,9 +2294,19 @@ pub(crate) fn cut_bands(
             }
         }
 
+        // A break model that can fragment inside a freely splittable stretch
+        // (today a freely fragmentable table row) may use the page's full
+        // extent. A legal box edge earlier in the flow must not move such a
+        // row whole just because it happens to be the last recorded edge.
+        let split_ahead = units.iter().any(|unit| {
+            unit.freely_fragmentable
+                && unit.start < limit
+                && unit.end > limit
+        });
         let cut = match forced {
             Some(at) => at,
             None if content_end <= limit => content_end,
+            None if split_ahead => limit,
             None => match legal {
                 Some(at) => at,
                 // Nothing in this fragmentainer may be cut at, so a box that must stay whole is
@@ -1993,15 +2371,20 @@ pub(crate) fn edges_of(
     doc: &BaseDocument,
     container_id: crate::NodeId,
     basis: f32,
+    axis: FlowAxis,
+    reversed: bool,
+    measure: f32,
+    fragmentainer_depth: Option<f32>,
 ) -> (Vec<Edge>, Vec<Unit>, Vec<CloneSpan>, f32) {
     let mut planner = Planner {
         doc,
         unrounded: true,
-        axis: FlowAxis::Y,
-        // A column sequence is measured along its own block axis, which this pass only does for a
-        // horizontal flow — so no direction to account for here.
-        reversed: false,
-        measure: 0.0,
+        axis,
+        // A column sequence is measured along its own block axis and direction.
+        reversed,
+        measure,
+        fragmentainer_depth,
+        fragmentainer_cross: None,
         edges: Vec::new(),
         units: Vec::new(),
         spans: Vec::new(),
@@ -2138,6 +2521,17 @@ mod tests {
         let units = [Unit::whole(2.0, 40.0)];
         let bands = cut_bands(&edges, &units, &[], 0.0, 10.0, 800.0, 40.0);
         assert_eq!((bands[0].start, bands[0].end), (0.0, 10.0));
+    }
+
+    /// A too-tall box's start is not a useful break point when it cannot fit an empty
+    /// fragmentainer either. Taking it would print an empty page instead of filling this one.
+    #[test]
+    fn too_tall_to_carry_ignores_its_start_edge() {
+        let edges = [edge(0.0, Rank::Legal), edge(2.0, Rank::Legal)];
+        let units = [Unit::whole(2.0, 40.0)];
+        let bands = cut_bands(&edges, &units, &[], 0.0, 10.0, 800.0, 40.0);
+        assert_eq!((bands[0].start, bands[0].end), (0.0, 10.0));
+        assert_eq!((bands[1].start, bands[1].end), (10.0, 20.0));
     }
 
     /// A box taller than the page has no legal point inside it: the page is filled and the rest
@@ -2330,6 +2724,8 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
         axis,
         reversed,
         measure: flow_measure,
+        fragmentainer_depth: Some(depth),
+        fragmentainer_cross: Some(cross),
         edges: Vec::new(),
         units: Vec::new(),
         spans: Vec::new(),

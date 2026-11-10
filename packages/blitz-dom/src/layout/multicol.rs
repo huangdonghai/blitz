@@ -30,6 +30,8 @@ use super::fragmentation::{
 };
 use super::resolve_calc_value;
 use crate::{dom_node_id, taffy_node_id};
+use crate::node::SpecialElementData;
+use super::table::TableFragmentSlice;
 
 /// The column parameters of a multi-column container, in CSS pixels.
 struct Columns {
@@ -102,6 +104,94 @@ fn resolve(value: &LengthPercentage, basis: f32) -> Option<f32> {
     Some(value.to_used_value(Au::from_f32_px(basis)).to_f32_px())
 }
 
+fn has_line_content(doc: &crate::BaseDocument, node_id: crate::NodeId) -> bool {
+    doc.nodes[node_id].children.iter().any(|&child_id| {
+        let child = &doc.nodes[child_id];
+        if !child.is_element() && !child.text_content().trim().is_empty() {
+            return true;
+        }
+        child.primary_styles().is_some_and(|styles| {
+            let display = styles.clone_display();
+            display.outside() == DisplayOutside::Inline
+                && !matches!(
+                    display.inside(),
+                    DisplayInside::Table
+                        | DisplayInside::TableCell
+                        | DisplayInside::TableRow
+                        | DisplayInside::TableRowGroup
+                        | DisplayInside::TableHeaderGroup
+                        | DisplayInside::TableFooterGroup
+                        | DisplayInside::TableColumn
+                        | DisplayInside::TableColumnGroup
+                )
+        })
+    })
+}
+
+fn record_table_fragments(
+    doc: &crate::BaseDocument,
+    node_id: crate::NodeId,
+    bands: &[Band],
+    axis: FlowAxis,
+) {
+    if axis != FlowAxis::Y {
+        return;
+    }
+    let node = &doc.nodes[node_id];
+    if node.flags.is_table_root()
+        && let Some(element) = node.element_data()
+        && let SpecialElementData::TableRoot(table) = &element.special_data
+    {
+        let (position, layout) = doc.physical_unrounded_geometry(node_id);
+        let table_start = position.y;
+        let table_end = table_start + layout.size.height;
+        let slices = bands
+            .iter()
+            .enumerate()
+            .filter_map(|(index, band)| {
+                let start = band.start.max(table_start);
+                let end = band.end.min(table_end);
+                (end > start).then_some(TableFragmentSlice {
+                    band: index,
+                    start: start - table_start,
+                    end: end - table_start,
+                })
+            })
+            .collect();
+        *table.fragment_slices.borrow_mut() = slices;
+    }
+    for child in &node.children {
+        record_table_fragments(doc, *child, bands, axis);
+    }
+}
+
+fn subtree_uses_vertical_axis(doc: &crate::BaseDocument, node_id: crate::NodeId) -> bool {
+    let node = &doc.nodes[node_id];
+    if node.flags.is_table_root() || node.taffy_position() == taffy::Position::Absolute {
+        return true;
+    }
+    if node.primary_styles().is_some_and(|styles| {
+        let display = styles.clone_display();
+        display.outside() == DisplayOutside::InternalTable
+            || matches!(
+                display.inside(),
+                DisplayInside::Table
+                    | DisplayInside::TableCell
+                    | DisplayInside::TableRow
+                    | DisplayInside::TableRowGroup
+                    | DisplayInside::TableHeaderGroup
+                    | DisplayInside::TableFooterGroup
+                    | DisplayInside::TableColumn
+                    | DisplayInside::TableColumnGroup
+            )
+    }) {
+        return true;
+    }
+    node.children
+        .iter()
+        .any(|&child| subtree_uses_vertical_axis(doc, child))
+}
+
 impl LayoutPassState<'_> {
     /// Lay out a multi-column container; see the module docs.
     ///
@@ -132,7 +222,18 @@ impl LayoutPassState<'_> {
         // the styles cannot outlive a pass that writes into the same tree. The insets are the
         // container's own box, which the single-column pass adds back on so that its children sit
         // the same distance from its border as they would in one column.
-        let (columns, insets, content_width, definite, outer, inline_root, auto_width) = {
+        let (
+            columns,
+            insets,
+            content_width,
+            definite,
+            outer,
+            inline_root,
+            auto_width,
+            intrinsic_width,
+            vertical,
+            vertical_rl,
+        ) = {
             let node = &self.nodes[dom_id];
             let Some(styles) = node.primary_styles() else {
                 return LayoutOutput::HIDDEN;
@@ -153,6 +254,13 @@ impl LayoutPassState<'_> {
             // shrink-to-fit one.
             use style::values::computed::Size as ComputedSize;
             let auto_width = matches!(styles.clone_width(), ComputedSize::Auto);
+            let intrinsic_width = matches!(
+                styles.clone_width(),
+                ComputedSize::FitContent
+                    | ComputedSize::FitContentFunction(_)
+                    | ComputedSize::MinContent
+                    | ComputedSize::MaxContent
+            );
             let style = node.layout_style();
             let padding = style
                 .padding()
@@ -166,8 +274,10 @@ impl LayoutPassState<'_> {
                 top: padding.top + border.top,
                 bottom: padding.bottom + border.bottom,
             };
-            let content_width = (available_width - insets.left - insets.right).max(0.0);
-            let columns = Columns::measure(&styles, content_width, parent_width);
+            let decorated_box = padding.left + padding.right + padding.top + padding.bottom > 0.0;
+            let vertical = node.writing_mode().is_vertical()
+                && (decorated_box || subtree_uses_vertical_axis(self, dom_id));
+            let vertical_rl = node.writing_mode().is_vertical_rl();
             // Two different heights are asked for below, and under `box-sizing: content-box` — the
             // default — they are not the same number: the height the author wrote is the **content**
             // box, while the block algorithm is handed a **border box**, exactly as the width below
@@ -180,7 +290,20 @@ impl LayoutPassState<'_> {
                 style::computed_values::box_sizing::T::BorderBox => authored,
                 _ => authored.map(|height| height + insets.top + insets.bottom),
             };
-            let definite = outer.map(|height| (height - insets.top - insets.bottom).max(0.0));
+            let content_width = if vertical {
+                authored
+                    .map(|height| (height - insets.top - insets.bottom).max(0.0))
+                    .unwrap_or(available_width)
+            } else {
+                (available_width - insets.left - insets.right).max(0.0)
+            };
+            let columns = Columns::measure(&styles, content_width, parent_width);
+            let definite = if vertical {
+                style_width(&styles, inputs)
+                    .map(|width| (width - insets.left - insets.right).max(0.0))
+            } else {
+                outer.map(|height| (height - insets.top - insets.bottom).max(0.0))
+            };
             (
                 columns,
                 insets,
@@ -189,7 +312,15 @@ impl LayoutPassState<'_> {
                 outer,
                 node.flags.is_inline_root(),
                 auto_width,
+                intrinsic_width,
+                vertical,
+                vertical_rl,
             )
+        };
+        let definite_width = if intrinsic_width {
+            None
+        } else {
+            definite_width
         };
 
         // Pass one: this container's flow as a single column.
@@ -228,13 +359,18 @@ impl LayoutPassState<'_> {
             columns.width = one;
             content_width = one;
         }
+        let flow_depth = if vertical {
+            definite.unwrap_or(columns.width)
+        } else {
+            columns.width
+        };
         let narrow = LayoutInput {
             known_dimensions: Size {
-                width: Some(columns.width + insets.left + insets.right),
+                width: Some(flow_depth + insets.left + insets.right),
                 height: outer,
             },
             available_space: Size {
-                width: AvailableSpace::Definite(columns.width + insets.left + insets.right),
+                width: AvailableSpace::Definite(flow_depth + insets.left + insets.right),
                 height: match outer {
                     Some(height) => AvailableSpace::Definite(height),
                     None => AvailableSpace::MaxContent,
@@ -263,11 +399,46 @@ impl LayoutPassState<'_> {
             self.remeasure_spanners(dom_id, content_width, columns.width, definite);
         }
 
-        let flow_height = (flow.size.height - insets.top - insets.bottom).max(0.0);
-        let (edges, units, spans, extent) = edges_of(&*self, dom_id, columns.width);
+        let flow_height = if vertical {
+            (flow.size.width - insets.left - insets.right).max(0.0)
+        } else {
+            (flow.size.height - insets.top - insets.bottom).max(0.0)
+        };
+        let axis = if vertical {
+            FlowAxis::X
+        } else {
+            FlowAxis::Y
+        };
+        let flow_measure = if vertical_rl {
+            insets.left + definite.unwrap_or(columns.width)
+        } else {
+            0.0
+        };
+        let (edges, units, spans, extent) = edges_of(
+            &*self,
+            dom_id,
+            columns.width,
+            axis,
+            vertical_rl,
+            flow_measure,
+            if columns.sequential { definite } else { None },
+        );
         // The pass knows where the flow ends: its own height. `extent` only sees the blocks of the
-        // flow, and a column of text has none — its lines are the container's own.
-        let flow_end = flow_height.max(extent);
+        // flow, and a column of text has none — its lines are the container's own. A definite
+        // height clips the box but not its overflow: those lines continue in the next column
+        // instead of disappearing.
+        let overflow_height = if columns.sequential {
+            if vertical {
+                (flow.scrollable_overflow_rect.right - insets.left).max(0.0)
+            } else if edges.len() <= columns.count && has_line_content(&*self, dom_id) {
+                (flow.scrollable_overflow_rect.bottom - insets.top).max(0.0)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let flow_end = flow_height.max(extent).max(overflow_height);
 
         // How tall a column is: the container's own height when it has one, otherwise the
         // shortest height that still holds the flow in the columns asked for.
@@ -300,14 +471,30 @@ impl LayoutPassState<'_> {
                 None if columns.sequential => flow_height,
                 None => balance(&edges, &units, &spans, flow_height, columns.count),
             };
+            // A table's wrapper begins at the flow's content edge, not at the
+            // multicol box's outer edge. Starting at zero would otherwise take
+            // the table's own start edge as a break and print a padding-only
+            // fragment before it.
+            let flow_start = if vertical {
+                insets.left
+            } else {
+                insets.top
+            };
             let bands: ThinVec<_> =
-                cut_bands(&edges, &units, &spans, 0.0, height, columns.width, flow_end)
+                cut_bands(&edges, &units, &spans, flow_start, height, columns.width, flow_end)
                     .into_iter()
                     .enumerate()
                     .map(|(index, mut band)| {
-                        band.origin = taffy::Point {
-                            x: insets.left + index as f32 * (columns.width + columns.gap),
-                            y: insets.top,
+                        band.origin = if vertical {
+                            taffy::Point {
+                                x: insets.left,
+                                y: insets.top + index as f32 * (columns.width + columns.gap),
+                            }
+                        } else {
+                            taffy::Point {
+                                x: insets.left + index as f32 * (columns.width + columns.gap),
+                                y: insets.top,
+                            }
                         };
                         // Chrome measures a column rule by the fragmentainer's own depth: a container
                         // that was given a height rules to that height even when balancing made the
@@ -318,6 +505,8 @@ impl LayoutPassState<'_> {
                     .collect();
             (bands, height)
         };
+
+        record_table_fragments(&*self, dom_id, &bands, axis);
 
         #[cfg(debug_assertions)]
         if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {
@@ -371,6 +560,15 @@ impl LayoutPassState<'_> {
         } else {
             bands.len().max(1).min(columns.count)
         };
+        // An intrinsically-sized container reports the columns it asks for,
+        // even when the content at the measured width filled fewer of them.
+        // Its parent needs that width to lay out the column context; the final
+        // definite-width pass can still settle on the used count.
+        let reported = if definite_width.is_none() {
+            columns.count
+        } else {
+            used
+        };
 
         // A box of definite width that balanced into fewer columns than it named has to be measured
         // again, because the columns it now uses are wider and its content reflows in them: cutting
@@ -379,10 +577,9 @@ impl LayoutPassState<'_> {
         // of 396. One correction pass is enough — a second asking for fewer still is a flow whose
         // height does not depend on the column width, and the hinted measure reports its own count.
         //
-        // Only a horizontal flow is corrected: this module cuts bands along the flow's block axis
-        // today, so in a vertical container the band count says nothing about how many columns the
-        // content fills, and the correction collapsed `break-inside-avoid-min-block-size-2`'s three
-        // columns into one. That is the axis work the module docs record as missing, not this rule.
+        // The definite-width correction stays horizontal-only: vertical columns derive their
+        // breadth from the authored inline size, and re-dividing it by the painted band count
+        // collapsed `break-inside-avoid-min-block-size-2`'s three columns into one.
         let vertical_flow = self.nodes[dom_id].primary_styles().is_some_and(|styles| {
             use style::values::computed::WritingModeProperty as Wm;
             matches!(
@@ -410,18 +607,21 @@ impl LayoutPassState<'_> {
         }
 
         self.nodes[dom_id].break_plan = Some(Box::new(BreakPlan {
-            axis: FlowAxis::Y,
+            axis,
             stride: columns.width + columns.gap,
             bands,
-            // A column sequence is cut along its own block axis, which this pass only does for a
-            // horizontal flow: a vertical container's columns are the work left to do.
-            reversed: false,
-            measure: 0.0,
-            depth: 0.0,
-            flow_end: 0.0,
+            // A column sequence is cut along its own block axis.
+            reversed: vertical_rl,
+            measure: flow_measure,
+            depth: if vertical_rl {
+                definite.unwrap_or(height)
+            } else {
+                0.0
+            },
+            flow_end: if vertical_rl { flow_end } else { 0.0 },
             // The flow was measured at one column's width inside this container's content box, so its
             // children begin at the container's own cross inset and the bands must not add it twice.
-            cross_start: insets.left,
+            cross_start: if vertical { insets.top } else { insets.left },
         }));
 
         // The container is as tall as one column, not as tall as the flow it was cut from —
@@ -429,17 +629,27 @@ impl LayoutPassState<'_> {
         // spanner is as tall as all of its runs together.
         LayoutOutput {
             size: Size {
-                width: if definite_width.is_some() {
+                width: if vertical {
+                    definite.unwrap_or(height) + insets.left + insets.right
+                } else if definite_width.is_some() {
                     available_width
                 } else {
                     // As wide as the columns its content filled, with the room between them.
-                    let used = used as f32;
-                    columns.width * used
-                        + columns.gap * (used - 1.0).max(0.0)
+                    let reported = reported as f32;
+                    columns.width * reported
+                        + columns.gap * (reported - 1.0).max(0.0)
                         + insets.left
                         + insets.right
                 },
-                height: definite.unwrap_or(height) + insets.top + insets.bottom,
+                height: if vertical {
+                    let reported = reported as f32;
+                    columns.width * reported
+                        + columns.gap * (reported - 1.0).max(0.0)
+                        + insets.top
+                        + insets.bottom
+                } else {
+                    definite.unwrap_or(height) + insets.top + insets.bottom
+                },
             },
             ..flow
         }
@@ -806,6 +1016,16 @@ fn style_height(styles: &ComputedValues, inputs: LayoutInput) -> Option<f32> {
     (height > 0.0).then_some(height)
 }
 
+/// The width the author gave the container, in CSS pixels.
+fn style_width(styles: &ComputedValues, inputs: LayoutInput) -> Option<f32> {
+    let basis = inputs.parent_size.width.unwrap_or(0.0);
+    let width = match styles.clone_width() {
+        style::values::computed::Size::LengthPercentage(value) => resolve(&value.0, basis)?,
+        _ => return None,
+    };
+    (width > 0.0).then_some(width)
+}
+
 /// The shortest column height, measured at a legal break point, that holds the flow in `count`
 /// columns.
 ///
@@ -872,12 +1092,7 @@ mod tests {
     }
 
     fn line(start: f32, end: f32) -> Unit {
-        Unit {
-            start,
-            end,
-            box_start: start,
-            flex_item: false,
-        }
+        Unit::whole(start, end)
     }
 
     /// A 78px flow of three 26px lines, asked to balance into four columns. The only point between

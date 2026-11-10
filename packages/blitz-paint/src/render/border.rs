@@ -1,6 +1,10 @@
 use anyrender::PaintScene;
 use blitz_dom::node::SpecialElementData;
-use kurbo::{BezPath, Cap, Circle, Insets, Join, PathEl, Point, Rect, Shape as _, Stroke, Vec2};
+use blitz_dom::local_name;
+use blitz_traits::node_id::NodeId;
+use kurbo::{
+    Affine, BezPath, Cap, Circle, Insets, Join, PathEl, Point, Rect, Shape as _, Stroke, Vec2,
+};
 use peniko::{Color, Fill};
 use smallvec::SmallVec;
 use style::{
@@ -46,6 +50,309 @@ fn physical_table_tracks(
         .collect();
     x_tracks.sort_by(|a, b| a.start.total_cmp(&b.start));
     (x_tracks, columns)
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TableGridTrack {
+    pub line: taffy::Line<f32>,
+    /// Index into `TableContext::rows` or `TableContext::columns`.
+    pub index: usize,
+}
+
+pub(super) struct TableGridGeometry {
+    pub x: Vec<TableGridTrack>,
+    pub y: Vec<TableGridTrack>,
+    /// The table box around the grid, excluding caption rows.
+    pub border_box: Rect,
+}
+
+/// The physical tracks and border box of the table's grid.
+///
+/// Captions are rows in the taffy grid but are outside the table box in CSS.
+/// Keeping them in the grid is useful for placing and fragmenting them, but
+/// every table-level paint operation has to stop at the first and last real
+/// row instead of at the wrapper's edge.
+pub(super) fn table_grid_geometry<S: taffy::CheapCloneStr>(
+    element: &SpecialElementData,
+    grid_info: &taffy::DetailedGridInfo<S>,
+    vertical: bool,
+    vertical_rl: bool,
+    table_size: taffy::Size<f32>,
+    captions: &[(bool, Rect)],
+    border: taffy::Rect<f32>,
+) -> TableGridGeometry {
+    let SpecialElementData::TableRoot(table) = element else {
+        unreachable!("table grid geometry is only for a table root");
+    };
+    let mut caption_rows = vec![false; table.rows.len()];
+    for cell in table.cells.iter().filter(|cell| cell.caption) {
+        if let Some(caption) = caption_rows.get_mut(cell.row as usize) {
+            *caption = true;
+        }
+    }
+
+    let columns: Vec<_> = PhysicalTracks::from_tracks(&grid_info.columns)
+        .iter_indexed()
+        .collect();
+    let all_rows: Vec<_> = PhysicalTracks::from_tracks(&grid_info.rows)
+        .iter_indexed()
+        .map(|(index, row)| {
+            let line = if vertical && vertical_rl {
+                taffy::Line {
+                    start: table_size.width - row.end,
+                    end: table_size.width - row.start,
+                }
+            } else {
+                row
+            };
+            (index, line)
+        })
+        .collect();
+    let rows: Vec<_> = all_rows
+        .iter()
+        .copied()
+        .filter(|(index, _)| !caption_rows.get(*index).copied().unwrap_or(false))
+        .collect();
+
+    let (x, mut y) = if vertical {
+        let mut x: Vec<_> = rows
+            .into_iter()
+            .map(|(index, line)| TableGridTrack { line, index })
+            .collect();
+        x.sort_by(|left, right| left.line.start.total_cmp(&right.line.start));
+        let y: Vec<TableGridTrack> = columns
+            .into_iter()
+            .map(|(index, line)| TableGridTrack { line, index })
+            .collect();
+        (x, y)
+    } else {
+        let x: Vec<TableGridTrack> = columns
+            .into_iter()
+            .map(|(index, line)| TableGridTrack { line, index })
+            .collect();
+        let y: Vec<TableGridTrack> = rows
+            .into_iter()
+            .map(|(index, line)| TableGridTrack { line, index })
+            .collect();
+        (x, y)
+    };
+
+    if !vertical && captions.iter().any(|(top, _)| *top) {
+        let shift = border.top.max(table.style.gap.height.into_raw().value());
+        for track in &mut y {
+            track.line.start -= shift;
+            track.line.end -= shift;
+        }
+    }
+
+    let border_box = if vertical {
+        let (x0, x1) = if vertical_rl {
+            (
+                captions
+                    .iter()
+                    .filter(|(top, _)| !top)
+                    .map(|(_, rect)| rect.x1)
+                    .reduce(f64::max)
+                    .unwrap_or(0.0),
+                captions
+                    .iter()
+                    .filter(|(top, _)| *top)
+                    .map(|(_, rect)| rect.x0)
+                    .reduce(f64::min)
+                    .unwrap_or(table_size.width as f64),
+            )
+        } else {
+            (
+                captions
+                    .iter()
+                    .filter(|(top, _)| *top)
+                    .map(|(_, rect)| rect.x1)
+                    .reduce(f64::max)
+                    .unwrap_or(0.0),
+                captions
+                    .iter()
+                    .filter(|(top, _)| !top)
+                    .map(|(_, rect)| rect.x0)
+                    .reduce(f64::min)
+                    .unwrap_or(table_size.width as f64),
+            )
+        };
+        Rect::new(
+            x0.clamp(0.0, table_size.width as f64),
+            0.0,
+            x1.clamp(0.0, table_size.width as f64),
+            table_size.height as f64,
+        )
+    } else {
+        Rect::new(
+            0.0,
+            captions
+                .iter()
+                .filter(|(top, _)| *top)
+                .map(|(_, rect)| rect.y1)
+                .reduce(f64::max)
+                .unwrap_or(0.0),
+            table_size.width as f64,
+            captions
+                .iter()
+                .filter(|(top, _)| !top)
+                .map(|(_, rect)| rect.y0)
+                .reduce(f64::min)
+                .unwrap_or(table_size.height as f64),
+        )
+    };
+    TableGridGeometry { x, y, border_box }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableBorderSide {
+    Top,
+    Right,
+    Bottom,
+    Left,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableAxis {
+    Row,
+    Column,
+}
+
+/// The origin classes of CSS 2.1 §17.6.2.1, lowest to highest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum BorderOrigin {
+    Table,
+    ColumnGroup,
+    Column,
+    RowGroup,
+    Row,
+    Cell,
+}
+
+#[derive(Clone, Copy)]
+struct BorderCandidate {
+    width: f64,
+    style: BorderStyle,
+    color: Color,
+    origin: BorderOrigin,
+    /// Zero for the physical before/left/top side of an edge, one for after/right/bottom.
+    order: u8,
+}
+
+impl BorderCandidate {
+    fn beats(self, other: Self, prefer_after: bool) -> bool {
+        if self.style == BorderStyle::Hidden {
+            return other.style != BorderStyle::Hidden;
+        }
+        if other.style == BorderStyle::Hidden {
+            return false;
+        }
+        if self.width != other.width {
+            return self.width > other.width;
+        }
+        let rank = |style| match style {
+            BorderStyle::Double => 8,
+            BorderStyle::Solid => 7,
+            BorderStyle::Dashed => 6,
+            BorderStyle::Dotted => 5,
+            BorderStyle::Ridge => 4,
+            BorderStyle::Outset => 3,
+            BorderStyle::Groove => 2,
+            BorderStyle::Inset => 1,
+            BorderStyle::None => 0,
+            BorderStyle::Hidden => u8::MAX,
+        };
+        let style = rank(self.style);
+        let other_style = rank(other.style);
+        if style != other_style {
+            return style > other_style;
+        }
+        if self.origin != other.origin {
+            return self.origin > other.origin;
+        }
+        let order = |candidate: Self| {
+            if prefer_after {
+                1 - candidate.order
+            } else {
+                candidate.order
+            }
+        };
+        order(self) < order(other)
+    }
+}
+
+fn border_candidate(
+    node: &blitz_dom::Node,
+    origin: BorderOrigin,
+    side: TableBorderSide,
+    order: u8,
+) -> Option<BorderCandidate> {
+    let styles = node.primary_styles()?;
+    let border = styles.get_border();
+    let current = styles.clone_color();
+    let (color, width, style) = match side {
+        TableBorderSide::Top => (
+            &border.border_top_color,
+            border.border_top_width.clone(),
+            border.border_top_style,
+        ),
+        TableBorderSide::Right => (
+            &border.border_right_color,
+            border.border_right_width.clone(),
+            border.border_right_style,
+        ),
+        TableBorderSide::Bottom => (
+            &border.border_bottom_color,
+            border.border_bottom_width.clone(),
+            border.border_bottom_style,
+        ),
+        TableBorderSide::Left => (
+            &border.border_left_color,
+            border.border_left_width.clone(),
+            border.border_left_style,
+        ),
+    };
+    Some(BorderCandidate {
+        width: if style.none_or_hidden() {
+            0.0
+        } else {
+            width.0.to_f32_px() as f64
+        },
+        style,
+        color: color.resolve_to_absolute(&current).as_srgb_color(),
+        origin,
+        order,
+    })
+}
+
+fn push_border_candidate(
+    candidates: &mut SmallVec<[BorderCandidate; 16]>,
+    node: &blitz_dom::Node,
+    origin: BorderOrigin,
+    side: TableBorderSide,
+    order: u8,
+) {
+    if let Some(candidate) = border_candidate(node, origin, side, order) {
+        candidates.push(candidate);
+    }
+}
+
+fn resolve_border_candidates(
+    candidates: &[BorderCandidate],
+    prefer_after: bool,
+) -> Option<Color> {
+    let mut winner: Option<BorderCandidate> = None;
+    for candidate in candidates.iter().copied() {
+        if candidate.style == BorderStyle::Hidden {
+            return None;
+        }
+        if winner.is_none_or(|current| candidate.beats(current, prefer_after)) {
+            winner = Some(candidate);
+        }
+    }
+    winner
+        .filter(|candidate| candidate.width > 0.0 && candidate.style != BorderStyle::None)
+        .map(|candidate| candidate.color)
 }
 
 /// A darker version of a colour (mirrors WebKit/Blink's `Color::Dark`): the
@@ -181,6 +488,13 @@ fn sample_points_along_path(path: &BezPath, spacing: f64, count: usize) -> Vec<P
 impl ElementCx<'_, '_> {
     /// Draw all borders for a node
     pub(crate) fn draw_border(&self, scene: &mut impl PaintScene) {
+        if let Some(grid) = self.table_grid_cx() {
+            return grid.draw_border_box(scene);
+        }
+        self.draw_border_box(scene);
+    }
+
+    fn draw_border_box(&self, scene: &mut impl PaintScene) {
         let style = &*self.style;
         let border = style.get_border();
         let current_color = style.clone_color();
@@ -543,6 +857,127 @@ impl ElementCx<'_, '_> {
         scene.pop_layer();
     }
 
+    /// Resolve one segment of a collapsed grid edge by CSS 2.1 §17.6.2.1.
+    ///
+    /// `before` and `after` are the tracks on the two physical sides of the edge, each with the
+    /// side of its own border box that meets the edge. A cell grid is built once per table so a
+    /// spanned cell contributes the same border along every grid segment it covers.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_table_border_color(
+        &self,
+        element: &SpecialElementData,
+        cell_grid: &[Option<NodeId>],
+        grid_columns: usize,
+        boundary_axis: TableAxis,
+        before: Option<(usize, TableBorderSide)>,
+        after: Option<(usize, TableBorderSide)>,
+        cross_axis: TableAxis,
+        cross: usize,
+        outer: bool,
+    ) -> Option<Color> {
+        let SpecialElementData::TableRoot(table) = element else {
+            return None;
+        };
+        let mut candidates: SmallVec<[BorderCandidate; 16]> = SmallVec::new();
+
+        let track = |axis: TableAxis, index: usize| -> Option<(NodeId, Option<NodeId>, BorderOrigin, BorderOrigin)> {
+            match axis {
+                TableAxis::Row => {
+                    let row = table.rows.get(index)?;
+                    Some((
+                        row.node_id,
+                        row.group,
+                        BorderOrigin::Row,
+                        BorderOrigin::RowGroup,
+                    ))
+                }
+                TableAxis::Column => {
+                    let column = table.columns.get(index)?;
+                    Some((
+                        column.node_id,
+                        column.group,
+                        BorderOrigin::Column,
+                        BorderOrigin::ColumnGroup,
+                    ))
+                }
+            }
+        };
+        let push_track = |candidates: &mut SmallVec<[BorderCandidate; 16]>,
+                          axis: TableAxis,
+                          index: usize,
+                          side: TableBorderSide,
+                          order: u8| {
+            let Some((node_id, group, origin, group_origin)) = track(axis, index) else {
+                return;
+            };
+            if let Some(candidate) = self.context.dom.get_node(node_id).and_then(|node| {
+                border_candidate(node, origin, side, order)
+            }) {
+                candidates.push(candidate);
+            }
+            if let Some(candidate) = group.and_then(|group| {
+                self.context
+                    .dom
+                    .get_node(group)
+                    .and_then(|node| border_candidate(node, group_origin, side, order))
+            }) {
+                candidates.push(candidate);
+            }
+        };
+
+        for (index, side, order) in before
+            .map(|(index, side)| (index, side, 0))
+            .into_iter()
+            .chain(after.map(|(index, side)| (index, side, 1)))
+        {
+            push_track(&mut candidates, boundary_axis, index, side, order);
+
+            let (row, column) = match boundary_axis {
+                TableAxis::Row => (index, cross),
+                TableAxis::Column => (cross, index),
+            };
+            if let Some(cell_id) = cell_grid
+                .get(row * grid_columns + column)
+                .copied()
+                .flatten()
+                && let Some(cell) = self.context.dom.get_node(cell_id)
+            {
+                push_border_candidate(
+                    &mut candidates,
+                    cell,
+                    BorderOrigin::Cell,
+                    side,
+                    order,
+                );
+            }
+        }
+
+        let edge_side = after
+            .map(|(_, side)| side)
+            .or_else(|| before.map(|(_, side)| side))
+            .expect("a table border edge has at least one side");
+        if outer {
+            push_track(
+                &mut candidates,
+                cross_axis,
+                cross,
+                edge_side,
+                2,
+            );
+            push_border_candidate(
+                &mut candidates,
+                self.node,
+                BorderOrigin::Table,
+                edge_side,
+                2,
+            );
+        }
+
+        let prefer_after = matches!(edge_side, TableBorderSide::Left | TableBorderSide::Right)
+            && self.style.clone_direction() == style::computed_values::direction::T::Rtl;
+        resolve_border_candidates(&candidates, prefer_after)
+    }
+
     pub(crate) fn draw_table_borders(&self, scene: &mut impl PaintScene) {
         let SpecialElementData::TableRoot(table) = &self.element.special_data else {
             return;
@@ -555,43 +990,106 @@ impl ElementCx<'_, '_> {
         let Some(grid_info) = &mut *table.computed_grid_info.borrow_mut() else {
             return;
         };
-        let Some(border_style) = table.border_style.as_deref() else {
-            return;
-        };
-
-        let outer_border_style = self.style.get_border();
-
-        let cols = PhysicalTracks::from_tracks(&grid_info.columns);
-        let rows = PhysicalTracks::from_tracks(&grid_info.rows);
-
-        // Taffy stores the tracks in the table's writing-mode axes. Map them
-        // back to the physical axes paint uses before drawing.
         let writing_mode = self.node.writing_mode();
         let vertical = writing_mode.is_vertical();
-        let (x_tracks, y_tracks) = physical_table_tracks(
-            cols.iter(),
-            rows.iter(),
+        let layout = *self.node.final_layout();
+        let captions: Vec<(bool, Rect)> = table
+            .cells
+            .iter()
+            .filter(|cell| cell.caption)
+            .filter_map(|cell| {
+                let layout = self.context.dom.get_node(cell.node_id)?.final_layout();
+                Some((
+                    cell.caption_top,
+                    Rect::new(
+                        layout.location.x as f64,
+                        layout.location.y as f64,
+                        (layout.location.x + layout.size.width) as f64,
+                        (layout.location.y + layout.size.height) as f64,
+                    ),
+                ))
+            })
+            .collect();
+        let geometry = table_grid_geometry(
+            &self.element.special_data,
+            grid_info,
             vertical,
             writing_mode.is_vertical_rl(),
-            self.node.final_layout().size.width,
+            layout.size,
+            &captions,
+            layout.border,
         );
-
-        // TODO: support different colors for different borders
-        let current_color = self.style.clone_color();
-        let border_color = border_style
-            .border_top_color
-            .resolve_to_absolute(&current_color)
-            .as_srgb_color();
-
-        // No need to draw transparent borders (as they won't be visible anyway)
-        if border_color == Color::TRANSPARENT {
+        let x_tracks: Vec<_> = geometry.x.iter().map(|track| track.line).collect();
+        let y_tracks: Vec<_> = geometry.y.iter().map(|track| track.line).collect();
+        if x_tracks.is_empty() || y_tracks.is_empty() {
             return;
         }
 
-        // Border widths are not adjusted for border-style in computed styles,
-        // so a border with `none`/`hidden` style must be treated as zero-width.
-        if border_style.border_top_style.none_or_hidden() {
-            return;
+        // Taffy's physical x/y tracks swap axes for vertical tables. Keep the logical
+        // row/column index beside each physical track so border candidates are read
+        // from the right row, row group, column and column group.
+        let x_axis = if vertical {
+            TableAxis::Row
+        } else {
+            TableAxis::Column
+        };
+        let y_axis = if vertical {
+            TableAxis::Column
+        } else {
+            TableAxis::Row
+        };
+        let x_indices: Vec<usize> = geometry.x.iter().map(|track| track.index).collect();
+        let y_indices: Vec<usize> = geometry.y.iter().map(|track| track.index).collect();
+
+        let mut row_cell_start = vec![None; table.rows.len()];
+        for cell in table.cells.iter().filter(|cell| !cell.caption) {
+            if let Some(layout) = self
+                .context
+                .dom
+                .get_node(cell.node_id)
+                .map(|node| node.final_layout())
+            {
+                row_cell_start[cell.row as usize].get_or_insert(layout.location.y);
+            }
+        }
+        let row_outside = |index: usize| {
+            let Some(track) = y_tracks.get(index) else {
+                return false;
+            };
+            let end = (self.transform * Point::new(0.0, track.end as f64 * self.scale)).y;
+            if end > self.clip_rect.y1 + 0.5 {
+                return false;
+            }
+            let Some(next_row) = y_indices.get(index + 1).copied() else {
+                return false;
+            };
+            let Some(start) = row_cell_start.get(next_row).copied().flatten() else {
+                return false;
+            };
+            let screen = (self.transform * Point::new(0.0, start as f64 * self.scale)).y;
+            screen >= self.clip_rect.y1 - 0.5
+        };
+
+        let grid_columns = grid_info.columns.positions.len();
+        let grid_rows = grid_info.rows.positions.len();
+        let mut cell_grid = vec![None; grid_rows.saturating_mul(grid_columns)];
+        for cell in table.cells.iter().filter(|cell| !cell.caption) {
+            let Some(node) = self.context.dom.get_node(cell.node_id) else {
+                continue;
+            };
+            let span = |name| {
+                node.attr(name)
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .filter(|span| *span > 0)
+                    .unwrap_or(1)
+            };
+            let row_end = (cell.row as usize + span(local_name!("rowspan"))).min(grid_rows);
+            let column_end = (cell.column as usize + span(local_name!("colspan"))).min(grid_columns);
+            for row in cell.row as usize..row_end {
+                for column in cell.column as usize..column_end {
+                    cell_grid[row * grid_columns + column] = Some(cell.node_id);
+                }
+            }
         }
 
         // The borders are laid out as the gutters between the tracks, and as the border
@@ -610,36 +1108,166 @@ impl ElementCx<'_, '_> {
         let right = x_end + x_border;
         let top = y_origin - y_border;
         let bottom = y_end + y_border;
-
-        let mut fill = |x0: f64, y0: f64, x1: f64, y1: f64| {
+        let table_clip = self
+            .multicol_clip_rect()
+            .map(|clip| clip.intersect(self.clip_rect))
+            .filter(|clip| clip.area() > 0.0);
+        if let Some(clip) = table_clip {
+            scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+        }
+        let mut fill = |x0: f64, y0: f64, x1: f64, y1: f64, color: Color| {
             let shape = Rect::new(x0, y0, x1, y1).scale_from_origin(self.scale);
-            scene.fill(Fill::NonZero, self.transform, border_color, None, &shape);
+            scene.fill(Fill::NonZero, self.transform, color, None, &shape);
         };
 
-        // Horizontal borders: the outer edges, then the gutters between adjacent tracks.
-        // The vertical borders are drawn between them so that no corner is painted twice.
-        if outer_border_style.border_top_style != BorderStyle::Hidden {
-            fill(left, top, right, top + y_border);
-        }
-        if outer_border_style.border_bottom_style != BorderStyle::Hidden {
-            fill(left, bottom - y_border, right, bottom);
-        }
-        for (prev, next) in y_tracks.iter().zip(y_tracks.iter().skip(1)) {
-            fill(left, prev.end as f64, right, next.start as f64);
+        // Every physical horizontal edge, split by the crossing tracks so a column's
+        // border can win over the row's on that segment.
+        let horizontal_edges: Vec<_> = std::iter::once((
+            top,
+            top + y_border,
+            None,
+            y_indices.first().copied().map(|index| (index, TableBorderSide::Top)),
+            true,
+            false,
+        ))
+        .chain(
+            y_tracks
+                .iter()
+                .zip(y_tracks.iter().skip(1))
+                .enumerate()
+                .map(|(index, (previous, next))| {
+                    (
+                        previous.end as f64,
+                        next.start as f64,
+                        Some((y_indices[index], TableBorderSide::Bottom)),
+                        Some((y_indices[index + 1], TableBorderSide::Top)),
+                        false,
+                        row_outside(index),
+                    )
+                }),
+        )
+        .chain(std::iter::once((
+            bottom - y_border,
+            bottom,
+            y_indices
+                .last()
+                .copied()
+                .map(|index| (index, TableBorderSide::Bottom)),
+            None,
+            true,
+            false,
+        )))
+        .collect();
+        for (y0, y1, before, after, outer, outside) in horizontal_edges {
+            if outside {
+                continue;
+            }
+            for (index, track) in x_tracks.iter().enumerate() {
+                let x0 = if !outer {
+                    track.start as f64
+                } else if index == 0 {
+                    left
+                } else {
+                    x_tracks[index - 1].end as f64
+                };
+                let x1 = if !outer {
+                    track.end as f64
+                } else if index + 1 == x_tracks.len() {
+                    right
+                } else {
+                    track.end as f64
+                };
+                let cross = x_indices[index];
+                let Some(color) = self.resolve_table_border_color(
+                    &self.element.special_data,
+                    &cell_grid,
+                    grid_columns,
+                    y_axis,
+                    before,
+                    after,
+                    x_axis,
+                    cross,
+                    outer,
+                ) else {
+                    continue;
+                };
+                fill(x0, y0, x1, y1, color);
+            }
         }
 
-        // Vertical borders, one segment per y track
-        for row in y_tracks.iter() {
-            let (y0, y1) = (row.start as f64, row.end as f64);
-            if outer_border_style.border_left_style != BorderStyle::Hidden {
-                fill(left, y0, left + x_border, y1);
+        // Every physical vertical edge, split by the crossing tracks.
+        let vertical_edges: Vec<_> = std::iter::once((
+            left,
+            left + x_border,
+            None,
+            x_indices.first().copied().map(|index| (index, TableBorderSide::Left)),
+            true,
+        ))
+        .chain(
+            x_tracks
+                .iter()
+                .zip(x_tracks.iter().skip(1))
+                .enumerate()
+                .map(|(index, (previous, next))| {
+                    (
+                        previous.end as f64,
+                        next.start as f64,
+                        Some((x_indices[index], TableBorderSide::Right)),
+                        Some((x_indices[index + 1], TableBorderSide::Left)),
+                        false,
+                    )
+                }),
+        )
+        .chain(std::iter::once((
+            right - x_border,
+            right,
+            x_indices
+                .last()
+                .copied()
+                .map(|index| (index, TableBorderSide::Right)),
+            None,
+            true,
+        )))
+        .collect();
+        for (x0, x1, before, after, outer) in vertical_edges {
+            for (index, track) in y_tracks.iter().enumerate() {
+                let y0 = if !outer {
+                    track.start as f64
+                } else if index == 0 {
+                    top
+                } else {
+                    y_tracks[index - 1].end as f64
+                };
+                let y1 = if !outer {
+                    if row_outside(index) {
+                        track.end as f64 - y_border
+                    } else {
+                        track.end as f64
+                    }
+                } else if index + 1 == y_tracks.len() {
+                    bottom
+                } else {
+                    track.end as f64
+                };
+                let cross = y_indices[index];
+                let Some(color) = self.resolve_table_border_color(
+                    &self.element.special_data,
+                    &cell_grid,
+                    grid_columns,
+                    x_axis,
+                    before,
+                    after,
+                    y_axis,
+                    cross,
+                    outer,
+                ) else {
+                    continue;
+                };
+                fill(x0, y0, x1, y1, color);
             }
-            if outer_border_style.border_right_style != BorderStyle::Hidden {
-                fill(right - x_border, y0, right, y1);
-            }
-            for (prev, next) in x_tracks.iter().zip(x_tracks.iter().skip(1)) {
-                fill(prev.end as f64, y0, next.start as f64, y1);
-            }
+        }
+        if table_clip.is_some() {
+            scene.pop_layer();
         }
     }
 
@@ -687,11 +1315,31 @@ impl ElementCx<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use super::physical_table_tracks;
+    use super::{
+        BorderCandidate, BorderOrigin, physical_table_tracks, resolve_border_candidates,
+    };
+    use peniko::Color;
+    use style::values::computed::BorderStyle;
     use taffy::Line;
 
     fn line(start: f32, end: f32) -> Line<f32> {
         Line { start, end }
+    }
+
+    fn candidate(
+        width: f64,
+        style: BorderStyle,
+        origin: BorderOrigin,
+        order: u8,
+        color: Color,
+    ) -> BorderCandidate {
+        BorderCandidate {
+            width,
+            style,
+            color,
+            origin,
+            order,
+        }
     }
 
     #[test]
@@ -715,5 +1363,75 @@ mod tests {
         let (x, y) = physical_table_tracks(columns, rows, true, true, 70.0);
         assert_eq!(x, [line(0.0, 50.0), line(50.0, 70.0)]);
         assert_eq!(y, columns);
+    }
+
+    #[test]
+    fn hidden_suppresses_a_wider_visible_border() {
+        let red = Color::from_rgb8(255, 0, 0);
+        let blue = Color::from_rgb8(0, 0, 255);
+        let candidates = [
+            candidate(20.0, BorderStyle::Solid, BorderOrigin::Cell, 0, blue),
+            candidate(1.0, BorderStyle::Hidden, BorderOrigin::Table, 1, red),
+        ];
+        assert_eq!(resolve_border_candidates(&candidates, false), None);
+    }
+
+    #[test]
+    fn width_beats_style_and_origin() {
+        let red = Color::from_rgb8(255, 0, 0);
+        let green = Color::from_rgb8(0, 255, 0);
+        let candidates = [
+            candidate(5.0, BorderStyle::Double, BorderOrigin::Cell, 0, green),
+            candidate(9.0, BorderStyle::Inset, BorderOrigin::Table, 1, red),
+        ];
+        assert_eq!(
+            resolve_border_candidates(&candidates, false),
+            Some(red)
+        );
+    }
+
+    #[test]
+    fn equal_width_prefers_style_then_cell_origin() {
+        let red = Color::from_rgb8(255, 0, 0);
+        let green = Color::from_rgb8(0, 255, 0);
+        let blue = Color::from_rgb8(0, 0, 255);
+
+        let styles = [
+            candidate(5.0, BorderStyle::Dashed, BorderOrigin::Cell, 0, green),
+            candidate(5.0, BorderStyle::Solid, BorderOrigin::Table, 1, red),
+        ];
+        assert_eq!(
+            resolve_border_candidates(&styles, false),
+            Some(red),
+            "solid beats dashed before origin is considered"
+        );
+
+        let origins = [
+            candidate(5.0, BorderStyle::Solid, BorderOrigin::Column, 0, blue),
+            candidate(5.0, BorderStyle::Solid, BorderOrigin::Cell, 1, green),
+        ];
+        assert_eq!(
+            resolve_border_candidates(&origins, false),
+            Some(green),
+            "the cell's border wins when width and style tie"
+        );
+    }
+
+    #[test]
+    fn equal_borders_follow_the_physical_side_preference() {
+        let left = Color::from_rgb8(255, 0, 0);
+        let right = Color::from_rgb8(0, 255, 0);
+        let candidates = [
+            candidate(5.0, BorderStyle::Solid, BorderOrigin::Cell, 0, left),
+            candidate(5.0, BorderStyle::Solid, BorderOrigin::Cell, 1, right),
+        ];
+        assert_eq!(
+            resolve_border_candidates(&candidates, false),
+            Some(left)
+        );
+        assert_eq!(
+            resolve_border_candidates(&candidates, true),
+            Some(right)
+        );
     }
 }

@@ -83,6 +83,20 @@ impl<'a> PhysicalTracks<'a> {
     pub(crate) fn iter(self) -> impl ExactSizeIterator<Item = taffy::Line<f32>> + 'a {
         (0..self.positions.len()).map(move |index| self.get(index))
     }
+
+    /// Iterate tracks in physical order together with their logical index.
+    pub(crate) fn iter_indexed(
+        self,
+    ) -> impl ExactSizeIterator<Item = (usize, taffy::Line<f32>)> + 'a {
+        (0..self.positions.len()).map(move |index| {
+            let logical = if self.reversed {
+                self.positions.len() - 1 - index
+            } else {
+                index
+            };
+            (logical, self.get(index))
+        })
+    }
 }
 
 /// A short-lived struct which holds a bunch of parameters for rendering a scene so
@@ -139,12 +153,12 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         let root_element_id = dom.try_root_element().map(|el| el.id);
         // A development escape hatch for comparing the indexed and full
         // traversals on the same build.
-        let page_paint_membership =
-            if std::env::var_os("CUOTUO_DISABLE_PAGE_MEMBERSHIP").is_some() {
-                None
-            } else {
-                dom.page_paint_membership()
-            };
+        let page_paint_membership = if std::env::var_os("CUOTUO_DISABLE_PAGE_MEMBERSHIP").is_some()
+        {
+            None
+        } else {
+            dom.page_paint_membership()
+        };
         let margin_note_ancestors = {
             let mut ancestors = HashSet::new();
             for (_, node) in dom.tree().iter() {
@@ -517,6 +531,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // as its fragment: its own border box shortened to the band, and its content moved inside
         // the border and padding the break added.
         let piece = clone_fragment(node, node.final_layout(), transform, frag, self.scale);
+        let clone_content_empty = piece.as_ref().is_some_and(|piece| {
+            frag.is_some_and(|frag| frag.page_flow && (frag.outer_start || frag.outer_end))
+                && match piece.frag.axis {
+                    FlowAxis::Y => piece.frag.rect.height() <= 0.5,
+                    FlowAxis::X => piece.frag.rect.width() <= 0.5,
+                }
+        });
         let transform = match &piece {
             Some(piece) => transform.then_translate(piece.moved),
             None => transform,
@@ -524,10 +545,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // A fragment cuts its own content to what stands inside the border and padding the break
         // added, whatever the box's overflow asked for. The root element's overflow belongs to the
         // viewport rather than to itself, and the band already cuts it.
-        if piece.is_some()
-            && !is_root_element
-            && !self.margin_note_ancestors.contains(&node_id)
-        {
+        if piece.is_some() && !is_root_element && !self.margin_note_ancestors.contains(&node_id) {
             should_clip = true;
         }
 
@@ -605,11 +623,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             *node.final_layout(),
             transform,
             clip_rect,
-            frag.filter(|frag| {
-                frag.page_flow && self.margin_note_ancestors.contains(&node.id)
-            })
-            .map(|frag| frag.rect.intersect(clip_rect))
-            .filter(|clip| clip.area() > 0.0),
+            frag.filter(|frag| frag.page_flow && self.margin_note_ancestors.contains(&node.id))
+                .map(|frag| frag.rect.intersect(clip_rect))
+                .filter(|clip| clip.area() > 0.0),
             band_applied,
             frag,
             custom_widget_scene,
@@ -633,7 +649,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // scrolled out of view is culled rather than drawn and clipped away. The box used
         // here matches the clip applied to the content below.
         let child_clip_rect = if should_clip {
-            let clip_box = if is_text_input || piece.is_some() {
+            let clip_box = if clone_content_empty {
+                cx.frame.border_box_path()
+            } else if is_text_input || piece.is_some() {
                 cx.frame.content_box_path()
             } else {
                 cx.frame.padding_box_path()
@@ -721,6 +739,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     backdrop_filter,
                     |scene| {
                         cx.draw_background(scene);
+                        cx.draw_table_caption_backgrounds(scene);
                         cx.draw_inset_box_shadow(scene);
                         cx.draw_table_row_backgrounds(scene);
                         cx.draw_table_borders(scene);
@@ -730,7 +749,9 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         // TODO: allow layers with opacity to be unclipped (overflow: visible)
                         // A fragment is cut to its own content box: the border and padding the break
                         // cloned sit between that box and the band, and content belongs to neither.
-                        let clip = if is_text_input || piece.is_some() {
+                        let clip = if clone_content_empty {
+                            &cx.frame.border_box_path()
+                        } else if is_text_input || piece.is_some() {
                             &cx.frame.content_box_path()
                         } else {
                             &cx.frame.padding_box_path()
@@ -1248,18 +1269,6 @@ fn clone_fragment(
     if !(cut_start || cut_end) {
         return None;
     }
-    // The border and padding the box puts at the near end of its own extent along the flow.
-    let near = match frag.axis {
-        FlowAxis::Y => (layout.border.top + layout.padding.top) as f64 * scale,
-        FlowAxis::X => (layout.border.left + layout.padding.left) as f64 * scale,
-    };
-    // The content that stood at the flow line the cut fell on moves in by the border and padding
-    // the clone adds there — but not past the box's own edge, which already had them.
-    let into = piece.origin() - on_canvas.origin();
-    let shift = match frag.axis {
-        FlowAxis::Y => Vec2::new(0.0, into.y.min(near)),
-        FlowAxis::X => Vec2::new(into.x.min(near), 0.0),
-    };
     let moved = piece.origin() - on_canvas.origin();
     // The fragment's content box on the canvas: the decoration transform slides the fragment's own
     // origin, which is where `piece` already sits.
@@ -1280,7 +1289,7 @@ fn clone_fragment(
     Some(Piece {
         rect: Rect::from_origin_size(Point::ZERO, piece.size()),
         moved,
-        shift,
+        shift: Vec2::ZERO,
         frag: Fragmentainer {
             // Never wider than the band: the fragment's content box may reach past a column the box
             // itself overflows, and its children are cut to the column, not to the box.
@@ -1297,6 +1306,106 @@ fn clone_fragment(
 }
 
 impl ElementCx<'_, '_> {
+    /// The border box of the nearest multi-column ancestor, in screen
+    /// coordinates. A table that overflows the column count is still clipped
+    /// to the multicol box by Chrome rather than painting into the page margin.
+    pub(super) fn multicol_clip_rect(&self) -> Option<Rect> {
+        let mut current = self.node.parent;
+        while let Some(id) = current {
+            let node = self.context.dom.get_node(id)?;
+            if node.is_multicol_box() {
+                let position = node.absolute_position(0.0, 0.0);
+                let layout = node.final_layout();
+                return Some(Rect::new(
+                    position.x as f64 * self.scale,
+                    position.y as f64 * self.scale,
+                    (position.x + layout.size.width) as f64 * self.scale,
+                    (position.y + layout.size.height) as f64 * self.scale,
+                ));
+            }
+            current = node.parent;
+        }
+        None
+    }
+
+    /// A view of a table that paints only its grid, leaving captions to their
+    /// own boxes. Captions are rows in the taffy grid so that they take part in
+    /// fragmentation, but CSS puts them outside the table box.
+    pub(super) fn table_grid_cx(&self) -> Option<Self> {
+        let blitz_dom::node::SpecialElementData::TableRoot(table) = &self.element.special_data
+        else {
+            return None;
+        };
+        if !table.cells.iter().any(|cell| cell.caption) {
+            return None;
+        }
+        let grid = table.computed_grid_info.borrow();
+        let grid = grid.as_ref()?;
+        let writing_mode = self.node.writing_mode();
+        let layout = *self.node.final_layout();
+        let captions: Vec<(bool, Rect)> = table
+            .cells
+            .iter()
+            .filter(|cell| cell.caption)
+            .filter_map(|cell| {
+                let layout = self.context.dom.get_node(cell.node_id)?.final_layout();
+                Some((
+                    cell.caption_top,
+                    Rect::new(
+                        layout.location.x as f64,
+                        layout.location.y as f64,
+                        (layout.location.x + layout.size.width) as f64,
+                        (layout.location.y + layout.size.height) as f64,
+                    ),
+                ))
+            })
+            .collect();
+        let geometry = border::table_grid_geometry(
+            &self.element.special_data,
+            grid,
+            writing_mode.is_vertical(),
+            writing_mode.is_vertical_rl(),
+            layout.size,
+            &captions,
+            layout.border,
+        );
+        let grid_box = geometry.border_box;
+        if grid_box.width() <= 0.0 || grid_box.height() <= 0.0 {
+            return None;
+        }
+
+        let mut grid_layout = layout;
+        grid_layout.size = taffy::Size {
+            width: grid_box.width() as f32,
+            height: grid_box.height() as f32,
+        };
+        let frame = create_css_rect(&self.style, &grid_layout, self.scale);
+        let offset = Vec2 {
+            x: grid_box.x0 * self.scale,
+            y: grid_box.y0 * self.scale,
+        };
+
+        Some(ElementCx {
+            context: self.context,
+            frame,
+            style: self.style.clone(),
+            scale: self.scale,
+            node: self.node,
+            element: self.element,
+            transform: self.transform.then_translate(offset),
+            clip_rect: self.clip_rect,
+            page_content_clip: self.page_content_clip,
+            band_applied: self.band_applied,
+            frag: self.frag,
+            #[cfg(feature = "svg")]
+            svg: self.svg,
+            text_input: self.text_input,
+            list_item: self.list_item,
+            devtools: self.devtools,
+            custom_widget_scene: self.custom_widget_scene,
+        })
+    }
+
     /// Paint overlay scrollbar thumbs for scroll containers: `overflow:
     /// scroll`, or `auto` when the content overflows (never `hidden`/`clip`,
     /// which scroll only programmatically). Thumbs appear on scroll and fade
@@ -1457,20 +1566,48 @@ impl ElementCx<'_, '_> {
                     panic!("Tried to render node marked as inline root that does not have an inline layout: {:?}", self.node);
                 });
 
-            let pos = Point {
+            let mut pos = Point {
                 x: pos.x,
                 y: pos.y + text_layout.block_offset as f64,
             };
+            // A table caption whose width is rounded up by less than a pixel
+            // leaves a centered single line with a subpixel offset. The
+            // caption's grid box and the text advance are equal geometrically,
+            // so snap that rounding noise back to the caption's content edge.
+            let in_table_caption = {
+                let mut current = self.node.parent;
+                let mut found = false;
+                while let Some(id) = current {
+                    let Some(node) = self.context.dom.get_node(id) else {
+                        break;
+                    };
+                    if node.primary_styles().is_some_and(|styles| {
+                        styles.clone_display().outside() == DisplayOutside::TableCaption
+                    }) {
+                        found = true;
+                        break;
+                    }
+                    current = node.parent;
+                }
+                found
+            };
+            if in_table_caption {
+                let scale = text_layout.layout.scale() as f64;
+                if let Some(line) = text_layout.layout.lines().next() {
+                    let offset = line.metrics().offset as f64 / scale;
+                    if offset > 0.0 && offset < 0.5 {
+                        pos.x -= offset;
+                    }
+                }
+            }
             let transform =
                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
             let content_clip = self.page_content_clip;
             if let Some(clip) = content_clip {
                 scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
             }
-            let cull_rect = self.local_cull_rect_for(
-                transform,
-                content_clip.unwrap_or(self.clip_rect),
-            );
+            let cull_rect =
+                self.local_cull_rect_for(transform, content_clip.unwrap_or(self.clip_rect));
 
             // Render inline element backgrounds (e.g. `<span style="background: ...">`)
             // behind the text and selection highlight.
@@ -1822,14 +1959,7 @@ impl ElementCx<'_, '_> {
             if std::env::var_os("CUOTUO_DEBUG_PAINT").is_some() {
                 eprintln!(
                     "paint band {index}: flow {:.1}..{:.1} clip x {:.1}..{:.1} y {:.1}..{:.1} shift ({:.1},{:.1})",
-                    band.start,
-                    band.end,
-                    clip.x0,
-                    clip.x1,
-                    clip.y0,
-                    clip.y1,
-                    shift.x,
-                    shift.y,
+                    band.start, band.end, clip.x0, clip.x1, clip.y0, clip.y1, shift.x, shift.y,
                 );
             }
             if clip.area() <= 0.0 {
@@ -1855,7 +1985,13 @@ impl ElementCx<'_, '_> {
                 outer_start: index == 0,
                 outer_end: index == last,
             };
-            self.draw_children(scene, self.transform, clip_rect, Some(frag), OofChildren::Skip);
+            self.draw_children(
+                scene,
+                self.transform,
+                clip_rect,
+                Some(frag),
+                OofChildren::Skip,
+            );
         }
         // The boxes positioned against this container as a whole, once, where they were placed —
         // after the bands, so that they cover the columns they are painted over as they do in
@@ -1874,7 +2010,13 @@ impl ElementCx<'_, '_> {
         // A box of a fragmented flow cuts its own children by the band that cuts it, so that a
         // decoration they draw outside their boxes is not shaved by an ancestor's clip. Its
         // out-of-flow children move with it: their containing block is a fragment of this flow.
-        self.draw_children(scene, self.transform, clip_rect, self.frag, OofChildren::All);
+        self.draw_children(
+            scene,
+            self.transform,
+            clip_rect,
+            self.frag,
+            OofChildren::All,
+        );
     }
 
     /// What a box draws itself: its text, its replaced parts, its marker. Its children are not
@@ -1946,7 +2088,7 @@ impl ElementCx<'_, '_> {
             self.render_node(scene, child_id, transform, clip_rect, Some(frag));
             return;
         }
-        let clip = if self.margin_note_ancestors.contains(&child_id) {
+        let mut clip = if self.margin_note_ancestors.contains(&child_id) {
             clip_rect
         } else {
             frag.clip_for(
@@ -1957,6 +2099,16 @@ impl ElementCx<'_, '_> {
             )
             .intersect(clip_rect)
         };
+        // At an end fragment the clone padding can consume the whole content
+        // box. Keep descendants inside the fragment's border box instead of
+        // dropping them on the zero-area content edge.
+        if clip.area() <= 0.0
+            && frag.page_flow
+            && (frag.outer_start || frag.outer_end)
+            && clip_rect.area() > 0.0
+        {
+            clip = clip_rect;
+        }
         #[cfg(debug_assertions)]
         if std::env::var_os("CUOTUO_DEBUG_PAINT").is_some() {
             eprintln!(
@@ -1991,6 +2143,22 @@ impl ElementCx<'_, '_> {
         band: Option<Fragmentainer>,
         oof: OofChildren,
     ) {
+        let repeated_table_cells: HashSet<NodeId> =
+            if let blitz_dom::node::SpecialElementData::TableRoot(table) =
+                &self.element.special_data
+            {
+                table
+                    .cells
+                    .iter()
+                    .filter(|cell| {
+                        table.repeat_header_rows.contains(&cell.row)
+                            || table.repeat_footer_rows.contains(&cell.row)
+                    })
+                    .map(|cell| cell.node_id)
+                    .collect()
+            } else {
+                HashSet::new()
+            };
         let takes_part = |child: &Node| match oof {
             OofChildren::All => true,
             OofChildren::Skip => !child.is_out_of_flow(),
@@ -2028,6 +2196,9 @@ impl ElementCx<'_, '_> {
         // Regular children
         if let Some(children) = &*self.node.paint_children.borrow() {
             for child_id in children {
+                if repeated_table_cells.contains(child_id) {
+                    continue;
+                }
                 // Fixed-position children of the root element are positioned against
                 // the viewport and do not scroll with it, so cancel out the viewport
                 // scroll (applied in `paint_scene`). A fixed box contained by a

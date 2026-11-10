@@ -2,11 +2,13 @@ use super::{ElementCx, to_image_quality, to_peniko_image};
 use crate::color::{Color, ToColorColor};
 use crate::gradient::to_peniko_gradient;
 use anyrender::PaintScene;
-use blitz_dom::NodeId;
 use blitz_dom::node::{ImageData, ImageResourceData, SpecialElementData};
+use blitz_dom::{Node, NodeId};
 use kurbo::{self, Affine, BezPath, Point, Rect, Shape, Size, Vec2};
 use peniko::{self, Fill};
+use std::collections::{HashMap, HashSet};
 use style::{
+    color::AbsoluteColor,
     computed_values::border_collapse::T as BorderCollapse,
     properties::{
         generated::longhands::{
@@ -29,6 +31,42 @@ use style::{
 
 #[cfg(feature = "tracing")]
 use tracing::warn;
+
+/// The block-axis extent of a caption's side of the table, in the table's
+/// coordinates. `vertical_rl` decides which physical side is block-start.
+fn caption_block_range(
+    layout: &taffy::Layout,
+    table: &taffy::Layout,
+    vertical: bool,
+    vertical_lr: bool,
+) -> (f64, f64) {
+    if vertical {
+        let centre = layout.location.x as f64 + layout.size.width as f64 * 0.5;
+        let at_start = if vertical_lr {
+            centre < table.size.width as f64 * 0.5
+        } else {
+            centre >= table.size.width as f64 * 0.5
+        };
+        if at_start {
+            if vertical_lr {
+                (0.0, (layout.location.x + layout.size.width) as f64)
+            } else {
+                (layout.location.x as f64, table.size.width as f64)
+            }
+        } else if vertical_lr {
+            (layout.location.x as f64, table.size.width as f64)
+        } else {
+            (0.0, (layout.location.x + layout.size.width) as f64)
+        }
+    } else {
+        let at_start = (layout.location.y as f64) < table.size.height as f64 * 0.5;
+        if at_start {
+            (0.0, (layout.location.y + layout.size.height) as f64)
+        } else {
+            (layout.location.y as f64, table.size.height as f64)
+        }
+    }
+}
 
 /// A box from the CSS box model. Abstracts over the (structurally identical)
 /// computed value types of the `background-clip`/`background-origin` and
@@ -134,6 +172,31 @@ impl<'a> ImageLayerStyles<'a> {
 
 impl ElementCx<'_, '_> {
     pub(super) fn draw_background(&self, scene: &mut impl PaintScene) {
+        // Table captions are painted once by the table, in grid order. Their
+        // own box can be taller than the table fragment and would otherwise
+        // paint a later caption over the current fragment's rows.
+        if self
+            .node
+            .parent
+            .and_then(|parent| self.context.dom.get_node(parent))
+            .and_then(|parent| parent.element_data())
+            .is_some_and(|parent| {
+                matches!(
+                    parent.special_data,
+                    SpecialElementData::TableRoot(ref table)
+                        if table.cells.iter().any(|cell| cell.caption && cell.node_id == self.node.id)
+                )
+            })
+        {
+            return;
+        }
+        if let Some(grid) = self.table_grid_cx() {
+            return grid.draw_background_box(scene);
+        }
+        self.draw_background_box(scene);
+    }
+
+    fn draw_background_box(&self, scene: &mut impl PaintScene) {
         let bg_styles = &self.style.get_background();
         let image_data = &self.element.background_images;
         let layer_count = bg_styles.background_image.0.len();
@@ -226,12 +289,23 @@ impl ElementCx<'_, '_> {
     ///
     /// These backgrounds are only painted behind the table's cells (not in the
     /// `border-spacing` between them, nor where a row has no cell), so they are
-    /// painted cell by cell.
+    /// painted cell by cell. A cell clips the background of each track it
+    /// belongs to, while the track's own box positions the gradient so its
+    /// phase stays continuous across the cells.
     pub(super) fn draw_table_row_backgrounds(&self, scene: &mut impl PaintScene) {
         let SpecialElementData::TableRoot(table) = &self.element.special_data else {
             return;
         };
 
+        let cell_rect = |cell_id: NodeId| -> Option<Rect> {
+            let layout = self.context.dom.get_node(cell_id)?.final_layout();
+            Some(Rect::new(
+                layout.location.x as f64,
+                layout.location.y as f64,
+                (layout.location.x + layout.size.width) as f64,
+                (layout.location.y + layout.size.height) as f64,
+            ))
+        };
         let background_color = |node_id: NodeId| -> Option<Color> {
             let node = self.context.dom.get_node(node_id)?;
             let style = node.primary_styles()?;
@@ -244,42 +318,62 @@ impl ElementCx<'_, '_> {
             (color != Color::TRANSPARENT).then_some(color)
         };
 
-        // Resolve the (group, track) background colors once per track rather than once per cell
-        let column_colors: Vec<[Option<Color>; 2]> = table
-            .columns
-            .iter()
-            .map(|col| {
-                [
-                    col.group.and_then(background_color),
-                    background_color(col.node_id),
-                ]
-            })
-            .collect();
-        let row_colors: Vec<[Option<Color>; 2]> = table
-            .rows
-            .iter()
-            .map(|row| {
-                [
-                    row.group.and_then(background_color),
-                    background_color(row.node_id),
-                ]
-            })
-            .collect();
-        let has_color =
-            |colors: &[[Option<Color>; 2]]| colors.iter().flatten().any(Option::is_some);
-        if !has_color(&column_colors) && !has_color(&row_colors) {
-            return;
-        }
-
-        let cell_rect = |cell_id: NodeId| -> Option<Rect> {
-            let layout = self.context.dom.get_node(cell_id)?.final_layout();
-            Some(Rect::new(
-                layout.location.x as f64,
-                layout.location.y as f64,
-                (layout.location.x + layout.size.width) as f64,
-                (layout.location.y + layout.size.height) as f64,
-            ))
+        let has_background = |node_id: NodeId| -> bool {
+            let Some(node) = self.context.dom.get_node(node_id) else {
+                return false;
+            };
+            let Some(style) = node.primary_styles() else {
+                return false;
+            };
+            let background = style.get_background();
+            background_color(node_id).is_some()
+                || background
+                    .background_image
+                    .0
+                    .iter()
+                    .any(|image| matches!(image, GenericImage::Gradient(_)))
         };
+
+        let mut column_rects: HashMap<u16, Rect> = HashMap::new();
+        let mut row_rects: HashMap<u16, Rect> = HashMap::new();
+        let mut column_group_rects: HashMap<NodeId, Rect> = HashMap::new();
+        let mut row_group_rects: HashMap<NodeId, Rect> = HashMap::new();
+        let repeat_rows = |row: u16| {
+            table.repeat_header_rows.contains(&row) || table.repeat_footer_rows.contains(&row)
+        };
+        for cell in table
+            .cells
+            .iter()
+            .filter(|cell| !cell.caption && !repeat_rows(cell.row))
+        {
+            let Some(rect) = cell_rect(cell.node_id) else {
+                continue;
+            };
+            column_rects
+                .entry(cell.column)
+                .and_modify(|known| *known = known.union(rect))
+                .or_insert(rect);
+            row_rects
+                .entry(cell.row)
+                .and_modify(|known| *known = known.union(rect))
+                .or_insert(rect);
+            if let Some(group) = table
+                .columns
+                .get(cell.column as usize)
+                .and_then(|column| column.group)
+            {
+                column_group_rects
+                    .entry(group)
+                    .and_modify(|known| *known = known.union(rect))
+                    .or_insert(rect);
+            }
+            if let Some(group) = table.rows.get(cell.row as usize).and_then(|row| row.group) {
+                row_group_rects
+                    .entry(group)
+                    .and_modify(|known| *known = known.union(rect))
+                    .or_insert(rect);
+            }
+        }
 
         // In the collapsed borders model the borders are laid out as gutters between the
         // cells, but a cell's border box (and so its background) extends to the middle of
@@ -301,13 +395,7 @@ impl ElementCx<'_, '_> {
         let after = gutter - before;
 
         for cell in &table.cells {
-            let no_colors = [None, None];
-            let column = column_colors
-                .get(cell.column as usize)
-                .unwrap_or(&no_colors);
-            let row = row_colors.get(cell.row as usize).unwrap_or(&no_colors);
-            let mut colors = column.iter().chain(row).flatten().peekable();
-            if colors.peek().is_none() {
+            if cell.caption || repeat_rows(cell.row) {
                 continue;
             }
             let Some(mut rect) = cell_rect(cell.node_id) else {
@@ -323,10 +411,386 @@ impl ElementCx<'_, '_> {
                 .intersect(bounds);
             }
 
-            let shape = rect.scale_from_origin(self.scale);
-            for color in colors {
-                scene.fill(Fill::NonZero, self.transform, *color, None, &shape);
+            let clip = rect.scale_from_origin(self.scale);
+            let column = table.columns.get(cell.column as usize);
+            let row = table.rows.get(cell.row as usize);
+            let column_rect = column_rects
+                .get(&cell.column)
+                .copied()
+                .unwrap_or(rect)
+                .scale_from_origin(self.scale);
+            let row_rect = row_rects
+                .get(&cell.row)
+                .copied()
+                .unwrap_or(rect)
+                .scale_from_origin(self.scale);
+            let column_group_rect = column
+                .and_then(|column| column.group)
+                .and_then(|group| column_group_rects.get(&group))
+                .copied()
+                .unwrap_or(rect)
+                .scale_from_origin(self.scale);
+            let row_group_rect = row
+                .and_then(|row| row.group)
+                .and_then(|group| row_group_rects.get(&group))
+                .copied()
+                .unwrap_or(rect)
+                .scale_from_origin(self.scale);
+            let tracks = [
+                (column.and_then(|column| column.group), column_group_rect),
+                (column.map(|column| column.node_id), column_rect),
+                (row.and_then(|row| row.group), row_group_rect),
+                (row.map(|row| row.node_id), row_rect),
+            ];
+            for (node_id, origin_rect) in tracks {
+                let Some(node_id) = node_id else {
+                    continue;
+                };
+                if !has_background(node_id) {
+                    continue;
+                }
+                self.draw_table_track_background(scene, node_id, origin_rect, clip);
             }
+        }
+
+        // A table row whose children were wrapped in anonymous cells still
+        // paints its background over the row track. The table's own grid
+        // positions are the only place that height is available once empty
+        // rows have been stretched by a specified table block size.
+        let grid = table.computed_grid_info.borrow();
+        let Some(grid) = grid.as_ref() else {
+            return;
+        };
+        let caption_rows: HashSet<u16> = table
+            .cells
+            .iter()
+            .filter(|cell| cell.caption)
+            .map(|cell| cell.row)
+            .collect();
+        let table_layout = *self.node.final_layout();
+        let writing_mode = self.node.writing_mode();
+        let vertical = writing_mode.is_vertical();
+        let table_bounds = Rect::new(
+            0.0,
+            0.0,
+            table_layout.size.width as f64,
+            table_layout.size.height as f64,
+        )
+        .scale_from_origin(self.scale);
+        for (index, row) in table.rows.iter().enumerate() {
+            let caption = caption_rows.contains(&(index as u16));
+            if row.synthetic
+                || row_rects.contains_key(&(index as u16))
+                || repeat_rows(index as u16)
+            {
+                continue;
+            }
+            let Some(track) = grid.rows.positions.get(index) else {
+                continue;
+            };
+            let block_range = caption.then(|| {
+                self.context
+                    .dom
+                    .get_node(row.node_id)
+                    .map(|node| {
+                        caption_block_range(
+                            node.final_layout(),
+                            &table_layout,
+                            vertical,
+                            writing_mode.is_vertical_lr(),
+                        )
+                    })
+            });
+            let rect = if vertical {
+                let (x0, x1) =
+                    block_range
+                        .flatten()
+                        .unwrap_or((0.0, table_layout.size.width as f64));
+                Rect::new(x0, track.start as f64, x1, track.end as f64)
+            } else {
+                let (y0, y1) = block_range
+                    .flatten()
+                    .unwrap_or((track.start as f64, track.end as f64));
+                Rect::new(0.0, y0, table_layout.size.width as f64, y1)
+            }
+            .scale_from_origin(self.scale);
+            for node_id in [row.group, Some(row.node_id)].into_iter().flatten() {
+                if has_background(node_id) {
+                    // A caption is the row's own element, but its 120px block size is the
+                    // caption box, not a grid track that may spill outside the table.
+                    let clip = if caption {
+                        rect.intersect(table_bounds)
+                    } else {
+                        rect
+                    };
+                    self.draw_table_track_background(scene, node_id, rect, clip);
+                }
+            }
+        }
+
+        let header_cells: Vec<NodeId> = table
+            .cells
+            .iter()
+            .filter(|cell| table.repeat_header_rows.contains(&cell.row))
+            .map(|cell| cell.node_id)
+            .collect();
+        let footer_cells: Vec<NodeId> = table
+            .cells
+            .iter()
+            .filter(|cell| table.repeat_footer_rows.contains(&cell.row))
+            .map(|cell| cell.node_id)
+            .collect();
+        let body_height = table
+            .cells
+            .iter()
+            .filter(|cell| !cell.caption && !repeat_rows(cell.row))
+            .filter_map(|cell| cell_rect(cell.node_id))
+            .reduce(|a, b| a.union(b))
+            .map_or(0.0, |rect| rect.height());
+        self.draw_repeated_table_sections(scene, &header_cells, &footer_cells, body_height);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_repeated_table_sections(
+        &self,
+        scene: &mut impl PaintScene,
+        header_cells: &[NodeId],
+        footer_cells: &[NodeId],
+        body_height: f64,
+    ) {
+        if header_cells.is_empty() && footer_cells.is_empty() {
+            return;
+        }
+        let local_rect = |cell_id: NodeId| -> Option<Rect> {
+            let layout = self.context.dom.get_node(cell_id)?.final_layout();
+            Some(Rect::new(
+                layout.location.x as f64,
+                layout.location.y as f64,
+                (layout.location.x + layout.size.width) as f64,
+                (layout.location.y + layout.size.height) as f64,
+            ))
+        };
+        let group_rect = |cells: &[NodeId]| -> Option<Rect> {
+            cells
+                .iter()
+                .filter_map(|cell| local_rect(*cell))
+                .reduce(|a, b| a.union(b))
+        };
+        let table = self.node.final_layout();
+        let header_rect = group_rect(header_cells)
+            .unwrap_or_else(|| Rect::new(0.0, 0.0, table.size.width as f64, 0.0));
+        let header_height = header_rect.height();
+        let footer_height = group_rect(footer_cells).map_or(0.0, |rect| rect.height());
+
+        let clip_top = self.clip_rect.y0 / self.scale;
+        let clip_bottom = self.clip_rect.y1 / self.scale;
+        let natural_header_top = self
+            .transform
+            .transform_rect_bbox(header_rect.scale_from_origin(self.scale))
+            .y0
+            / self.scale;
+        let (ordinal, fragment_depth) = self.repeat_fragment_ordinal();
+        let start = if ordinal == 0 {
+            natural_header_top.max(clip_top)
+        } else {
+            clip_top
+        };
+        let available = (clip_bottom - start - header_height - footer_height).max(0.0);
+        let base_capacity = (fragment_depth - header_height - footer_height).max(0.0);
+        let body_start = ordinal as f64 * base_capacity;
+        let capacity = if ordinal == 0 {
+            available
+        } else {
+            base_capacity
+        };
+        let body_slice = (body_height - body_start).clamp(0.0, capacity);
+        if body_start >= body_height && body_height > 0.0 {
+            return;
+        }
+
+        let natural_header_top = natural_header_top * self.scale;
+        let target_top = start * self.scale;
+        let header_transform =
+            self.transform * Affine::translate(Vec2::new(0.0, target_top - natural_header_top));
+        scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &self.clip_rect);
+        for cell in header_cells {
+            self.context
+                .render_node(scene, *cell, header_transform, self.clip_rect, self.frag);
+        }
+
+        if !footer_cells.is_empty() && body_slice > 0.0 {
+            let natural_footer_top = self
+                .transform
+                .transform_rect_bbox(
+                    group_rect(footer_cells)
+                        .unwrap_or(header_rect)
+                        .scale_from_origin(self.scale),
+                )
+                .y0;
+            let footer_top = (start + header_height + body_slice) * self.scale - natural_footer_top;
+            let footer_transform = self.transform * Affine::translate(Vec2::new(0.0, footer_top));
+            for cell in footer_cells {
+                self.context
+                    .render_node(scene, *cell, footer_transform, self.clip_rect, self.frag);
+            }
+        }
+        scene.pop_layer();
+    }
+
+    fn repeat_fragment_ordinal(&self) -> (usize, f64) {
+        let mut current = self.node.parent;
+        let mut plans = Vec::new();
+        while let Some(id) = current {
+            let Some(node) = self.context.dom.get_node(id) else {
+                break;
+            };
+            if node.is_multicol_box()
+                && let Some(plan) = node.break_plan.as_deref()
+            {
+                plans.push((id, plan));
+            }
+            current = node.parent;
+        }
+        let Some((outer_id, outer)) = plans.last().copied() else {
+            return (
+                self.frag.map_or(0, |frag| frag.index),
+                self.clip_rect.height() / self.scale,
+            );
+        };
+        if outer.stride <= 0.0 {
+            return (
+                self.frag.map_or(0, |frag| frag.index),
+                self.clip_rect.height() / self.scale,
+            );
+        }
+        let mut x = 0.0;
+        let mut current = Some(outer_id);
+        while let Some(id) = current {
+            let Some(node) = self.context.dom.get_node(id) else {
+                break;
+            };
+            x += node.final_layout().location.x as f64;
+            current = node.parent;
+        }
+        let clip_x = self.clip_rect.x0 / self.scale;
+        let stride = self.clip_rect.width() / self.scale;
+        if stride <= 0.0 {
+            return (
+                self.frag.map_or(0, |frag| frag.index),
+                self.clip_rect.height() / self.scale,
+            );
+        }
+        let ordinal = ((clip_x - x) / stride).floor().max(0.0) as usize;
+        let depth = outer
+            .bands
+            .iter()
+            .map(|band| band.depth as f64)
+            .fold(self.clip_rect.height() / self.scale, f64::max);
+        (ordinal, depth)
+    }
+
+    fn draw_table_track_background(
+        &self,
+        scene: &mut impl PaintScene,
+        node_id: NodeId,
+        origin_rect: Rect,
+        clip_rect: Rect,
+    ) {
+        let Some(node) = self.context.dom.get_node(node_id) else {
+            return;
+        };
+        let Some(style) = node.primary_styles() else {
+            return;
+        };
+        let Some(element) = node.element_data() else {
+            return;
+        };
+        let background = style.get_background();
+        let current_color = style.clone_color();
+        let color = background
+            .background_color
+            .resolve_to_absolute(&current_color)
+            .as_srgb_color();
+        if color != Color::TRANSPARENT {
+            scene.fill(Fill::NonZero, self.transform, color, None, &clip_rect);
+        }
+
+        let layer_count = background.background_image.0.len();
+        for index in (0..layer_count).rev() {
+            let layer =
+                ImageLayerStyles::from_background(background, &element.background_images, index);
+            let GenericImage::Gradient(gradient) = layer.stylo_image else {
+                continue;
+            };
+            let clip = self.transform.transform_rect_bbox(clip_rect);
+            scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+            self.draw_gradient_in(
+                scene,
+                gradient,
+                &layer,
+                origin_rect,
+                self.transform,
+                clip_rect,
+                origin_rect,
+                &current_color,
+            );
+            scene.pop_layer();
+        }
+    }
+
+    pub(super) fn draw_table_caption_backgrounds(&self, scene: &mut impl PaintScene) {
+        let SpecialElementData::TableRoot(table) = &self.element.special_data else {
+            return;
+        };
+        let captions: Vec<_> = table.cells.iter().filter(|cell| cell.caption).collect();
+        if captions.is_empty() {
+            return;
+        }
+        let background = |node: &Node| -> Option<Color> {
+            let style = node.primary_styles()?;
+            let current = style.clone_color();
+            let color = style
+                .get_background()
+                .background_color
+                .resolve_to_absolute(&current)
+                .as_srgb_color();
+            (color != Color::TRANSPARENT).then_some(color)
+        };
+        let mut fallback = None;
+        let mut current = self.node.parent;
+        while let Some(id) = current {
+            let Some(node) = self.context.dom.get_node(id) else {
+                break;
+            };
+            if let Some(color) = background(node) {
+                fallback = Some(color);
+                break;
+            }
+            current = node.parent;
+        }
+        let fallback = fallback.unwrap_or(Color::WHITE);
+        let table = *self.node.final_layout();
+        let writing_mode = self.node.writing_mode();
+        for caption in captions {
+            let Some(node) = self.context.dom.get_node(caption.node_id) else {
+                continue;
+            };
+            let color = background(node).unwrap_or(fallback);
+            let layout = node.final_layout();
+            let rect = if writing_mode.is_vertical() {
+                let (x0, x1) = caption_block_range(
+                    layout,
+                    &table,
+                    true,
+                    writing_mode.is_vertical_lr(),
+                );
+                Rect::new(x0, 0.0, x1, table.size.height as f64)
+            } else {
+                let (y0, y1) = caption_block_range(layout, &table, false, false);
+                Rect::new(0.0, y0, table.size.width as f64, y1)
+            }
+            .scale_from_origin(self.scale);
+            scene.fill(Fill::NonZero, self.transform, color, None, &rect);
         }
     }
 
@@ -555,6 +1019,32 @@ impl ElementCx<'_, '_> {
             )
         };
 
+        let bounding_box = self.frame.border_box.bounding_box();
+        let current_color = self.style.clone_color();
+        self.draw_gradient_in(
+            scene,
+            gradient,
+            layer,
+            origin_rect,
+            base_transform,
+            clip_rect,
+            bounding_box,
+            &current_color,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_gradient_in(
+        &self,
+        scene: &mut impl PaintScene,
+        gradient: &StyloGradient,
+        layer: &ImageLayerStyles,
+        origin_rect: Rect,
+        base_transform: Affine,
+        clip_rect: Rect,
+        bounding_box: Rect,
+        current_color: &AbsoluteColor,
+    ) {
         let (bg_pos, bg_size) = compute_layer_position_and_size(
             layer,
             origin_rect.width() / self.scale,
@@ -592,16 +1082,9 @@ impl ElementCx<'_, '_> {
         }
 
         let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
-        let bounding_box = self.frame.border_box.bounding_box();
-        let current_color = self.style.clone_color();
 
-        let (gradient, gradient_transform) = to_peniko_gradient(
-            gradient,
-            tile_rect,
-            bounding_box,
-            self.scale,
-            &current_color,
-        );
+        let (gradient, gradient_transform) =
+            to_peniko_gradient(gradient, tile_rect, bounding_box, self.scale, current_color);
         let brush = anyrender::Paint::Gradient(&gradient);
 
         let transform = base_transform.then_translate(Vec2 {

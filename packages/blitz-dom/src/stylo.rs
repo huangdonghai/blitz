@@ -426,7 +426,11 @@ mod language_tests {
             ("", "*", false),
             ("", "", true),
         ] {
-            assert_eq!(language_matches(tag, range), expected, "{tag}:lang({range})");
+            assert_eq!(
+                language_matches(tag, range),
+                expected,
+                "{tag}:lang({range})"
+            );
         }
     }
 }
@@ -912,16 +916,18 @@ impl<'a> TElement for BlitzNode<'a> {
 
     fn lang_attr(&self) -> Option<style::selector_parser::AttrValue> {
         let element = self.element_data()?;
-        let xml_lang = element.attrs().iter().find(|attr| {
-            attr.name.local == local_name!("lang") && attr.name.ns == ns!(xml)
-        });
+        let xml_lang = element
+            .attrs()
+            .iter()
+            .find(|attr| attr.name.local == local_name!("lang") && attr.name.ns == ns!(xml));
         let lang = xml_lang.or_else(|| {
             if element.name.ns != ns!(html) && element.name.ns != ns!(svg) {
                 return None;
             }
-            element.attrs().iter().find(|attr| {
-                attr.name.local == local_name!("lang") && attr.name.ns == ns!()
-            })
+            element
+                .attrs()
+                .iter()
+                .find(|attr| attr.name.local == local_name!("lang") && attr.name.ns == ns!())
         })?;
         Some(style::values::AtomString(Atom::from(lang.value.as_str())))
     }
@@ -1080,6 +1086,40 @@ impl<'a> TElement for BlitzNode<'a> {
                 attr.name.local == local_name!("type") && attr.value.eq_ignore_ascii_case("image")
             });
 
+        let cellpadding = if *tag == local_name!("td") || *tag == local_name!("th") {
+            let mut table = self.parent.map(|id| self.with(id));
+            let mut padding = None;
+            while let Some(node) = table {
+                if node.data.is_element_with_tag_name(&local_name!("table")) {
+                    padding = node.element_data().and_then(|element| {
+                        element
+                            .attrs()
+                            .iter()
+                            .find(|attr| &*attr.name.local == "cellpadding")
+                            .and_then(|attr| {
+                                style::servo::attr::parse_unsigned_integer(
+                                    attr.value.chars(),
+                                )
+                                .ok()
+                            })
+                    });
+                    break;
+                }
+                table = node.parent.map(|id| node.with(id));
+            }
+            padding
+        } else {
+            None
+        };
+        if let Some(px) = cellpadding {
+            use style::values::specified::{NoCalcLength, NonNegativeLengthPercentage};
+            let padding = NonNegativeLengthPercentage::from(NoCalcLength::from_px(px as f32));
+            push_style(PropertyDeclaration::PaddingTop(padding.clone()));
+            push_style(PropertyDeclaration::PaddingRight(padding.clone()));
+            push_style(PropertyDeclaration::PaddingBottom(padding.clone()));
+            push_style(PropertyDeclaration::PaddingLeft(padding));
+        }
+
         // https://html.spec.whatwg.org/multipage/#the-lang-and-xml:lang-attributes
         let accepts_lang = elem.name.ns == ns!(html) || elem.name.ns == ns!(svg);
         let mut lang = None;
@@ -1161,6 +1201,20 @@ impl<'a> TElement for BlitzNode<'a> {
                     } else {
                         PropertyDeclaration::Height(size)
                     });
+                }
+            }
+
+            // `cellspacing` on a table is a presentational hint for
+            // `border-spacing`. A single value applies to both axes.
+            // https://html.spec.whatwg.org/multipage/rendering.html#tables-2
+            if *tag == local_name!("table") && &**name == "cellspacing" {
+                if let Ok(px) = style::servo::attr::parse_unsigned_integer(value.chars()) {
+                    use style::values::specified::{BorderSpacing, NonNegativeLength};
+                    let spacing = BorderSpacing::new(
+                        NonNegativeLength::from_px(px as f32),
+                        NonNegativeLength::from_px(px as f32),
+                    );
+                    push_style(PropertyDeclaration::BorderSpacing(spacing));
                 }
             }
 
