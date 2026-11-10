@@ -6,7 +6,7 @@ mod form_controls;
 mod mask;
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use super::kurbo_css::CssBox;
@@ -113,6 +113,10 @@ pub struct BlitzDomPainter<'dom, 'a> {
     pub(crate) initial_y: f64,
     /// The id of the document's root element (cached to avoid re-resolving it for every element)
     pub(crate) root_element_id: Option<NodeId>,
+    /// Boxes on the path from the root to a paged margin note. Their content
+    /// boxes clip the flow at fragment boundaries, but a margin note lives
+    /// outside that flow in the page margin.
+    margin_note_ancestors: HashSet<NodeId>,
     /// Scrollbar hover/drag state, resolved once per scene like the root element
     #[cfg(feature = "scrollbars")]
     pub(crate) hovered_scrollbar: Option<blitz_dom::node::ScrollbarRef>,
@@ -147,7 +151,31 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
 
         let layer_manager = LayerManager::default();
         let root_element_id = dom.try_root_element().map(|el| el.id);
-
+        let margin_note_ancestors = {
+            let mut ancestors = HashSet::new();
+            for (_, node) in dom.tree().iter() {
+                let has_fragments = node
+                    .element_data()
+                    .and_then(|element| element.inline_layout_data.as_ref())
+                    .is_some_and(|layout| {
+                        layout
+                            .margin_note_groups
+                            .iter()
+                            .any(|group| !group.page_fragments.is_empty())
+                    });
+                if !has_fragments {
+                    continue;
+                }
+                let mut current = Some(node.id);
+                while let Some(id) = current {
+                    if !ancestors.insert(id) {
+                        break;
+                    }
+                    current = dom.get_node(id).and_then(|node| node.parent);
+                }
+            }
+            ancestors
+        };
         Self {
             dom,
             scale,
@@ -156,6 +184,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             initial_x,
             initial_y,
             root_element_id,
+            margin_note_ancestors,
             #[cfg(feature = "scrollbars")]
             hovered_scrollbar: dom.hovered_scrollbar(),
             #[cfg(feature = "scrollbars")]
@@ -260,7 +289,25 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         page.right as f64 * self.scale + self.initial_x,
                         page.bottom as f64 * self.scale + self.initial_y,
                     );
-                    let clip = band_rect.intersect(viewport_clip_rect);
+                    // A page's margin belongs to the page, not to the flow's content
+                    // area: margin notes are laid out there. Clip to the paper while
+                    // still cutting boxes to the content fragment below.
+                    let paper_rect = if let Some(size) = self.dom.page_box_size() {
+                        let (left, top) = match plan.axis {
+                            FlowAxis::X => (index as f32 * size.width, 0.0),
+                            FlowAxis::Y => (0.0, index as f32 * size.height),
+                        };
+                        let (right, bottom) = (left + size.width, top + size.height);
+                        Rect::new(
+                            left as f64 * self.scale + self.initial_x,
+                            top as f64 * self.scale + self.initial_y,
+                            right as f64 * self.scale + self.initial_x,
+                            bottom as f64 * self.scale + self.initial_y,
+                        )
+                    } else {
+                        band_rect
+                    };
+                    let clip = paper_rect.intersect(viewport_clip_rect);
                     if clip.area() <= 0.0 {
                         continue;
                     }
@@ -280,6 +327,8 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                         Some(Fragmentainer {
                             rect: band_rect,
                             axis: plan.axis,
+                            index,
+                            page_flow: true,
                             outer_start: index == 0,
                             outer_end: index == last,
                         }),
@@ -471,7 +520,10 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         // A fragment cuts its own content to what stands inside the border and padding the break
         // added, whatever the box's overflow asked for. The root element's overflow belongs to the
         // viewport rather than to itself, and the band already cuts it.
-        if piece.is_some() && !is_root_element {
+        if piece.is_some()
+            && !is_root_element
+            && !self.margin_note_ancestors.contains(&node_id)
+        {
             should_clip = true;
         }
 
@@ -1003,10 +1055,28 @@ fn box_whole_in_band(
     frag: Fragmentainer,
     scale: f64,
 ) -> (bool, bool) {
+    let Some(on_canvas) = box_on_canvas(node, transform, scale) else {
+        return (false, false);
+    };
+    match frag.axis {
+        FlowAxis::Y => (
+            on_canvas.y0 >= frag.rect.y0 - 0.5,
+            on_canvas.y1 <= frag.rect.y1 + 0.5,
+        ),
+        FlowAxis::X => (
+            on_canvas.x0 >= frag.rect.x0 - 0.5,
+            on_canvas.x1 <= frag.rect.x1 + 0.5,
+        ),
+    }
+}
+
+/// A child's border box in canvas coordinates, or `None` for a transform that
+/// cannot be compared axis-aligned with a band.
+fn box_on_canvas(node: &Node, transform: Affine, scale: f64) -> Option<Rect> {
     let layout = node.final_layout();
     let [sx, ky, kx, sy, _, _] = transform.as_coeffs();
     if sx != 1.0 || ky != 0.0 || kx != 0.0 || sy != 1.0 {
-        return (false, false);
+        return None;
     }
     // The child's own place in the flow, not the container's origin: `render_node` slides a child by
     // its `location` when it draws it, so a rect built at `Point::ZERO` answers "is this box whole in
@@ -1018,23 +1088,13 @@ fn box_whole_in_band(
         layout.location.x as f64 * scale,
         layout.location.y as f64 * scale,
     );
-    let on_canvas = transform.transform_rect_bbox(Rect::from_origin_size(
+    Some(transform.transform_rect_bbox(Rect::from_origin_size(
         origin,
         Size::new(
             layout.size.width as f64 * scale,
             layout.size.height as f64 * scale,
         ),
-    ));
-    match frag.axis {
-        FlowAxis::Y => (
-            on_canvas.y0 >= frag.rect.y0 - 0.5,
-            on_canvas.y1 <= frag.rect.y1 + 0.5,
-        ),
-        FlowAxis::X => (
-            on_canvas.x0 >= frag.rect.x0 - 0.5,
-            on_canvas.x1 <= frag.rect.x1 + 0.5,
-        ),
-    }
+    )))
 }
 
 /// Whether a box asks that the decoration of each of its fragments be drawn whole — which is why
@@ -1057,6 +1117,11 @@ struct Fragmentainer {
     rect: Rect,
     /// The axis the flow advances along, which is the axis a box is cut on.
     axis: FlowAxis,
+    /// Which page band this fragment belongs to.
+    index: usize,
+    /// Whether this fragment is a printed page rather than a column in a
+    /// multi-column flow.
+    page_flow: bool,
     /// Whether the near edge along the flow is where the flow starts, and the same at the far edge.
     /// A box may bleed what it draws outside its border box past an end of the flow, but never past
     /// a break, because the next fragmentainer is what lies there.
@@ -1206,6 +1271,8 @@ fn clone_fragment(
             // itself overflows, and its children are cut to the column, not to the box.
             rect: content.intersect(frag.rect),
             axis: frag.axis,
+            index: frag.index,
+            page_flow: frag.page_flow,
             // An edge of the content box that is not a cut leads into the box's own padding, which
             // its children may overflow; an edge the break put there cuts them.
             outer_start: !cut_start,
@@ -1448,6 +1515,11 @@ impl ElementCx<'_, '_> {
                 self.local_cull_rect(transform),
                 &mut draw_text_context,
             );
+            // A fragment's boxes are already in the flow's page coordinates, so
+            // only the crop of the current page moves them into the scene.
+            let page_translation =
+                Affine::translate((self.context.initial_x, self.context.initial_y));
+            let page_transform = page_translation * Affine::scale(self.scale);
             for group in &text_layout.margin_note_groups {
                 if group.page_fragments.is_empty() {
                     let note_transform = transform
@@ -1461,17 +1533,24 @@ impl ElementCx<'_, '_> {
                         None,
                         self.context.dom,
                         note_transform,
+                        page_transform,
                         self.scale,
                         self.node.id,
-                        self.local_cull_rect(note_transform),
+                        self.clip_rect,
                         &mut draw_text_context,
                     );
                 } else {
                     for fragment in &group.page_fragments {
+                        if self
+                            .frag
+                            .is_some_and(|frag| frag.index != fragment.page_index)
+                        {
+                            continue;
+                        }
                         let note_transform = transform
                             * Affine::translate((
-                                f64::from(group.inline_dx + fragment.shift_x) * self.scale,
-                                f64::from(group.inline_dy + fragment.shift_y) * self.scale,
+                                f64::from(group.inline_dx) * self.scale,
+                                f64::from(group.inline_dy) * self.scale,
                             ));
                         crate::text::stroke_margin_note_group(
                             scene,
@@ -1479,9 +1558,10 @@ impl ElementCx<'_, '_> {
                             Some(fragment),
                             self.context.dom,
                             note_transform,
+                            page_transform,
                             self.scale,
                             self.node.id,
-                            self.local_cull_rect(note_transform),
+                            self.clip_rect,
                             &mut draw_text_context,
                         );
                     }
@@ -1740,6 +1820,8 @@ impl ElementCx<'_, '_> {
             let frag = Fragmentainer {
                 rect: band_rect,
                 axis: plan.axis,
+                index,
+                page_flow: false,
                 outer_start: index == 0,
                 outer_end: index == last,
             };
@@ -1800,6 +1882,17 @@ impl ElementCx<'_, '_> {
         clip_rect: Rect,
     ) {
         let child = &self.context.dom.as_ref().tree()[child_id];
+        if let Some(on_canvas) = box_on_canvas(child, transform, self.scale) {
+            let slack = 256.0 * self.scale;
+            let cull = clip_rect.inflate(slack, slack);
+            if on_canvas.x1 < cull.x0
+                || on_canvas.x0 > cull.x1
+                || on_canvas.y1 < cull.y0
+                || on_canvas.y0 > cull.y1
+            {
+                return;
+            }
+        }
         let bleed = decoration_bleed(child);
         // Where the band never cut this child, its edge along the flow is the box's own edge and not
         // a break: an outline or shadow drawn there belongs on the canvas, even though it falls
@@ -1808,14 +1901,24 @@ impl ElementCx<'_, '_> {
         // treated that edge as though the break had taken the decoration away with it.
         let (whole_start, whole_end) = box_whole_in_band(child, transform, frag, self.scale);
         let cloned = clones_decorations(child);
-        let clip = frag
-            .clip_for(
+        // A page already has one clip layer around the sheet. A child wholly
+        // inside its page fragment cannot paint across another page, so it can
+        // share that layer instead of adding one of its own.
+        if frag.page_flow && whole_start && whole_end && !cloned {
+            self.render_node(scene, child_id, transform, clip_rect, Some(frag));
+            return;
+        }
+        let clip = if self.margin_note_ancestors.contains(&child_id) {
+            clip_rect
+        } else {
+            frag.clip_for(
                 bleed,
                 self.scale,
                 cloned || whole_start,
                 cloned || whole_end,
             )
-            .intersect(clip_rect);
+            .intersect(clip_rect)
+        };
         #[cfg(debug_assertions)]
         if std::env::var_os("CUOTUO_DEBUG_PAINT").is_some() {
             eprintln!(

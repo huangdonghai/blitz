@@ -9,7 +9,7 @@ use blitz_dom::{
     util::ToColorColor,
 };
 use icu_properties::{CodePointMapData, props::VerticalOrientation};
-use kurbo::{Affine, BezPath, Cap, Circle, Rect, Stroke};
+use kurbo::{Affine, BezPath, Cap, Circle, Point, Rect, Stroke, Vec2};
 use parley::{Affinity, Cursor, Layout, Line, LineMetrics, PositionedLayoutItem, Selection};
 use peniko::{Fill, Mix};
 use std::collections::HashMap;
@@ -2108,9 +2108,10 @@ pub(crate) fn stroke_margin_note_group(
     fragment: Option<&MarginNotePageFragment>,
     doc: &BaseDocument,
     transform: Affine,
+    box_transform: Affine,
     scale: f64,
     inline_root_id: NodeId,
-    cull_rect: Rect,
+    screen_cull_rect: Rect,
     context: &mut DrawTextContext,
 ) {
     let Some(styles) = doc
@@ -2132,13 +2133,19 @@ pub(crate) fn stroke_margin_note_group(
     let line_start = fragment.map_or(0, |fragment| fragment.line_start);
     let line_end = fragment.map_or(group.layout.len(), |fragment| fragment.line_end);
     let local_border = Rect::new(
-        f64::from(border_box.left - content_box.left) * scale,
-        f64::from(border_box.top - content_box.top) * scale,
-        f64::from(border_box.right - content_box.left) * scale,
-        f64::from(border_box.bottom - content_box.top) * scale,
+        f64::from(border_box.left),
+        f64::from(border_box.top),
+        f64::from(border_box.right),
+        f64::from(border_box.bottom),
     );
     if background.components[3] > 0.0 {
-        scene.fill(Fill::NonZero, transform, background, None, &local_border);
+        scene.fill(
+            Fill::NonZero,
+            box_transform,
+            background,
+            None,
+            &local_border,
+        );
     }
 
     let widths = [
@@ -2152,7 +2159,7 @@ pub(crate) fn stroke_margin_note_group(
     };
     draw_inline_note_border_side(
         scene,
-        transform,
+        box_transform,
         border.border_top_style,
         resolve(&border.border_top_color),
         NoteBorderSide::Top,
@@ -2161,18 +2168,18 @@ pub(crate) fn stroke_margin_note_group(
             local_border.x0,
             local_border.y0,
             local_border.x1,
-            local_border.y0 + f64::from(widths[0]) * scale,
+            local_border.y0 + f64::from(widths[0]),
         ),
     );
     draw_inline_note_border_side(
         scene,
-        transform,
+        box_transform,
         border.border_right_style,
         resolve(&border.border_right_color),
         NoteBorderSide::Right,
         widths[1],
         Rect::new(
-            local_border.x1 - f64::from(widths[1]) * scale,
+            local_border.x1 - f64::from(widths[1]),
             local_border.y0,
             local_border.x1,
             local_border.y1,
@@ -2180,21 +2187,21 @@ pub(crate) fn stroke_margin_note_group(
     );
     draw_inline_note_border_side(
         scene,
-        transform,
+        box_transform,
         border.border_bottom_style,
         resolve(&border.border_bottom_color),
         NoteBorderSide::Bottom,
         widths[2],
         Rect::new(
             local_border.x0,
-            local_border.y1 - f64::from(widths[2]) * scale,
+            local_border.y1 - f64::from(widths[2]),
             local_border.x1,
             local_border.y1,
         ),
     );
     draw_inline_note_border_side(
         scene,
-        transform,
+        box_transform,
         border.border_left_style,
         resolve(&border.border_left_color),
         NoteBorderSide::Left,
@@ -2202,7 +2209,7 @@ pub(crate) fn stroke_margin_note_group(
         Rect::new(
             local_border.x0,
             local_border.y0,
-            local_border.x0 + f64::from(widths[3]) * scale,
+            local_border.x0 + f64::from(widths[3]),
             local_border.y1,
         ),
     );
@@ -2212,6 +2219,39 @@ pub(crate) fn stroke_margin_note_group(
     #[cfg(not(feature = "writing-mode"))]
     let vertical: Option<VerticalTextPaint> = None;
 
+    let mut text_transform = transform;
+    if fragment.is_some()
+        && let Some(first_line) = group.layout.get(line_start)
+    {
+        let expected = box_transform.transform_rect_bbox(Rect::new(
+            f64::from(content_box.left),
+            f64::from(content_box.top),
+            f64::from(content_box.right),
+            f64::from(content_box.bottom),
+        ));
+        let block_start = f64::from(first_line.metrics().block_min_coord);
+        let shift = match vertical.as_ref() {
+            Some(vertical) if vertical.block_axis_starts_at_right => {
+                let current = (text_transform
+                    * Point::new(
+                        f64::from(vertical.block_extent) - block_start,
+                        0.0,
+                    ))
+                .x;
+                Vec2::new(expected.x1 - current, 0.0)
+            }
+            Some(_) => {
+                let current = (text_transform * Point::new(block_start, 0.0)).x;
+                Vec2::new(expected.x0 - current, 0.0)
+            }
+            None => {
+                let current = (text_transform * Point::new(0.0, block_start)).y;
+                Vec2::new(0.0, expected.y0 - current)
+            }
+        };
+        text_transform = Affine::translate(shift) * text_transform;
+    }
+
     draw_inline_backgrounds(
         scene,
         group
@@ -2220,10 +2260,25 @@ pub(crate) fn stroke_margin_note_group(
             .skip(line_start)
             .take(line_end.saturating_sub(line_start)),
         doc,
-        transform,
+        text_transform,
         inline_root_id,
         vertical.as_ref(),
     );
+    // `line_extent` and the glyph batches both work in the physical axes
+    // `vertical_transform` has already mapped the line onto, so the screen clip
+    // maps back through the note transform alone.
+    let cull_rect = if transform.determinant().abs() < f64::EPSILON {
+        Rect::new(
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::INFINITY,
+        )
+    } else {
+        text_transform
+            .inverse()
+            .transform_rect_bbox(screen_cull_rect)
+    };
     stroke_text_with_data(
         scene,
         group
@@ -2232,7 +2287,7 @@ pub(crate) fn stroke_margin_note_group(
             .skip(line_start)
             .take(line_end.saturating_sub(line_start)),
         doc,
-        transform,
+        text_transform,
         scale,
         inline_root_id,
         cull_rect,
