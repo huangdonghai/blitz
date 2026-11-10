@@ -605,6 +605,11 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             *node.final_layout(),
             transform,
             clip_rect,
+            frag.filter(|frag| {
+                frag.page_flow && self.margin_note_ancestors.contains(&node.id)
+            })
+            .map(|frag| frag.rect.intersect(clip_rect))
+            .filter(|clip| clip.area() > 0.0),
             band_applied,
             frag,
             custom_widget_scene,
@@ -821,6 +826,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         layout: Layout,
         transform: Affine,
         clip_rect: Rect,
+        page_content_clip: Option<Rect>,
         band_applied: bool,
         frag: Option<Fragmentainer>,
         custom_widget_scene: Option<&'a Scene>,
@@ -852,6 +858,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             element,
             transform,
             clip_rect,
+            page_content_clip,
             band_applied,
             frag,
             #[cfg(feature = "svg")]
@@ -913,6 +920,10 @@ struct ElementCx<'dom, 'a> {
     /// The visible region, in screen coordinates: what descendants may be culled
     /// against (see [`ElementCx::local_cull_rect`]).
     clip_rect: Rect,
+    /// The page's content band for an inline root that also paints margin
+    /// notes. Ordinary text and inline notes stay inside this clip; the margin
+    /// notes themselves keep painting on the paper.
+    page_content_clip: Option<Rect>,
     /// Whether the caller already placed this box in one of its fragmentainers. A page sequence
     /// is cut by [`BlitzDomPainter::paint_scene`] and a column box by
     /// [`ElementCx::draw_content_fragmented`]; either way the content below is drawn once per
@@ -1419,6 +1430,10 @@ impl ElementCx<'_, '_> {
     /// coordinates, so the region has to be mapped back through the same screen
     /// offset the culling in `render_element` uses.
     fn local_cull_rect(&self, transform: Affine) -> Rect {
+        self.local_cull_rect_for(transform, self.clip_rect)
+    }
+
+    fn local_cull_rect_for(&self, transform: Affine, clip_rect: Rect) -> Rect {
         let screen = transform;
         // A degenerate transform has no visible region to speak of; cull nothing
         // rather than guess at one.
@@ -1430,7 +1445,7 @@ impl ElementCx<'_, '_> {
                 f64::INFINITY,
             );
         }
-        screen.inverse().transform_rect_bbox(self.clip_rect)
+        screen.inverse().transform_rect_bbox(clip_rect)
     }
 
     fn draw_inline_layout(&self, scene: &mut impl PaintScene, pos: Point) {
@@ -1448,6 +1463,14 @@ impl ElementCx<'_, '_> {
             };
             let transform =
                 self.transform * Affine::translate((pos.x * self.scale, pos.y * self.scale));
+            let content_clip = self.page_content_clip;
+            if let Some(clip) = content_clip {
+                scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &clip);
+            }
+            let cull_rect = self.local_cull_rect_for(
+                transform,
+                content_clip.unwrap_or(self.clip_rect),
+            );
 
             // Render inline element backgrounds (e.g. `<span style="background: ...">`)
             // behind the text and selection highlight.
@@ -1495,7 +1518,7 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
-                self.local_cull_rect(transform),
+                cull_rect,
                 &mut draw_text_context,
             );
 
@@ -1506,7 +1529,7 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
-                self.local_cull_rect(transform),
+                cull_rect,
                 &mut draw_text_context,
             );
             crate::text::stroke_interline_notes(
@@ -1516,9 +1539,12 @@ impl ElementCx<'_, '_> {
                 transform,
                 self.scale,
                 self.node.id,
-                self.local_cull_rect(transform),
+                cull_rect,
                 &mut draw_text_context,
             );
+            if content_clip.is_some() {
+                scene.pop_layer();
+            }
             // A fragment's boxes are already in the flow's page coordinates, so
             // only the crop of the current page moves them into the scene.
             let page_translation =
