@@ -2813,6 +2813,206 @@ impl BaseDocument {
         None
     }
 
+    /// An inline note's own text length and the byte offset at which it is
+    /// inserted into its containing inline root's text.
+    ///
+    /// The note's text is not part of the root's text: the layout carries an
+    /// inline box for the note at that offset instead. Selections that cross
+    /// the note have to cut the root there and take the note's text from its
+    /// own layout.
+    fn inline_note_selection_source(&self, node_id: NodeId) -> Option<(NodeId, usize, usize)> {
+        for (root_id, node) in self.tree().iter() {
+            let Some(layout) = node
+                .element_data()
+                .and_then(|element| element.inline_layout_data.as_ref())
+            else {
+                continue;
+            };
+            let Some(source) = layout
+                .inline_notes
+                .iter()
+                .find(|source| source.node_id == node_id)
+            else {
+                continue;
+            };
+            let insertion = layout
+                .layout
+                .inline_boxes()
+                .filter(|inline_box| {
+                    inline_box.id == node_id.as_u64()
+                        && matches!(
+                            inline_box.kind,
+                            parley::InlineBoxKind::CustomInFlow
+                                | parley::InlineBoxKind::CustomInFlowCentered
+                        )
+                })
+                .map(|inline_box| inline_box.index)
+                .min()?;
+            return Some((root_id, insertion, source.text.len()));
+        }
+        None
+    }
+
+    /// Append the ranges of every inline note inserted inside `start..end` of
+    /// `root_id`'s text, in any order.
+    ///
+    /// A note takes no bytes in the root's text, so a range that runs past its
+    /// insertion point covers the body text around it while the note's own
+    /// characters would never be selected. `excluded` holds notes whose range
+    /// the caller has already emitted in a different form (a selection
+    /// endpoint).
+    fn push_inline_notes_in_range(
+        &self,
+        ranges: &mut Vec<(NodeId, usize, usize)>,
+        root_id: NodeId,
+        start: usize,
+        end: usize,
+        excluded: &[NodeId],
+    ) {
+        let Some(layout) = self
+            .get_node(root_id)
+            .and_then(|node| node.element_data())
+            .and_then(|element| element.inline_layout_data.as_ref())
+        else {
+            return;
+        };
+        let mut insertions = Vec::new();
+        for source in &layout.inline_notes {
+            if excluded.contains(&source.node_id) {
+                continue;
+            }
+            let Some(insertion) = layout
+                .layout
+                .inline_boxes()
+                .filter(|inline_box| {
+                    inline_box.id == source.node_id.as_u64()
+                        && matches!(
+                            inline_box.kind,
+                            parley::InlineBoxKind::CustomInFlow
+                                | parley::InlineBoxKind::CustomInFlowCentered
+                        )
+                })
+                .map(|inline_box| inline_box.index)
+                .min()
+            else {
+                continue;
+            };
+            if start <= insertion && insertion < end {
+                insertions.push((source.node_id, source.text.len()));
+            }
+        }
+        for (node, len) in insertions {
+            ranges.push((node, 0, len));
+        }
+    }
+
+    /// Selection ranges for a selection with an inline note at one end.
+    ///
+    /// A note sits at a byte offset in its containing inline root, but its
+    /// text lives in a layout of its own. The root is therefore selected up to
+    /// (or from) the note's insertion point and the note's text is emitted as
+    /// a range of its own, so text on the far side of the note is not picked
+    /// up and the note's characters are not lost.
+    fn note_spanning_selection_ranges(
+        &self,
+        anchor_node: NodeId,
+        anchor_offset: usize,
+        focus_node: NodeId,
+        focus_offset: usize,
+    ) -> Option<Vec<(NodeId, usize, usize)>> {
+        // (root, offset in the root, root's text length, note at that point)
+        let endpoint = |node: NodeId,
+                        offset: usize|
+         -> Option<(NodeId, usize, usize, Option<(NodeId, usize, usize)>)> {
+            if let Some((root, insertion, note_len)) = self.inline_note_selection_source(node) {
+                let root_len = self
+                    .get_node(root)?
+                    .element_data()?
+                    .inline_layout_data
+                    .as_ref()?
+                    .text
+                    .len();
+                return Some((root, insertion, root_len, Some((node, offset, note_len))));
+            }
+            let root_len = self
+                .get_node(node)?
+                .element_data()?
+                .inline_layout_data
+                .as_ref()?
+                .text
+                .len();
+            Some((node, offset, root_len, None))
+        };
+
+        let anchor = endpoint(anchor_node, anchor_offset)?;
+        let focus = endpoint(focus_node, focus_offset)?;
+        let (first, last) = {
+            let order = if anchor.0 == focus.0 {
+                anchor.1.cmp(&focus.1)
+            } else {
+                self.compare_document_order(anchor.0, focus.0)
+            };
+            if order.is_gt() {
+                (focus, anchor)
+            } else {
+                (anchor, focus)
+            }
+        };
+
+        let excluded: Vec<NodeId> = [first.3, last.3]
+            .into_iter()
+            .flatten()
+            .map(|(note, _, _)| note)
+            .collect();
+        let mut ranges = Vec::new();
+        let push = |ranges: &mut Vec<(NodeId, usize, usize)>,
+                    node: NodeId,
+                    start: usize,
+                    end: usize| {
+            if start < end {
+                ranges.push((node, start, end));
+            }
+        };
+
+        if first.0 == last.0 {
+            if let Some((note, offset, len)) = first.3 {
+                ranges.push((note, offset, len));
+            }
+            push(&mut ranges, first.0, first.1, last.1);
+            self.push_inline_notes_in_range(&mut ranges, first.0, first.1, last.1, &excluded);
+            if let Some((note, offset, _)) = last.3 {
+                ranges.push((note, 0, offset));
+            }
+            return Some(ranges);
+        }
+
+        if let Some((note, offset, len)) = first.3 {
+            ranges.push((note, offset, len));
+        }
+        push(&mut ranges, first.0, first.1, first.2);
+        self.push_inline_notes_in_range(&mut ranges, first.0, first.1, first.2, &excluded);
+        for root in self.collect_inline_roots_in_range(first.0, last.0) {
+            if root == first.0 || root == last.0 {
+                continue;
+            }
+            if let Some(len) = self
+                .get_node(root)
+                .and_then(|node| node.element_data())
+                .and_then(|element| element.inline_layout_data.as_ref())
+                .map(|layout| layout.text.len())
+            {
+                push(&mut ranges, root, 0, len);
+                self.push_inline_notes_in_range(&mut ranges, root, 0, len, &excluded);
+            }
+        }
+        push(&mut ranges, last.0, 0, last.1);
+        self.push_inline_notes_in_range(&mut ranges, last.0, 0, last.1, &excluded);
+        if let Some((note, offset, _)) = last.3 {
+            ranges.push((note, 0, offset));
+        }
+        Some(ranges)
+    }
+
     /// Get all selection ranges as Vec<(node_id, start_offset, end_offset)>.
     /// Returns empty vec if no selection.
     pub fn get_text_selection_ranges(&self) -> Vec<(NodeId, usize, usize)> {
@@ -2854,7 +3054,27 @@ impl BaseDocument {
             if start == end {
                 return Vec::new();
             }
-            return vec![(anchor_node, start, end)];
+            let mut ranges = vec![(anchor_node, start, end)];
+            // A paragraph's range covers the body text around its notes, but
+            // not the notes' own text; those are separate ranges.
+            self.push_inline_notes_in_range(&mut ranges, anchor_node, start, end, &[]);
+            return ranges;
+        }
+
+        // An inline note at either end keeps its text in a separate layout.
+        // The inline-root walk below would take the whole containing root and
+        // drop the note itself, so resolve this case from the note's insertion
+        // point instead.
+        if (self.inline_note_selection_source(anchor_node).is_some()
+            || self.inline_note_selection_source(focus_node).is_some())
+            && let Some(ranges) = self.note_spanning_selection_ranges(
+                anchor_node,
+                self.text_selection.anchor.offset,
+                focus_node,
+                self.text_selection.focus.offset,
+            )
+        {
+            return ranges;
         }
 
         // Multi-node selection: collect all inline roots between anchor and focus
@@ -2901,22 +3121,27 @@ impl BaseDocument {
 
             let text_len = inline_layout.text.len();
 
-            if node_id == first_node && node_id == last_node {
-                let start = first_offset.min(last_offset);
-                let end = first_offset.max(last_offset);
+            // Notes inside the selected part of this root are not in its
+            // text; add their own ranges so nothing between the endpoints is
+            // dropped.
+            let mut select = |start: usize, end: usize| {
                 if start < end && end <= text_len {
                     ranges.push((node_id, start, end));
+                    self.push_inline_notes_in_range(&mut ranges, node_id, start, end, &[]);
                 }
+            };
+            if node_id == first_node && node_id == last_node {
+                select(first_offset.min(last_offset), first_offset.max(last_offset));
             } else if node_id == first_node {
                 if first_offset < text_len {
-                    ranges.push((node_id, first_offset, text_len));
+                    select(first_offset, text_len);
                 }
             } else if node_id == last_node {
-                if last_offset > 0 && last_offset <= text_len {
-                    ranges.push((node_id, 0, last_offset));
+                if last_offset > 0 {
+                    select(0, last_offset);
                 }
             } else if text_len > 0 {
-                ranges.push((node_id, 0, text_len));
+                select(0, text_len);
             }
         }
 
