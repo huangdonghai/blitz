@@ -3052,9 +3052,16 @@ impl BaseDocument {
                 ranges.push((note, offset, note_len));
             }
 
+            // The selection continues past this root when another root
+            // follows, so a note anchored at the very end of this root's text
+            // is still inside the selection. Only the last root's end can stop
+            // before its note, and that note is then handled as an endpoint
+            // when it is the focus.
+            let continues_after = root != last.0;
             let mut cursor = start;
             for (insertion, note, note_len) in self.note_sources_in_root(root) {
-                if insertion < start || insertion >= end || endpoint_notes.contains(&note) {
+                let inside = insertion >= start && (insertion < end || (continues_after && insertion == end));
+                if !inside || endpoint_notes.contains(&note) {
                     continue;
                 }
                 if cursor < insertion {
