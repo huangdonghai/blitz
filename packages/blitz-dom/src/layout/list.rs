@@ -78,7 +78,8 @@ fn node_list_item_child(
     let position = match list_style_position {
         ListStylePosition::Inside => ListItemLayoutPosition::Inside,
         ListStylePosition::Outside => {
-            let mut parley_style = stylo_to_parley::style(child_id, &styles, false);
+            let mut parley_style =
+                stylo_to_parley::style(child_id, &styles, false, &doc.font_face_features);
 
             if let Some(font_family) = font_for_bullet_style(list_style_type) {
                 parley_style.font_family = font_family;

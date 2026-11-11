@@ -864,7 +864,7 @@ fn create_text_editor(doc: &mut BaseDocument, input_element_id: NodeId, is_multi
     let parley_style = node
         .primary_styles()
         .as_ref()
-        .map(|s| stylo_to_parley::style(node.id, s, false))
+        .map(|s| stylo_to_parley::style(node.id, s, false, &doc.font_face_features))
         .unwrap_or_default();
     let alignment = node
         .primary_styles()
@@ -1676,6 +1676,7 @@ pub(crate) fn build_inline_layout_into(
     text_layout: &mut TextLayout,
     scale: f32,
     inline_context_root_node_id: NodeId,
+    face_features: &stylo_to_parley::FaceFeatures,
 ) {
     let note_nodes = collect_inline_note_nodes(nodes, inline_context_root_node_id);
     let mut inline_notes = Vec::with_capacity(note_nodes.len());
@@ -1693,6 +1694,7 @@ pub(crate) fn build_inline_layout_into(
             None,
             None,
             None,
+            face_features,
         );
         if note_layout.text.is_empty() && note_layout.layout.inline_boxes().len() == 0 {
             continue;
@@ -1791,6 +1793,7 @@ pub(crate) fn build_inline_layout_into(
             Some(&interline_nodes),
             None,
             None,
+            face_features,
         );
         #[cfg(feature = "writing-mode")]
         {
@@ -1909,6 +1912,7 @@ pub(crate) fn build_inline_layout_into(
         None,
         None,
         None,
+        face_features,
     );
     let mut assigned = std::collections::HashSet::new();
     let source_intrinsics: std::collections::HashMap<_, _> = inline_notes
@@ -1949,6 +1953,7 @@ pub(crate) fn build_margin_note_content_layout(
     scale: f32,
     vertical: bool,
     base_direction: parley::BaseDirection,
+    face_features: &stylo_to_parley::FaceFeatures,
 ) -> TextLayout {
     let mut text_layout = TextLayout::default();
     build_inline_layout_into_inner(
@@ -1963,6 +1968,7 @@ pub(crate) fn build_margin_note_content_layout(
         None,
         Some(vertical),
         Some(base_direction),
+        face_features,
     );
     text_layout
 }
@@ -1979,6 +1985,7 @@ fn build_inline_layout_into_inner(
     interline_note_nodes: Option<&[NodeId]>,
     forced_vertical: Option<bool>,
     forced_base_direction: Option<parley::BaseDirection>,
+    face_features: &stylo_to_parley::FaceFeatures,
 ) {
     // Get the inline context's root node's text styles
     let root_node = &nodes[inline_context_root_node_id];
@@ -2001,7 +2008,7 @@ fn build_inline_layout_into_inner(
 
     let parley_style = root_node_style
         .as_ref()
-        .map(|s| stylo_to_parley::style(inline_context_root_node_id, s, false))
+        .map(|s| stylo_to_parley::style(inline_context_root_node_id, s, false, face_features))
         .unwrap_or_else(|| parley::TextStyle {
             white_space_collapse: WhiteSpaceCollapse::Collapse,
             ..Default::default()
@@ -2047,6 +2054,7 @@ fn build_inline_layout_into_inner(
                 Some(note_node_id),
                 note_sources,
                 Some(body_vertical),
+                face_features,
             );
         }
         builder.push_inline_box(InlineBox {
@@ -2104,6 +2112,7 @@ fn build_inline_layout_into_inner(
             note_root,
             note_sources,
             forced_vertical,
+            face_features,
         );
     }
     for child_id in root_node.children.iter().copied() {
@@ -2118,6 +2127,7 @@ fn build_inline_layout_into_inner(
             note_root,
             note_sources,
             forced_vertical,
+            face_features,
         );
     }
     if let Some(after_id) = root_node.after() {
@@ -2132,6 +2142,7 @@ fn build_inline_layout_into_inner(
             note_root,
             note_sources,
             forced_vertical,
+            face_features,
         );
     }
 
@@ -2151,6 +2162,7 @@ fn build_inline_layout_into_inner(
         note_root: Option<NodeId>,
         note_sources: &[crate::node::InlineNoteSource],
         forced_vertical: Option<bool>,
+        face_features: &stylo_to_parley::FaceFeatures,
     ) {
         let is_annotation = nodes[node_id]
             .element_data()
@@ -2167,6 +2179,7 @@ fn build_inline_layout_into_inner(
             note_root,
             note_sources,
             forced_vertical,
+            face_features,
         );
         if let Some(start) = start {
             ruby.ranges.push(start..builder.text().len());
@@ -2184,6 +2197,7 @@ fn build_inline_layout_into_inner(
         note_root: Option<NodeId>,
         note_sources: &[crate::node::InlineNoteSource],
         forced_vertical: Option<bool>,
+        face_features: &stylo_to_parley::FaceFeatures,
     ) {
         let node = &nodes[node_id];
 
@@ -2397,6 +2411,7 @@ fn build_inline_layout_into_inner(
                                 note_root,
                                 note_sources,
                                 forced_vertical,
+                                face_features,
                             );
                         }
                         builder.pop_style_span();
@@ -2438,7 +2453,7 @@ fn build_inline_layout_into_inner(
                             // node.remove_damage(CONSTRUCT_DESCENDENT | CONSTRUCT_FC | CONSTRUCT_BOX);
                             let mut style = node
                                 .primary_styles()
-                                .map(|s| stylo_to_parley::style(node.id, &s, true))
+                                .map(|s| stylo_to_parley::style(node.id, &s, true, face_features))
                                 .unwrap_or_else(|| parley::TextStyle {
                                     white_space_collapse: WhiteSpaceCollapse::Collapse,
                                     ..Default::default()
@@ -2499,6 +2514,7 @@ fn build_inline_layout_into_inner(
                                     note_root,
                                     note_sources,
                                     forced_vertical,
+                                    face_features,
                                 );
                             }
 
@@ -2514,6 +2530,7 @@ fn build_inline_layout_into_inner(
                                     note_root,
                                     note_sources,
                                     forced_vertical,
+                                    face_features,
                                 );
                             }
                             if let Some(after_id) = node.after() {
@@ -2528,6 +2545,7 @@ fn build_inline_layout_into_inner(
                                     note_root,
                                     note_sources,
                                     forced_vertical,
+                                    face_features,
                                 );
                             }
 

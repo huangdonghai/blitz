@@ -61,7 +61,10 @@ use style::{
     media_queries::MediaList,
     selector_parser::SnapshotMap,
     shared_lock::{SharedRwLock, StylesheetGuards},
-    stylesheets::{AllowImportRules, DocumentStyleSheet, Origin, Stylesheet},
+    stylesheets::{
+        AllowImportRules, CssRule, DocumentStyleSheet, Origin, Stylesheet,
+        StylesheetInDocument as _,
+    },
     stylist::Stylist,
 };
 use style_dom::ElementState;
@@ -291,6 +294,13 @@ pub struct BaseDocument {
     // Parley contexts
     /// A Parley font context
     pub(crate) font_ctx: Arc<Mutex<parley::FontContext>>,
+    /// OpenType features declared by `@font-face { font-feature-settings }`,
+    /// keyed by lowercased family name.
+    ///
+    /// The descriptor is a property of the face, but Parley features belong to
+    /// the text style, so they are merged into a style when it names the
+    /// family. Element-level `font-feature-settings` still wins over them.
+    pub(crate) font_face_features: Vec<(String, Vec<parley::FontFeature>)>,
     #[cfg(feature = "parallel-construct")]
     /// Thread-and-document-local copies to the font context
     pub(crate) thread_font_contexts: ThreadLocal<RefCell<Box<FontContext>>>,
@@ -508,6 +518,7 @@ impl BaseDocument {
             nodes_to_stylesheet: BTreeMap::new(),
             stylesheet_generation: 0,
             font_ctx,
+            font_face_features: Vec::new(),
             #[cfg(feature = "parallel-construct")]
             thread_font_contexts: ThreadLocal::new(),
             layout_ctx: parley::LayoutContext::new(),
@@ -1266,9 +1277,65 @@ impl BaseDocument {
         self.add_stylesheet_for_node(sheet, node_id);
     }
 
+    /// Remember the OpenType features an `@font-face` rule declares.
+    ///
+    /// `font-feature-settings` is a descriptor of the face, while Parley's
+    /// features belong to a text style. Recording the families here lets the
+    /// style conversion merge the face's defaults into text that names the
+    /// family; an element-level `font-feature-settings` is applied later and
+    /// wins over them.
+    pub(crate) fn record_font_face_features(&mut self, sheet: &Stylesheet) {
+        let rules: Vec<CssRule> = {
+            let guard = self.guard.read();
+            sheet.contents(&guard).rules.read_with(&guard).0.clone()
+        };
+        for rule in &rules {
+            self.record_font_face_rule(rule);
+        }
+    }
+
+    /// [`Self::record_font_face_features`] for one already-parsed rule.
+    pub(crate) fn record_font_face_rule(&mut self, rule: &CssRule) {
+        let CssRule::FontFace(font_face) = rule else {
+            return;
+        };
+        let (family, settings) = {
+            let guard = self.guard.read();
+            let descriptors = &font_face.read_with(&guard).descriptors;
+            let Some(family) = descriptors.font_family.as_ref() else {
+                return;
+            };
+            let Some(settings) = descriptors.font_feature_settings.as_ref() else {
+                return;
+            };
+            (family.name.to_string(), settings.clone())
+        };
+        let features: Vec<parley::FontFeature> = settings
+            .0
+            .iter()
+            .map(|setting| parley::FontFeature {
+                tag: parley::setting::Tag::from_bytes(setting.tag.0.to_be_bytes()),
+                value: setting.value.get().unwrap_or(0).clamp(0, u16::MAX as i32) as u16,
+            })
+            .collect();
+        if features.is_empty() {
+            return;
+        }
+        let family = family.to_ascii_lowercase();
+        self.font_face_features.retain(|(name, _)| *name != family);
+        self.font_face_features.push((family, features));
+    }
+
+    /// OpenType features declared by `@font-face` rules, keyed by lowercased
+    /// family name.
+    pub fn font_face_features(&self) -> &[(String, Vec<parley::FontFeature>)] {
+        &self.font_face_features
+    }
+
     pub fn add_stylesheet_for_node(&mut self, stylesheet: DocumentStyleSheet, node_id: NodeId) {
         let old = self.nodes_to_stylesheet.insert(node_id, stylesheet.clone());
         self.stylesheet_generation += 1;
+        self.record_font_face_features(&stylesheet.0);
 
         if let Some(old) = old {
             self.stylist.remove_stylesheet(old, &self.guard.read())
@@ -1368,6 +1435,7 @@ impl BaseDocument {
                 self.add_stylesheet_for_node(css, node_id);
             }
             Resource::ImportedCss(import_rule, sheet) => {
+                self.record_font_face_features(&sheet);
                 let mut guard = self.guard.write();
                 import_rule.write_with(&mut guard).stylesheet =
                     style::stylesheets::import_rule::ImportSheet::Sheet(sheet);

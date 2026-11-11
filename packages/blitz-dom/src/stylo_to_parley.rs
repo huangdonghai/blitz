@@ -126,6 +126,42 @@ fn feature(tag: &[u8; 4], value: u16) -> parley::FontFeature {
     }
 }
 
+/// OpenType features declared by `@font-face` rules, keyed by lowercased
+/// family name.
+pub(crate) type FaceFeatures = [(String, Vec<parley::FontFeature>)];
+
+/// The `@font-face` descriptor features that apply to `style`'s font stack.
+///
+/// The descriptor belongs to the face, but Parley's features belong to the
+/// text style; merging them here approximates the browser behaviour of using
+/// the face's defaults when that face is selected. Only the stack's first
+/// named family is consulted: that is the face a browser would try first, and
+/// a fallback family's defaults must not leak onto text the first family
+/// renders. Generic families never carry descriptors.
+fn face_features_for<'a>(
+    style: &stylo::ComputedValues,
+    face_features: &'a FaceFeatures,
+) -> Option<&'a [parley::FontFeature]> {
+    if face_features.is_empty() {
+        return None;
+    }
+    let first = style
+        .get_font()
+        .font_family
+        .families
+        .list
+        .iter()
+        .find_map(|family| match family {
+            stylo::SingleFontFamily::FamilyName(name) => Some(name.name.as_str()),
+            stylo::SingleFontFamily::Generic(_) => None,
+        })?;
+    let first = first.to_ascii_lowercase();
+    face_features
+        .iter()
+        .find(|(family, _)| *family == first)
+        .map(|(_, features)| features.as_slice())
+}
+
 /// Convert the `font-feature-settings` property (low-level OpenType feature control)
 /// into a list of Parley font features.
 pub(crate) fn font_feature_settings(
@@ -278,9 +314,19 @@ pub(crate) fn font_variant_east_asian(
 /// Parley stably sorts the feature list by tag and HarfBuzz applies the last of any
 /// duplicate tags, so appending `font-feature-settings` after the `font-variant-*`
 /// features gives it the higher precedence required by the spec.
-pub(crate) fn font_features(style: &stylo::ComputedValues) -> Vec<parley::FontFeature> {
+pub(crate) fn font_features(
+    style: &stylo::ComputedValues,
+    face_features: &FaceFeatures,
+) -> Vec<parley::FontFeature> {
     let font_styles = style.get_font();
     let mut features = Vec::new();
+
+    // The face's `@font-face` descriptors are defaults: everything the
+    // properties below imply is appended after them, and the later value of a
+    // tag wins, so an author's `font-feature-settings` can override them.
+    if let Some(defaults) = self::face_features_for(style, face_features) {
+        features.extend(defaults.iter().copied());
+    }
 
     self::font_variant_ligatures(font_styles.font_variant_ligatures, &mut features);
     self::font_variant_caps(font_styles.font_variant_caps, &mut features);
@@ -616,6 +662,7 @@ pub(crate) fn style(
     span_id: NodeId,
     style: &stylo::ComputedValues,
     inline_element: bool,
+    face_features: &FaceFeatures,
 ) -> parley::TextStyle<'static, 'static, TextBrush> {
     let (hang_start_blocked, hang_end_blocked) = hanging_insets(style, inline_element);
     let inline_element_id = if inline_element { span_id.as_u64() } else { 0 };
@@ -647,7 +694,7 @@ pub(crate) fn style(
     let font_style = self::font_style(font_styles.font_style);
     let font_width = self::font_width(font_styles.font_width);
     let font_variations = self::font_variations(&font_styles.font_variation_settings);
-    let font_features = self::font_features(style);
+    let font_features = self::font_features(style, face_features);
 
     // Convert font family
     let families: Vec<_> = font_styles

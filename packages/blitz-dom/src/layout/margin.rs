@@ -894,6 +894,7 @@ pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
             scale,
             wm.is_vertical(),
             base_direction,
+            &doc.font_face_features,
         );
         if content.text.is_empty() && content.layout.inline_boxes().len() == 0 {
             continue;
