@@ -1900,7 +1900,7 @@ pub(crate) fn stroke_inline_notes(
     scale: f64,
     inline_root_id: NodeId,
     cull_rect: Rect,
-    selection_ranges: &HashMap<NodeId, (usize, usize)>,
+    selection_ranges: &HashMap<NodeId, Vec<(usize, usize)>>,
     context: &mut DrawTextContext,
 ) {
     #[cfg(feature = "writing-mode")]
@@ -1934,7 +1934,9 @@ pub(crate) fn stroke_inline_notes(
             let Some(source_line) = source.layout.get(segment.line_index) else {
                 continue;
             };
-            let selection = selection_ranges.get(&source.node_id).copied();
+            let selection = selection_ranges
+                .get(&source.node_id)
+                .and_then(|ranges| ranges.first().copied());
 
             let mut note_vertical = vertical;
             if let (Some(vertical), Some(orientation)) =
@@ -2071,7 +2073,7 @@ pub(crate) fn stroke_interline_notes(
     scale: f64,
     inline_root_id: NodeId,
     cull_rect: Rect,
-    selection_ranges: &HashMap<NodeId, (usize, usize)>,
+    selection_ranges: &HashMap<NodeId, Vec<(usize, usize)>>,
     context: &mut DrawTextContext,
 ) {
     let Some(stream) = text_layout.interline.as_ref() else {
@@ -2095,16 +2097,18 @@ pub(crate) fn stroke_interline_notes(
         if !source.active {
             continue;
         }
-        let Some(&(start, end)) = selection_ranges.get(&source.node_id) else {
+        let Some(ranges) = selection_ranges.get(&source.node_id) else {
             continue;
         };
-        let start = source.text_range.start + start;
-        let end = source.text_range.start + end;
-        if start < end
-            && end <= source.text_range.end
-            && end <= stream.text.len()
-        {
-            draw_text_selection(scene, &stream.layout, transform, start, end, vertical);
+        for &(start, end) in ranges {
+            let start = source.text_range.start + start;
+            let end = source.text_range.start + end;
+            if start < end
+                && end <= source.text_range.end
+                && end <= stream.text.len()
+            {
+                draw_text_selection(scene, &stream.layout, transform, start, end, vertical);
+            }
         }
     }
     stroke_text_with_data(

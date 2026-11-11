@@ -120,8 +120,12 @@ pub struct BlitzDomPainter<'dom, 'a> {
     pub(crate) layer_manager: LayerManager,
     /// Reusable scratch allocations shared by all text layouts painted for this document.
     pub(crate) draw_text_context: RefCell<DrawTextContext>,
-    /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset)
-    pub(crate) selection_ranges: HashMap<NodeId, (usize, usize)>,
+    /// Cached selection ranges for O(1) lookup: node_id -> (start_offset, end_offset).
+    ///
+    /// A node can appear more than once when notes are anchored inside its
+    /// text: the text is cut at each anchor and the note's range takes its
+    /// place, so the same root covers the text on both sides of a note.
+    pub(crate) selection_ranges: HashMap<NodeId, Vec<(usize, usize)>>,
 
     // Pre-computed `Scene`s for each CustomWidget
     pub(crate) custom_widget_scenes: &'a CustomWidgetSceneMap,
@@ -138,11 +142,13 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
         initial_y: f64,
         custom_widget_scenes: &'a CustomWidgetSceneMap,
     ) -> Self {
-        let selection_ranges: HashMap<NodeId, (usize, usize)> = dom
-            .get_text_selection_ranges()
-            .into_iter()
-            .map(|(node_id, start, end)| (node_id, (start, end)))
-            .collect();
+        let mut selection_ranges: HashMap<NodeId, Vec<(usize, usize)>> = HashMap::new();
+        for (node_id, start, end) in dom.get_text_selection_ranges() {
+            selection_ranges
+                .entry(node_id)
+                .or_default()
+                .push((start, end));
+        }
 
         let layer_manager = LayerManager::default();
         let root_element_id = dom.try_root_element().map(|el| el.id);
@@ -1620,8 +1626,10 @@ impl ElementCx<'_, '_> {
                 vertical.as_ref(),
             );
 
-            // Render text selection highlight (if any) using cached selection ranges
-            if let Some(&(sel_start, sel_end)) = self.context.selection_ranges.get(&self.node.id) {
+            // Render text selection highlight (if any) using cached selection
+            // ranges. A node whose text has notes anchored inside it carries
+            // one range per stretch of text between the notes.
+            if let Some(ranges) = self.context.selection_ranges.get(&self.node.id) {
                 // Selection geometry comes from Parley in the writing mode's own
                 // axes, so vertical inline roots need the same transpose the
                 // glyphs get below.
@@ -1631,14 +1639,16 @@ impl ElementCx<'_, '_> {
                 #[cfg(not(feature = "writing-mode"))]
                 let selection_vertical = None;
 
-                crate::text::draw_text_selection(
-                    scene,
-                    &text_layout.layout,
-                    transform,
-                    sel_start,
-                    sel_end,
-                    selection_vertical,
-                );
+                for &(sel_start, sel_end) in ranges {
+                    crate::text::draw_text_selection(
+                        scene,
+                        &text_layout.layout,
+                        transform,
+                        sel_start,
+                        sel_end,
+                        selection_vertical,
+                    );
+                }
             }
 
             // Render text
@@ -1701,7 +1711,10 @@ impl ElementCx<'_, '_> {
                         self.scale,
                         self.node.id,
                         self.clip_rect,
-                        self.context.selection_ranges.get(&group.node_id).copied(),
+                        self.context
+                            .selection_ranges
+                            .get(&group.node_id)
+                            .and_then(|ranges| ranges.first().copied()),
                         &mut draw_text_context,
                     );
                 } else {
@@ -1727,7 +1740,10 @@ impl ElementCx<'_, '_> {
                             self.scale,
                             self.node.id,
                             self.clip_rect,
-                            self.context.selection_ranges.get(&group.node_id).copied(),
+                            self.context
+                                .selection_ranges
+                                .get(&group.node_id)
+                                .and_then(|ranges| ranges.first().copied()),
                             &mut draw_text_context,
                         );
                     }
