@@ -28,7 +28,7 @@ use blitz_traits::shell::{DummyShellProvider, ShellProvider, Viewport};
 use cursor_icon::CursorIcon;
 use linebender_resource_handle::Blob;
 use markup5ever::{LocalName, local_name};
-use parley::{FontContext, PlainEditorDriver};
+use parley::{BreakReason, Cluster, ClusterSide, FontContext, PlainEditorDriver};
 use selectors::{Element, matching::QuirksMode};
 use smallvec::SmallVec;
 use std::any::Any;
@@ -243,6 +243,10 @@ pub struct BaseDocument {
     pub(crate) page_box: Option<crate::layout::fragmentation::PageBox>,
     /// Conservative per-page node membership, rebuilt when geometry changes.
     page_paint_membership: RefCell<Option<Arc<crate::layout::fragmentation::PagePaintMembership>>>,
+    /// Whether the last layout produced any margin-note groups.
+    pub(crate) has_margin_notes: bool,
+    /// Inline roots that own at least one margin-note group.
+    pub(crate) margin_note_roots: Vec<NodeId>,
     /// Bumped whenever layout or a scroll offset can invalidate the page
     /// membership. `resolve` bumps it for actual damage, not for every no-op
     /// resolve, so turning a page can reuse the index.
@@ -493,6 +497,8 @@ impl BaseDocument {
             page_box: None,
             page_paint_membership: RefCell::new(None),
             page_paint_epoch: 1,
+            has_margin_notes: false,
+            margin_note_roots: Vec::new(),
             pending_device_changes: DeviceChanges::empty(),
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
@@ -1621,7 +1627,66 @@ impl BaseDocument {
 
     // Takes (x, y) co-ordinates (relative to the )
     pub fn hit(&self, x: f32, y: f32) -> Option<HitResult> {
+        if let Some((node_id, text_offset)) = self.hit_margin_note(x, y) {
+            return Some(HitResult {
+                node_id,
+                is_text: true,
+                text_offset: Some(text_offset),
+                x,
+                y,
+            });
+        }
         self.hit_with_scrollbar(x, y).0
+    }
+
+    /// Hit test margin notes, whose content boxes live in page coordinates
+    /// outside the inline flow that owns their layouts.
+    fn hit_margin_note(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
+        if !self.has_margin_notes {
+            return None;
+        }
+        for &root_id in &self.margin_note_roots {
+            let Some(node) = self.get_node(root_id) else {
+                continue;
+            };
+            let Some(text) = node
+                .element_data()
+                .and_then(|element| element.inline_layout_data.as_ref())
+            else {
+                continue;
+            };
+            let scale = text.layout.scale();
+            for group in &text.margin_note_groups {
+                if group.page_fragments.is_empty() {
+                    if let Some(offset) = margin_note_offset(
+                        &group.layout,
+                        group.content_box,
+                        0,
+                        x,
+                        y,
+                        scale,
+                        text.vertical_text.as_ref(),
+                    ) {
+                        return Some((group.node_id, offset));
+                    }
+                } else {
+                    for fragment in &group.page_fragments {
+                        if let Some(offset) = margin_note_offset(
+                            &group.layout,
+                            fragment.content_box,
+                            fragment.line_start,
+                            x,
+                            y,
+                            scale,
+                            text.vertical_text.as_ref(),
+                        ) {
+                            return Some((group.node_id, offset));
+                        }
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// The topmost element at viewport coordinates (x, y), or `None` if the point
@@ -2552,6 +2617,9 @@ impl BaseDocument {
     /// and byte offset.
     pub fn find_text_position(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
         let hit = self.hit(x, y)?;
+        if let Some(offset) = hit.text_offset {
+            return Some((hit.node_id, offset));
+        }
         let hit_node = self.get_node(hit.node_id)?;
         let inline_root = hit_node.inline_root_ancestor()?;
         let byte_offset = inline_root.text_offset_at_point(hit.x, hit.y)?;
@@ -2684,18 +2752,14 @@ impl BaseDocument {
 
         let mut result = String::new();
         for (node_id, start, end) in &ranges {
-            let node = self.get_node(*node_id)?;
-            let element_data = node.element_data()?;
-            let inline_layout = element_data.inline_layout_data.as_ref()?;
-
-            if *end > inline_layout.text.len() {
+            let Some(text) = self.selection_text(*node_id, *start, *end) else {
                 continue;
-            }
+            };
 
             if !result.is_empty() {
                 result.push(' ');
             }
-            result.push_str(&inline_layout.text[*start..*end]);
+            result.push_str(text);
         }
 
         if result.is_empty() {
@@ -2703,6 +2767,50 @@ impl BaseDocument {
         } else {
             Some(result)
         }
+    }
+
+    fn selection_text(&self, node_id: NodeId, start: usize, end: usize) -> Option<&str> {
+        if let Some(text) = self
+            .get_node(node_id)
+            .and_then(|node| node.element_data()?.inline_layout_data.as_ref())
+        {
+            return (end <= text.text.len()).then(|| &text.text[start..end]);
+        }
+
+        for (_, node) in self.nodes.iter() {
+            let Some(text) = node
+                .element_data()
+                .and_then(|element| element.inline_layout_data.as_ref())
+            else {
+                continue;
+            };
+            if let Some(source) = text
+                .inline_notes
+                .iter()
+                .find(|source| source.node_id == node_id)
+            {
+                return (end <= source.text.len()).then(|| &source.text[start..end]);
+            }
+            if let Some(stream) = text.interline.as_ref()
+                && let Some(source) = stream
+                    .sources
+                    .iter()
+                    .find(|source| source.node_id == node_id)
+            {
+                let base = source.text_range.start;
+                let start = base.checked_add(start)?;
+                let end = base.checked_add(end)?;
+                return (end <= stream.text.len()).then(|| &stream.text[start..end]);
+            }
+            if let Some(group) = text
+                .margin_note_groups
+                .iter()
+                .find(|group| group.node_id == node_id)
+            {
+                return (end <= group.text.len()).then(|| &group.text[start..end]);
+            }
+        }
+        None
     }
 
     /// Get all selection ranges as Vec<(node_id, start_offset, end_offset)>.
@@ -2855,6 +2963,56 @@ impl AsMut<BaseDocument> for BaseDocument {
     fn as_mut(&mut self) -> &mut BaseDocument {
         self
     }
+}
+
+fn margin_note_offset(
+    layout: &parley::layout::Layout<TextBrush>,
+    content_box: crate::node::MarginNoteRect,
+    first_line_index: usize,
+    x: f32,
+    y: f32,
+    scale: f32,
+    vertical: Option<&crate::node::VerticalTextPaint>,
+) -> Option<usize> {
+    if x < content_box.left
+        || x > content_box.right
+        || y < content_box.top
+        || y > content_box.bottom
+    {
+        return None;
+    }
+    let first_line = layout.get(first_line_index)?;
+    let (layout_x, local_block) = match vertical {
+        Some(vertical) => {
+            let inline = if vertical.inline_axis_needs_mirror {
+                content_box.bottom - y
+            } else {
+                y - content_box.top
+            };
+            let block = if vertical.block_axis_starts_at_right {
+                content_box.right - x
+            } else {
+                x - content_box.left
+            };
+            (inline * scale, block)
+        }
+        None => ((x - content_box.left) * scale, y - content_box.top),
+    };
+    let layout_y = first_line.metrics().block_min_coord + local_block * scale;
+    let (cluster, side) = Cluster::from_point_exact(layout, layout_x, layout_y)?;
+    let is_leading = side == ClusterSide::Left;
+    let offset = if cluster.is_rtl() {
+        if is_leading {
+            cluster.text_range().end
+        } else {
+            cluster.text_range().start
+        }
+    } else if is_leading || cluster.is_line_break() == Some(BreakReason::Explicit) {
+        cluster.text_range().start
+    } else {
+        cluster.text_range().end
+    };
+    Some(offset)
 }
 
 #[cfg(test)]

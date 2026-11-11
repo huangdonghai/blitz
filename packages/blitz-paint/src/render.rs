@@ -1662,6 +1662,7 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 cull_rect,
+                &self.context.selection_ranges,
                 &mut draw_text_context,
             );
             crate::text::stroke_interline_notes(
@@ -1672,6 +1673,7 @@ impl ElementCx<'_, '_> {
                 self.scale,
                 self.node.id,
                 cull_rect,
+                &self.context.selection_ranges,
                 &mut draw_text_context,
             );
             if content_clip.is_some() {
@@ -1699,6 +1701,7 @@ impl ElementCx<'_, '_> {
                         self.scale,
                         self.node.id,
                         self.clip_rect,
+                        self.context.selection_ranges.get(&group.node_id).copied(),
                         &mut draw_text_context,
                     );
                 } else {
@@ -1724,6 +1727,7 @@ impl ElementCx<'_, '_> {
                             self.scale,
                             self.node.id,
                             self.clip_rect,
+                            self.context.selection_ranges.get(&group.node_id).copied(),
                             &mut draw_text_context,
                         );
                     }

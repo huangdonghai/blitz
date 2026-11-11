@@ -456,6 +456,13 @@ pub struct HitResult {
     pub node_id: NodeId,
     /// Whether the hit content is text
     pub is_text: bool,
+    /// Byte offset within the hit text layout, when the hit target is text.
+    ///
+    /// Most callers can still resolve this through the DOM. Note layouts keep
+    /// their text in separate Parley layouts, so their hit tests need to carry
+    /// the offset with the hit instead of rediscovering it from the main inline
+    /// layout.
+    pub text_offset: Option<usize>,
     /// The x coordinate of the hit within the hit target's border-box
     pub x: f32,
     /// The y coordinate of the hit within the hit target's border-box

@@ -728,6 +728,12 @@ pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
             text.margin_note_groups.clear();
         }
     }
+    doc.has_margin_notes = !anchors.is_empty();
+    doc.margin_note_roots.clear();
+    doc.margin_note_roots
+        .extend(anchors.iter().map(|(root_id, _)| *root_id));
+    doc.margin_note_roots.sort_unstable();
+    doc.margin_note_roots.dedup();
     if anchors.is_empty() {
         return;
     }

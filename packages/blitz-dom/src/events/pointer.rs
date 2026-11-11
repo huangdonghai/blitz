@@ -311,7 +311,8 @@ pub(crate) fn handle_pointermove<F: FnMut(DomEvent)>(
     // node), while the hit may be an anonymous block (e.g. bare text wrapped
     // in an anonymous box). Compare against the hit's canonical DOM ancestor
     // so selection drags keep working over anonymous blocks.
-    if doc.nearest_non_anonymous_ancestor(hit.node_id) != Some(target) {
+    let note_text_hit = hit.is_text && hit.text_offset.is_some();
+    if !note_text_hit && doc.nearest_non_anonymous_ancestor(hit.node_id) != Some(target) {
         return changed;
     }
 

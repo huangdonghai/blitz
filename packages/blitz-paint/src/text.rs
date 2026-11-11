@@ -1900,6 +1900,7 @@ pub(crate) fn stroke_inline_notes(
     scale: f64,
     inline_root_id: NodeId,
     cull_rect: Rect,
+    selection_ranges: &HashMap<NodeId, (usize, usize)>,
     context: &mut DrawTextContext,
 ) {
     #[cfg(feature = "writing-mode")]
@@ -1933,6 +1934,7 @@ pub(crate) fn stroke_inline_notes(
             let Some(source_line) = source.layout.get(segment.line_index) else {
                 continue;
             };
+            let selection = selection_ranges.get(&source.node_id).copied();
 
             let mut note_vertical = vertical;
             if let (Some(vertical), Some(orientation)) =
@@ -2047,6 +2049,7 @@ pub(crate) fn stroke_inline_notes(
                     transform,
                     scale,
                     note_vertical.as_ref(),
+                    selection,
                     context,
                 );
             }
@@ -2068,6 +2071,7 @@ pub(crate) fn stroke_interline_notes(
     scale: f64,
     inline_root_id: NodeId,
     cull_rect: Rect,
+    selection_ranges: &HashMap<NodeId, (usize, usize)>,
     context: &mut DrawTextContext,
 ) {
     let Some(stream) = text_layout.interline.as_ref() else {
@@ -2087,6 +2091,22 @@ pub(crate) fn stroke_interline_notes(
         inline_root_id,
         vertical.as_ref(),
     );
+    for source in &stream.sources {
+        if !source.active {
+            continue;
+        }
+        let Some(&(start, end)) = selection_ranges.get(&source.node_id) else {
+            continue;
+        };
+        let start = source.text_range.start + start;
+        let end = source.text_range.start + end;
+        if start < end
+            && end <= source.text_range.end
+            && end <= stream.text.len()
+        {
+            draw_text_selection(scene, &stream.layout, transform, start, end, vertical);
+        }
+    }
     stroke_text_with_data(
         scene,
         stream.layout.lines(),
@@ -2112,6 +2132,7 @@ pub(crate) fn stroke_margin_note_group(
     scale: f64,
     inline_root_id: NodeId,
     screen_cull_rect: Rect,
+    selection: Option<(usize, usize)>,
     context: &mut DrawTextContext,
 ) {
     let Some(styles) = doc
@@ -2279,6 +2300,19 @@ pub(crate) fn stroke_margin_note_group(
             .inverse()
             .transform_rect_bbox(screen_cull_rect)
     };
+    if let Some((start, end)) = selection
+        && start < end
+        && end <= group.text.len()
+    {
+        draw_text_selection(
+            scene,
+            &group.layout,
+            text_transform,
+            start,
+            end,
+            vertical,
+        );
+    }
     stroke_text_with_data(
         scene,
         group
@@ -2690,6 +2724,43 @@ fn inline_note_box_extent(
     )
 }
 
+fn note_selection_rect(
+    vertical: Option<&VerticalTextPaint>,
+    inline_start: f32,
+    inline_end: f32,
+    block_start: f32,
+    block_end: f32,
+) -> Rect {
+    let Some(vertical) = vertical else {
+        return Rect::new(
+            f64::from(inline_start),
+            f64::from(block_start),
+            f64::from(inline_end),
+            f64::from(block_end),
+        );
+    };
+    let block_x = |block: f32| {
+        if vertical.block_axis_starts_at_right {
+            vertical.block_extent - block
+        } else {
+            block
+        }
+    };
+    let inline_y = |inline: f32| {
+        if vertical.inline_axis_needs_mirror {
+            vertical.inline_extent - inline
+        } else {
+            inline
+        }
+    };
+    Rect::new(
+        f64::from(block_x(block_start).min(block_x(block_end))),
+        f64::from(inline_y(inline_start).min(inline_y(inline_end))),
+        f64::from(block_x(block_start).max(block_x(block_end))),
+        f64::from(inline_y(inline_start).max(inline_y(inline_end))),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_inline_note_row(
     scene: &mut impl PaintScene,
@@ -2718,6 +2789,7 @@ fn paint_inline_note_row(
     transform: Affine,
     scale: f64,
     vertical: Option<&VerticalTextPaint>,
+    selection: Option<(usize, usize)>,
     context: &mut DrawTextContext,
 ) {
     context.glyph_batches.clear();
@@ -2725,6 +2797,7 @@ fn paint_inline_note_row(
     context.deco_boxes.clear();
     context.stack.clear();
     context.path_scratch.clear();
+    let mut selection_rects = Vec::new();
 
     let row_justification_amount = justification_amount + row_fill_amount;
     let row_advance =
@@ -2878,6 +2951,23 @@ fn paint_inline_note_row(
                 run_hanging_extra += hanging_extra;
             }
             let cluster_origin = row_pen;
+            if let Some((selection_start, selection_end)) = selection
+                && cluster_range.start < selection_end
+                && selection_start < cluster_range.end
+            {
+                let inline_start =
+                    inline_origin + cluster_origin + new_before - old_before;
+                let inline_end = inline_start + un_hung_advance;
+                let block_start = inline_box.y + row_block_offset + block_start_inset;
+                let block_end = block_start + row_height;
+                selection_rects.push(note_selection_rect(
+                    vertical,
+                    inline_start,
+                    inline_end,
+                    block_start,
+                    block_end,
+                ));
+            }
             let is_annotation = source.ruby_ranges.iter().any(|annotation| {
                 annotation.start <= cluster_range.start && cluster_range.end <= annotation.end
             });
@@ -3179,6 +3269,19 @@ fn paint_inline_note_row(
                 glyphs: rotated,
             });
         }
+        }
+    }
+
+    if !selection_rects.is_empty() {
+        let selection_transform = inline_run_transform(doc, source.node_id, transform, scale);
+        for rect in selection_rects {
+            scene.fill(
+                Fill::NonZero,
+                selection_transform,
+                SELECTION_COLOR,
+                None,
+                &rect,
+            );
         }
     }
 

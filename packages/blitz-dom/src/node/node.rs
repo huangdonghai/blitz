@@ -1560,6 +1560,15 @@ impl Node {
         if self.flags.is_inline_root() {
             let element_data = &self.element_data().unwrap();
             if let Some(ild) = element_data.inline_layout_data.as_ref() {
+                if let Some((node_id, text_offset)) = ild.note_text_position_at_point(x, y) {
+                    return Some(HitResult {
+                        node_id,
+                        x,
+                        y,
+                        is_text: true,
+                        text_offset: Some(text_offset),
+                    });
+                }
                 let layout = &ild.layout;
                 let scale = layout.scale();
                 // Parley coordinates: transposed for vertical writing modes (see
@@ -1581,6 +1590,7 @@ impl Node {
                             x,
                             y,
                             is_text: true,
+                            text_offset: None,
                         });
                     }
                 }
@@ -1594,6 +1604,7 @@ impl Node {
                 x,
                 y,
                 is_text: false,
+                text_offset: None,
             });
         }
 

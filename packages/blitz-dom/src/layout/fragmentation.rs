@@ -595,6 +595,27 @@ impl BaseDocument {
     pub fn page_box_size(&self) -> Option<Size<f32>> {
         self.page_box.map(|page| page.size)
     }
+
+    /// The flow coordinate under the top-left corner of page `index`'s paper.
+    ///
+    /// A page is drawn from the paper's edge, which sits outside the page area
+    /// the flow was laid out in, and a reversed flow (`vertical-rl`) enters its
+    /// pages from the far edge. Painting moves each band by
+    /// [`BreakPlan::translate`], so the inverse of that translation plus the
+    /// page's position on the canvas is the document coordinate a page image's
+    /// top-left pixel stands for — the offset pointer coordinates need before
+    /// hit testing.
+    pub fn page_flow_origin(&self, index: usize) -> Option<(f32, f32)> {
+        let page = self.page_box?;
+        let plan = self.root_element().break_plan.as_deref()?;
+        let band = plan.bands.get(index)?;
+        let shift = plan.translate(band);
+        let (x, y) = match plan.axis {
+            FlowAxis::Y => (0.0, index as f32 * page.size.height),
+            FlowAxis::X => (index as f32 * page.size.width, 0.0),
+        };
+        Some((x - shift.x, y - shift.y))
+    }
 }
 
 /// The paper one page is printed on, and the margin that keeps content off its edge, in the CSS

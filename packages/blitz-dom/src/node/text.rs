@@ -4,7 +4,10 @@ use blitz_traits::{
     shell::ShellProvider,
 };
 use keyboard_types::{Key, Modifiers, NamedKey};
-use parley::{ContentWidths, FontContext, LayoutContext};
+use parley::{
+    BreakReason, Cluster, ClusterSide, ContentWidths, FontContext, LayoutContext,
+    PositionedLayoutItem,
+};
 
 use crate::util::ACTION_MOD;
 
@@ -431,6 +434,88 @@ impl TextLayout {
         }
     }
 
+    /// Find a note text position at a physical point relative to the inline
+    /// root's content box.
+    ///
+    /// Inline notes and interline notes are separate Parley layouts rather
+    /// than part of the main paragraph's text, so the ordinary inline-root
+    /// hit test cannot see them. Their layout coordinates share the inline
+    /// root's writing-mode axes.
+    pub(crate) fn note_text_position_at_point(&self, x: f32, y: f32) -> Option<(NodeId, usize)> {
+        let (layout_x, layout_y) = self.layout_point(x, y);
+        let scale = self.layout.scale();
+        // The inline boxes and note fragment geometry below are in Parley's
+        // layout units, which carry the layout scale; `layout_point` returns
+        // CSS pixels. Without the scaling a note's hit box sits at the wrong
+        // place whenever the layout is not at 1:1 (every HiDPI window), and a
+        // click on the note lands on the body text that happens to be there.
+        let (note_x, note_y) = (layout_x * scale, layout_y * scale);
+
+        if let Some(stream) = self.interline.as_ref()
+            && let Some((cluster, side)) = Cluster::from_point_exact(
+                &stream.layout,
+                layout_x * scale,
+                layout_y * scale,
+            )
+        {
+            let range = cluster.text_range();
+            if let Some(source) = stream.sources.iter().find(|source| {
+                source.active
+                    && source.text_range.start <= range.start
+                    && range.end <= source.text_range.end
+            }) {
+                let offset = cluster_offset(&cluster, side);
+                return Some((
+                    source.node_id,
+                    offset.saturating_sub(source.text_range.start),
+                ));
+            }
+        }
+
+        for line in self.layout.lines() {
+            for item in line.items() {
+                let PositionedLayoutItem::InlineBox(inline_box) = item else {
+                    continue;
+                };
+                if inline_box.kind != parley::InlineBoxKind::CustomInFlowCentered {
+                    continue;
+                }
+                let Some(Some(fragment)) = self.inline_note_fragments.get(inline_box.index)
+                else {
+                    continue;
+                };
+                if note_x < inline_box.x
+                    || note_x > inline_box.x + inline_box.width
+                    || note_y < inline_box.y
+                    || note_y > inline_box.y + inline_box.height
+                {
+                    continue;
+                }
+                let Some(source) = self.inline_notes.get(fragment.source_index) else {
+                    continue;
+                };
+                let Some(segment) = source.segments.get(fragment.segment_index) else {
+                    continue;
+                };
+                let Some(source_line) = source.layout.get(segment.line_index) else {
+                    continue;
+                };
+                if let Some(offset) = inline_note_offset(
+                    source,
+                    fragment,
+                    &source_line,
+                    &inline_box,
+                    note_x,
+                    note_y,
+                ) {
+                    return Some((source.node_id, offset));
+                }
+            }
+        }
+
+        None
+    }
+
     pub fn new() -> Self {
         Default::default()
     }
@@ -440,6 +525,98 @@ impl TextLayout {
             .content_widths
             .get_or_insert_with(|| self.layout.calculate_content_widths())
     }
+}
+
+fn cluster_offset(cluster: &Cluster<'_, TextBrush>, side: ClusterSide) -> usize {
+    let is_leading = side == ClusterSide::Left;
+    if cluster.is_rtl() {
+        if is_leading {
+            cluster.text_range().end
+        } else {
+            cluster.text_range().start
+        }
+    } else if is_leading || cluster.is_line_break() == Some(BreakReason::Explicit) {
+        cluster.text_range().start
+    } else {
+        cluster.text_range().end
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn inline_note_offset(
+    source: &InlineNoteSource,
+    fragment: &InlineNoteFragment,
+    source_line: &parley::layout::Line<'_, TextBrush>,
+    inline_box: &parley::layout::PositionedInlineBox,
+    layout_x: f32,
+    layout_y: f32,
+) -> Option<usize> {
+    let (range, shaped_clusters, row_advance, row_block_offset, row_height, hanging_advance) =
+        if layout_y < inline_box.y + fragment.first_line_height {
+            (
+                &fragment.first_range,
+                &fragment.first_shaped_clusters,
+                fragment.first_advance,
+                0.0,
+                fragment.first_line_height,
+                fragment.first_hanging_advance,
+            )
+        } else {
+            (
+                &fragment.second_range,
+                &fragment.second_shaped_clusters,
+                fragment.second_advance,
+                fragment.first_line_height,
+                fragment.second_line_height,
+                fragment.second_hanging_advance,
+            )
+        };
+    if layout_y < inline_box.y + row_block_offset
+        || layout_y > inline_box.y + row_block_offset + row_height
+    {
+        return None;
+    }
+
+    let content_width = (inline_box.width - fragment.inline_start_edge - fragment.inline_end_edge)
+        .max(0.0);
+    let inline_origin = if source.layout.is_rtl() {
+        inline_box.x + fragment.inline_end_edge + (content_width - row_advance).max(0.0)
+            - hanging_advance
+    } else {
+        inline_box.x + fragment.inline_start_edge
+    };
+    let target = layout_x - inline_origin;
+    let mut pen = 0.0;
+    let mut last_end = range.start;
+
+    for item in source_line.items() {
+        let PositionedLayoutItem::GlyphRun(run) = item else {
+            continue;
+        };
+        for cluster in run.visual_clusters() {
+            let cluster_range = cluster.text_range();
+            if cluster_range.start < range.start
+                || cluster_range.end > range.end
+                || !shaped_clusters.contains(&cluster.shaped_clusters_range().start)
+            {
+                continue;
+            }
+            let advance = cluster.advance();
+            let cluster_end = pen + advance;
+            last_end = cluster_range.end;
+            if target <= cluster_end {
+                let side = if target < pen + advance * 0.5 {
+                    ClusterSide::Left
+                } else {
+                    ClusterSide::Right
+                };
+                return Some(cluster_offset(&cluster, side));
+            }
+            pen = cluster_end;
+        }
+    }
+
+    Some(if target <= 0.0 { range.start } else { last_end })
 }
 
 impl std::fmt::Debug for TextLayout {
