@@ -156,11 +156,37 @@ pub fn walk_tree(indent: usize, node: &Node) {
 /// Parse an SVG image.
 #[cfg(feature = "svg")]
 pub(crate) fn parse_svg_image(source: &[u8]) -> Result<crate::node::SvgImageData, usvg::Error> {
+    parse_svg_image_with_resources(source, None)
+}
+
+#[cfg(feature = "svg")]
+pub(crate) fn parse_svg_image_with_resources(
+    source: &[u8],
+    resources_dir: Option<std::path::PathBuf>,
+) -> Result<crate::node::SvgImageData, usvg::Error> {
     let options = usvg::Options {
+        resources_dir,
         fontdb: Arc::clone(&*FONT_DB),
         ..Default::default()
     };
     crate::node::SvgImageData::from_data(source, &options)
+}
+
+/// Resolve the directory used for relative references inside an inline SVG.
+#[cfg(feature = "svg")]
+pub(crate) fn svg_resources_dir(url: &url::Url) -> Option<std::path::PathBuf> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        url.to_file_path()
+            .ok()?
+            .parent()
+            .map(std::path::Path::to_path_buf)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = url;
+        None
+    }
 }
 
 pub trait ToColorColor {
@@ -179,7 +205,44 @@ impl ToColorColor for AbsoluteColor {
 
 #[cfg(all(test, feature = "svg"))]
 mod svg_tests {
-    use super::parse_svg_image;
+    use super::{parse_svg_image, parse_svg_image_with_resources, svg_resources_dir};
+
+    #[test]
+    fn relative_image_href_resolves_from_the_document_url() {
+        use std::{fs, path::PathBuf};
+
+        let scratch = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../_scratch/svg-relative-image-")
+            .join(std::process::id().to_string());
+        let text_dir = scratch.join("OEBPS/Text");
+        let images_dir = scratch.join("OEBPS/Images");
+        fs::create_dir_all(&text_dir).unwrap();
+        fs::create_dir_all(&images_dir).unwrap();
+        fs::write(
+            images_dir.join("cover.png"),
+            include_bytes!("../../../examples/assets/square.png"),
+        )
+        .unwrap();
+
+        let document_path = text_dir.join("cover_page.xhtml");
+        let document_url = url::Url::from_file_path(document_path).unwrap();
+        let svg_source = br#"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" viewBox="0 0 10 10"><image width="10" height="10" xlink:href="../Images/cover.png"/></svg>"#;
+        let svg = parse_svg_image_with_resources(
+            svg_source,
+            svg_resources_dir(&document_url),
+        )
+        .unwrap();
+        fn contains_image(nodes: &[usvg::Node]) -> bool {
+            nodes.iter().any(|node| match node {
+                usvg::Node::Image(_) => true,
+                usvg::Node::Group(group) => contains_image(group.children()),
+                _ => false,
+            })
+        }
+        assert!(contains_image(svg.tree.root().children()));
+
+        fs::remove_dir_all(scratch).unwrap();
+    }
 
     #[test]
     fn svg_without_xmlns_parses() {
