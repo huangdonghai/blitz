@@ -96,12 +96,12 @@ pub use config::{DocumentConfig, StyleThreading};
 pub use document::{
     BaseDocument, BoundingRect, DocGuard, DocGuardMut, Document, PlainDocument, UserAgentStylesheet,
 };
+pub use layout::fragmentation::{Band, BreakPlan, FlowAxis, PagePaintMembership};
 pub use markup5ever::{
     LocalName, Namespace, NamespaceStaticSet, Prefix, PrefixStaticSet, QualName, local_name,
     namespace_prefix, namespace_url, ns,
 };
 pub use mutator::DocumentMutator;
-pub use layout::fragmentation::{Band, BreakPlan, FlowAxis, PagePaintMembership};
 pub use node::{Attribute, DocumentData, ElementData, Node, NodeData, TextNodeData};
 pub use parley::FontContext;
 pub use scrolling::{ScrollBehavior, ScrollLogicalPosition};
@@ -153,6 +153,8 @@ pub fn build_single_font_ctx(font_data: &[u8]) -> FontContext {
         GenericFamily::Serif,
         GenericFamily::Monospace,
         GenericFamily::SystemUi,
+        GenericFamily::FangSong,
+        GenericFamily::Kai,
     ] {
         ctx.collection
             .append_generic_families(generic, family_ids.iter().copied());

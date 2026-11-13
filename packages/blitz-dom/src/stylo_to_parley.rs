@@ -28,6 +28,7 @@ pub(crate) mod stylo {
     pub(crate) use style::values::computed::TextAutospace;
     pub(crate) use style::values::computed::TextSpacingTrim;
     pub(crate) use style::values::computed::WordBreak;
+    pub(crate) use style::values::computed::font::FontFamilyNameSyntax;
     pub(crate) use style::values::computed::font::FontFeatureSettings;
     pub(crate) use style::values::computed::font::FontStyle;
     pub(crate) use style::values::computed::font::FontVariantEastAsian;
@@ -66,9 +67,20 @@ pub(crate) fn generic_font_family(input: stylo::GenericFontFamily) -> parley::Ge
     }
 }
 
+fn generic_family_name(input: &str) -> parley::GenericFamily {
+    match input {
+        "kai" => parley::GenericFamily::Kai,
+        "fangsong" => parley::GenericFamily::FangSong,
+        _ => unreachable!("Stylo only parses supported generic() names"),
+    }
+}
+
 pub(crate) fn query_font_family(input: &stylo::SingleFontFamily) -> parley::QueryFamily<'_> {
     match input {
         stylo::SingleFontFamily::FamilyName(name) => {
+            if name.syntax == stylo::FontFamilyNameSyntax::Generic {
+                return parley::QueryFamily::Generic(generic_family_name(name.name.as_str()));
+            }
             'ret: {
                 let name = name.name.as_str();
 
@@ -145,16 +157,23 @@ fn face_features_for<'a>(
     if face_features.is_empty() {
         return None;
     }
-    let first = style
-        .get_font()
-        .font_family
-        .families
-        .list
-        .iter()
-        .find_map(|family| match family {
-            stylo::SingleFontFamily::FamilyName(name) => Some(name.name.as_str()),
-            stylo::SingleFontFamily::Generic(_) => None,
-        })?;
+    let first =
+        style
+            .get_font()
+            .font_family
+            .families
+            .list
+            .iter()
+            .find_map(|family| match family {
+                stylo::SingleFontFamily::FamilyName(name)
+                    if name.syntax != stylo::FontFamilyNameSyntax::Generic =>
+                {
+                    Some(name.name.as_str())
+                }
+                stylo::SingleFontFamily::FamilyName(_) | stylo::SingleFontFamily::Generic(_) => {
+                    None
+                }
+            })?;
     let first = first.to_ascii_lowercase();
     face_features
         .iter()
@@ -704,24 +723,28 @@ pub(crate) fn style(
         .iter()
         .map(|family| match family {
             stylo::SingleFontFamily::FamilyName(name) => {
-                'ret: {
-                    let name = name.name.as_str();
+                if name.syntax == stylo::FontFamilyNameSyntax::Generic {
+                    parley::FontFamilyName::Generic(generic_family_name(name.name.as_str()))
+                } else {
+                    'ret: {
+                        let name = name.name.as_str();
 
-                    // Legacy web compatibility
-                    #[cfg(target_vendor = "apple")]
-                    if name == "-apple-system" {
-                        break 'ret parley::FontFamilyName::Generic(
-                            parley::GenericFamily::SystemUi,
-                        );
-                    }
-                    #[cfg(target_os = "macos")]
-                    if name == "BlinkMacSystemFont" {
-                        break 'ret parley::FontFamilyName::Generic(
-                            parley::GenericFamily::SystemUi,
-                        );
-                    }
+                        // Legacy web compatibility
+                        #[cfg(target_vendor = "apple")]
+                        if name == "-apple-system" {
+                            break 'ret parley::FontFamilyName::Generic(
+                                parley::GenericFamily::SystemUi,
+                            );
+                        }
+                        #[cfg(target_os = "macos")]
+                        if name == "BlinkMacSystemFont" {
+                            break 'ret parley::FontFamilyName::Generic(
+                                parley::GenericFamily::SystemUi,
+                            );
+                        }
 
-                    break 'ret parley::FontFamilyName::Named(Cow::Owned(name.to_string()));
+                        break 'ret parley::FontFamilyName::Named(Cow::Owned(name.to_string()));
+                    }
                 }
             }
             stylo::SingleFontFamily::Generic(generic) => {
@@ -819,6 +842,15 @@ mod tests {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         )
+    }
+
+    #[test]
+    fn css_generic_function_families_map_to_parley_generics() {
+        assert_eq!(generic_family_name("kai"), parley::GenericFamily::Kai);
+        assert_eq!(
+            generic_family_name("fangsong"),
+            parley::GenericFamily::FangSong
+        );
     }
 
     #[test]

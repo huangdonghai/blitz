@@ -47,7 +47,9 @@ pub struct DocumentConfig {
     pub shell_provider: Option<Arc<dyn ShellProvider>>,
     /// HTML parser provider. Used to parse HTML for setInnerHTML
     pub html_parser_provider: Option<Arc<dyn HtmlParserProvider>>,
-    /// Parley `FontContext`
+    /// Parley `FontContext`. Use its collection's `set_generic_families` to
+    /// choose the available font families used by CSS `generic(kai)` and
+    /// `generic(fangsong)`.
     pub font_ctx: Option<FontContext>,
     /// The CSS media type used to evaluate `@media` rules.
     /// Defaults to [`MediaType::screen`].
