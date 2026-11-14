@@ -48,7 +48,7 @@ impl core::fmt::Debug for BlitzFontMetricsProvider {
 impl FontMetricsProvider for BlitzFontMetricsProvider {
     fn query_font_metrics(
         &self,
-        _vertical: bool,
+        vertical: bool,
         font_styles: &FontStyles,
         font_size: CSSPixelLength,
         _flags: QueryFontMetricsFlags,
@@ -56,6 +56,7 @@ impl FontMetricsProvider for BlitzFontMetricsProvider {
         use parley::fontique::{Query, QueryFont, QueryStatus};
         use skrifa::instance::{LocationRef, Size};
         use skrifa::metrics::{GlyphMetrics, Metrics};
+        use skrifa::raw::TableProvider as _;
 
         // Lock font_ctx. Explicit reborrow required for borrow checker.
         let mut font_ctx = self.font_ctx.lock().unwrap();
@@ -104,11 +105,16 @@ impl FontMetricsProvider for BlitzFontMetricsProvider {
         /// Scales the advance the same way as Parley's shaped glyph advances (font units × size / upem)
         /// rather than with skrifa's FreeType-compatible fixed-point scale, so that `ch`/`ic`
         /// lengths exactly match the width of the corresponding laid-out text.
+        ///
+        /// `vertical` selects the advance along the vertical axis (the `vmtx` advance) instead of
+        /// the horizontal one. Parley's upright vertical layout reads the same table, so `ic` and
+        /// `ih` stay in step with the laid-out text.
         fn advance_of(
             query: &mut Query,
             ch: char,
             font_size: f32,
             variations: &[FontVariation],
+            vertical: bool,
         ) -> Option<f32> {
             let font = find_font_for(query, ch)?;
             let font_ref = skrifa::FontRef::from_index(font.blob.as_ref(), font.index).ok()?;
@@ -125,7 +131,14 @@ impl FontMetricsProvider for BlitzFontMetricsProvider {
             let glyph_metrics = GlyphMetrics::new(&font_ref, Size::unscaled(), location_ref);
             let char_map = Charmap::new(&font_ref);
             let glyph_id = char_map.map(ch)?;
-            let advance = glyph_metrics.advance_width(glyph_id)?;
+            let advance = if vertical {
+                // Vertical advances are not exposed by `GlyphMetrics`; read `vmtx` directly, as
+                // Parley's `set_vertical_advances` does. A font without vertical metrics has no
+                // vertical advance here, so the caller falls back to 1em.
+                font_ref.vmtx().ok()?.advance(glyph_id)? as f32
+            } else {
+                glyph_metrics.advance_width(glyph_id)?
+            };
             Some(advance * (font_size / upem as f32))
         }
 
@@ -147,8 +160,14 @@ impl FontMetricsProvider for BlitzFontMetricsProvider {
             Some((metrics.ascent, metrics.x_height, metrics.cap_height))
         }
 
-        let zero_advance = advance_of(&mut query, '0', font_size.px(), &variations);
-        let ic_advance = advance_of(&mut query, '\u{6C34}', font_size.px(), &variations);
+        let zero_advance = advance_of(&mut query, '0', font_size.px(), &variations, vertical);
+        let ic_advance = advance_of(
+            &mut query,
+            '\u{6C34}',
+            font_size.px(),
+            &variations,
+            vertical,
+        );
         let (ascent, x_height, cap_height) =
             metrics_of(&mut query, ' ', Size::new(font_size.px()), &variations)
                 .unwrap_or((0.0, None, None));
