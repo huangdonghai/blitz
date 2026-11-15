@@ -1050,7 +1050,12 @@ impl ElementCx<'_, '_> {
                 .get_node(cell.node_id)
                 .map(|node| node.final_layout())
             {
-                row_cell_start[cell.row as usize].get_or_insert(layout.location.y);
+                // A table-cell that is a direct child of the table (no row box)
+                // can carry a row index with no entry in `table.rows`; its row
+                // start is unknown for the border-outside check.
+                if let Some(start) = row_cell_start.get_mut(cell.row as usize) {
+                    start.get_or_insert(layout.location.y);
+                }
             }
         }
         let row_outside = |index: usize| {
