@@ -12,7 +12,7 @@ use style::{
     data::ElementData as StyloElementData,
     shared_lock::StylesheetGuards,
     values::{
-        computed::{Content, ContentItem, Display, Float},
+        computed::{Content, ContentItem, Display, Float, RubyPosition},
         specified::box_::{DisplayInside, DisplayOutside},
     },
 };
@@ -24,8 +24,8 @@ use crate::{
         CONSTRUCT_BOX, CONSTRUCT_DESCENDENT, CONSTRUCT_FC, sort_layout_children_by_order,
     },
     node::{
-        ListItemLayout, ListItemLayoutPosition, Marker, NodeFlags, NodeKind, SpecialElementData,
-        TextBrush, TextInputData, TextLayout,
+        ListItemLayout, ListItemLayoutPosition, Marker, NodeFlags, NodeKind, RubyPair, RubySide,
+        SpecialElementData, TextBrush, TextInputData, TextLayout,
     },
     qual_name, stylo_to_parley,
     traversal::{iter_children, iter_children_and_pseudos},
@@ -1062,15 +1062,77 @@ pub(crate) fn queue_anonymous_inline_root(doc: &mut BaseDocument, node_id: NodeI
         .replace(Some(layout_children));
 }
 
-/// Where the ruby annotations are in the text being built.
-///
-/// An annotation is part of the inline content — it has to be shaped like any other text — but
-/// it takes no room in the line, so the layout only needs to know which bytes it covers.
+/// Ruby structure recorded while an inline formatting context is flattened into Parley text.
 #[derive(Default)]
 struct RubyBuild {
     text_len: usize,
     ranges: Vec<std::ops::Range<usize>>,
+    pairs: Vec<RubyPair>,
     emphasis: Vec<(std::ops::Range<usize>, crate::util::Color)>,
+    containers: Vec<RubyBuildContainer>,
+    annotation_depth: usize,
+}
+
+struct RubyBuildContainer {
+    position: RubyPosition,
+    pending_base: Vec<std::ops::Range<usize>>,
+    last_base: Vec<std::ops::Range<usize>>,
+    next_annotation_level: usize,
+    implicit_annotation_level: Option<usize>,
+}
+
+impl RubyBuild {
+    fn record_base_range(&mut self, range: std::ops::Range<usize>) {
+        if self.annotation_depth == 0
+            && let Some(container) = self.containers.last_mut()
+            && !range.is_empty()
+        {
+            container.pending_base.push(range);
+        }
+    }
+
+    fn record_annotation(
+        &mut self,
+        range: std::ops::Range<usize>,
+        level: usize,
+        position: RubyPosition,
+    ) {
+        let Some(container) = self.containers.last_mut() else {
+            return;
+        };
+        if container.pending_base.is_empty() {
+            container.pending_base.clone_from(&container.last_base);
+        } else {
+            container.last_base.clone_from(&container.pending_base);
+        }
+        if container.pending_base.is_empty() || range.is_empty() {
+            return;
+        }
+
+        let side = match position {
+            RubyPosition::Over => RubySide::Over,
+            RubyPosition::Under => RubySide::Under,
+            RubyPosition::AlternateOver if level % 2 == 0 => RubySide::Over,
+            RubyPosition::AlternateOver => RubySide::Under,
+            RubyPosition::AlternateUnder if level % 2 == 0 => RubySide::Under,
+            RubyPosition::AlternateUnder => RubySide::Over,
+        };
+        if let Some(previous) = self.pairs.last_mut()
+            && previous.base_ranges == container.pending_base
+            && previous.side == side
+            && previous.annotation_range.end == range.start
+        {
+            previous.annotation_range.end = range.end;
+            container.pending_base.clear();
+            return;
+        }
+        self.pairs.push(RubyPair {
+            base_ranges: container.pending_base.clone(),
+            annotation_range: range,
+            side,
+        });
+        container.pending_base.clear();
+    }
 }
 
 /// The character an element's `text-emphasis-style` asks for, if any.
@@ -1719,6 +1781,14 @@ pub(crate) fn build_inline_layout_into(
             .layout
             .clear_advances(&note_layout.text, &note_layout.ruby_ranges);
         note_layout.layout.break_all_lines(None);
+        let note_writing_mode = nodes[note_node_id].writing_mode();
+        note_layout.ruby_placements = super::inline::resolve_ruby_placements(
+            &note_layout.layout,
+            &note_layout.ruby_pairs,
+            note_writing_mode
+                .is_vertical()
+                .then_some(!note_writing_mode.is_vertical_lr()),
+        );
         let segments = inline_note_segments(
             &note_layout.layout,
             &note_layout.text,
@@ -1765,6 +1835,8 @@ pub(crate) fn build_inline_layout_into(
             text: note_layout.text,
             layout: note_layout.layout,
             ruby_ranges: note_layout.ruby_ranges,
+            ruby_pairs: note_layout.ruby_pairs,
+            ruby_placements: note_layout.ruby_placements,
             emphasis_ranges: note_layout.emphasis_ranges,
             segments,
             strut_line_height,
@@ -1895,6 +1967,8 @@ pub(crate) fn build_inline_layout_into(
                 text: stream_layout.text,
                 layout: stream_layout.layout,
                 ruby_ranges: stream_layout.ruby_ranges,
+                ruby_pairs: stream_layout.ruby_pairs,
+                ruby_placements: stream_layout.ruby_placements,
                 emphasis_ranges: stream_layout.emphasis_ranges,
                 sources,
             });
@@ -2069,6 +2143,7 @@ fn build_inline_layout_into_inner(
         });
         text_layout.text = builder.build_into(&mut text_layout.layout);
         text_layout.ruby_ranges = ruby.ranges;
+        text_layout.ruby_pairs = ruby.pairs;
         text_layout.emphasis_ranges = ruby.emphasis;
         return;
     }
@@ -2149,6 +2224,7 @@ fn build_inline_layout_into_inner(
 
     text_layout.text = builder.build_into(&mut text_layout.layout);
     text_layout.ruby_ranges = ruby.ranges;
+    text_layout.ruby_pairs = ruby.pairs;
     text_layout.emphasis_ranges = ruby.emphasis;
 
     /// Walk one node, recording the byte range of a ruby annotation's text around it.
@@ -2165,10 +2241,56 @@ fn build_inline_layout_into_inner(
         forced_vertical: Option<bool>,
         face_features: &stylo_to_parley::FaceFeatures,
     ) {
-        let is_annotation = nodes[node_id]
+        let element_name = nodes[node_id]
             .element_data()
-            .is_some_and(|element| matches!(&*element.name.local, "rt" | "rtc"));
-        let start = is_annotation.then(|| builder.text().len());
+            .map(|element| element.name.local.as_ref());
+        let is_ruby = element_name == Some("ruby");
+        let is_annotation_container = matches!(element_name, Some("rt" | "rtc"));
+        let capture_annotation = is_annotation_container && ruby.annotation_depth == 0;
+        let annotation_start = capture_annotation.then(|| builder.text().len());
+        let annotation_position = capture_annotation.then(|| {
+            nodes[node_id]
+                .primary_styles()
+                .map(|styles| styles.get_inherited_text().ruby_position)
+                .or_else(|| ruby.containers.last().map(|container| container.position))
+                .unwrap_or(RubyPosition::AlternateOver)
+        });
+        let annotation_level = if capture_annotation {
+            ruby.containers.last_mut().map_or(0, |container| {
+                if element_name == Some("rtc") {
+                    let level = container.next_annotation_level;
+                    container.next_annotation_level += 1;
+                    level
+                } else if let Some(level) = container.implicit_annotation_level {
+                    level
+                } else {
+                    let level = container.next_annotation_level;
+                    container.next_annotation_level += 1;
+                    container.implicit_annotation_level = Some(level);
+                    level
+                }
+            })
+        } else {
+            0
+        };
+
+        if is_ruby {
+            let position = nodes[node_id]
+                .primary_styles()
+                .map(|styles| styles.get_inherited_text().ruby_position)
+                .unwrap_or(RubyPosition::AlternateOver);
+            ruby.containers.push(RubyBuildContainer {
+                position,
+                pending_base: Vec::new(),
+                last_base: Vec::new(),
+                next_annotation_level: 0,
+                implicit_annotation_level: None,
+            });
+        }
+        if is_annotation_container {
+            ruby.annotation_depth += 1;
+        }
+
         build_inline_layout_node(
             builder,
             text_transformer,
@@ -2182,8 +2304,21 @@ fn build_inline_layout_into_inner(
             forced_vertical,
             face_features,
         );
-        if let Some(start) = start {
-            ruby.ranges.push(start..builder.text().len());
+
+        if is_annotation_container {
+            ruby.annotation_depth -= 1;
+        }
+        if let Some(start) = annotation_start {
+            let range = start..builder.text().len();
+            ruby.ranges.push(range.clone());
+            ruby.record_annotation(
+                range,
+                annotation_level,
+                annotation_position.unwrap_or(RubyPosition::AlternateOver),
+            );
+        }
+        if is_ruby {
+            ruby.containers.pop();
         }
     }
 
@@ -2592,7 +2727,10 @@ fn build_inline_layout_into_inner(
                     .filter(|style| !style.clone_display().is_contents())
                     .and_then(|style| emphasis_char(style));
                 let Some(mark) = emphasis else {
+                    let start = builder.text().len();
                     builder.push_text(text);
+                    let end = builder.text().len();
+                    ruby.record_base_range(start..end);
                     ruby.text_len += text.len();
                     return;
                 };
@@ -2622,7 +2760,10 @@ fn build_inline_layout_into_inner(
                 for character in text.chars() {
                     let mut scratch = [0u8; 4];
                     let piece = character.encode_utf8(&mut scratch);
+                    let start = builder.text().len();
                     builder.push_text(piece);
+                    let end = builder.text().len();
+                    ruby.record_base_range(start..end);
                     ruby.text_len += piece.len();
                     use icu_properties::props::GeneralCategory as Category;
                     if character.is_whitespace()

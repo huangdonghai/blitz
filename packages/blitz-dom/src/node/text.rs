@@ -24,6 +24,32 @@ impl TextBrush {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RubySide {
+    Over,
+    Under,
+}
+
+#[derive(Clone, Debug)]
+pub struct RubyPair {
+    /// Text ranges forming the base container.
+    pub base_ranges: Vec<std::ops::Range<usize>>,
+    /// Text range forming this annotation container.
+    pub annotation_range: std::ops::Range<usize>,
+    /// The side selected by `ruby-position` for this annotation level.
+    pub side: RubySide,
+}
+
+#[derive(Clone, Debug)]
+pub struct RubyPlacement {
+    pub annotation_range: std::ops::Range<usize>,
+    pub line_index: usize,
+    /// Inline-axis shift from the shaped annotation's natural origin.
+    pub inline_offset: f32,
+    /// Block-axis shift applied to the positioned annotation glyphs.
+    pub block_offset: f32,
+}
+
 #[derive(Clone, Default)]
 pub struct TextLayout {
     pub text: String,
@@ -56,12 +82,13 @@ pub struct TextLayout {
     /// containing block (as `SPAN_*_CB` flags). The inline root claims those boxes in its place.
     /// Set by each `RunMode::PerformLayout` run of inline layout.
     pub span_cb_flags: stylo_taffy::StyleFlags,
-    /// Byte ranges of the text that belongs to ruby annotations (`<rt>`, `<rtc>`).
-    ///
-    /// An annotation is drawn but takes no room in the line: its advances are cleared before
-    /// breaking (see [`parley::layout::Layout::clear_advances`]), and the painter lifts it above
-    /// the character it annotates.
+    /// Byte ranges of text that is drawn without taking inline advance, including `<rt>` and
+    /// text-emphasis marks. Advances are cleared before line breaking.
     pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    /// Ruby base/annotation relationships collected from the DOM tree.
+    pub ruby_pairs: Vec<RubyPair>,
+    /// Per-line placements resolved from the final inline layout.
+    pub ruby_placements: Vec<RubyPlacement>,
     /// Byte ranges of emphasis marks, with the colour `text-emphasis-color` gives them.
     ///
     /// The marks are shaped like text, so the painter needs to know which runs to paint in the
@@ -84,6 +111,8 @@ pub struct InlineNoteSource {
     pub text: String,
     pub layout: parley::layout::Layout<TextBrush>,
     pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    pub ruby_pairs: Vec<RubyPair>,
+    pub ruby_placements: Vec<RubyPlacement>,
     pub emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
     pub segments: Vec<InlineNoteSegment>,
     pub strut_line_height: f32,
@@ -228,6 +257,8 @@ pub struct InterlineNoteStream {
     pub text: String,
     pub layout: parley::layout::Layout<TextBrush>,
     pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    pub ruby_pairs: Vec<RubyPair>,
+    pub ruby_placements: Vec<RubyPlacement>,
     pub emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
     pub sources: Vec<InterlineNoteSource>,
 }
@@ -308,6 +339,8 @@ pub struct MarginNoteGroup {
     pub text: String,
     pub layout: parley::layout::Layout<TextBrush>,
     pub ruby_ranges: Vec<std::ops::Range<usize>>,
+    pub ruby_pairs: Vec<RubyPair>,
+    pub ruby_placements: Vec<RubyPlacement>,
     pub emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
     /// Physical translation from the inline root's content origin to the note's
     /// content box, in CSS pixels along the root's inline axis.

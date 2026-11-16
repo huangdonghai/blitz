@@ -9,7 +9,8 @@ use crate::layout::construct::build_margin_note_content_layout;
 use crate::layout::fragmentation::{BreakPlan, FlowAxis};
 use crate::layout::resolve_calc_value;
 use crate::node::{
-    MarginNoteGroup, MarginNotePageFragment, MarginNoteRect, MarginNoteSide, TextBrush, TextLayout,
+    MarginNoteGroup, MarginNotePageFragment, MarginNoteRect, MarginNoteSide, RubyPair,
+    RubyPlacement, TextBrush, TextLayout,
 };
 use crate::stylo_to_parley;
 use crate::{BaseDocument, NodeId};
@@ -85,6 +86,8 @@ struct Plan {
     text: String,
     layout: parley::layout::Layout<TextBrush>,
     ruby_ranges: Vec<std::ops::Range<usize>>,
+    ruby_pairs: Vec<RubyPair>,
+    ruby_placements: Vec<RubyPlacement>,
     emphasis_ranges: Vec<(std::ops::Range<usize>, crate::util::Color)>,
 }
 
@@ -1002,6 +1005,11 @@ pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
                 ),
             },
         );
+        let ruby_placements = super::inline::resolve_ruby_placements(
+            &note.content.layout,
+            &note.content.ruby_pairs,
+            note.wm.is_vertical().then_some(!note.wm.is_vertical_lr()),
+        );
         let mut content_block = content_extent(
             note.declared_block,
             note.content.layout.height() / scale,
@@ -1046,6 +1054,8 @@ pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
             text: note.content.text,
             layout: note.content.layout,
             ruby_ranges: note.content.ruby_ranges,
+            ruby_pairs: note.content.ruby_pairs,
+            ruby_placements,
             emphasis_ranges: note.content.emphasis_ranges,
         });
     }
@@ -1202,6 +1212,8 @@ pub(crate) fn resolve_margin_notes(doc: &mut BaseDocument) {
             text: std::mem::take(&mut plan.text),
             layout: std::mem::take(&mut plan.layout),
             ruby_ranges: std::mem::take(&mut plan.ruby_ranges),
+            ruby_pairs: std::mem::take(&mut plan.ruby_pairs),
+            ruby_placements: std::mem::take(&mut plan.ruby_placements),
             emphasis_ranges: std::mem::take(&mut plan.emphasis_ranges),
             inline_dx,
             inline_dy,

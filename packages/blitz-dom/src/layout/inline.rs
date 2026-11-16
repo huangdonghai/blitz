@@ -24,7 +24,7 @@ use crate::layout::LayoutPassState;
 use crate::node::{TextOrientation, VerticalTextPaint};
 use crate::node::{
     InlineNoteFragment, InlineNoteSource, InterlineAnchor, InterlineLine, InterlineNoteStream,
-    InterlinePart,
+    InterlinePart, RubyPair, RubyPlacement, RubySide, TextBrush,
 };
 use crate::stylo_to_parley;
 
@@ -55,6 +55,136 @@ fn text_orientation(sideways: bool, upright: bool) -> TextOrientation {
     } else {
         TextOrientation::Mixed
     }
+}
+
+/// Resolve each ruby annotation against the inline box geometry of its base and annotation
+/// spans. The returned offsets are relative to the current line, so later line-block shifts
+/// and the writing-mode transform apply to base and annotation together.
+pub(super) fn resolve_ruby_placements(
+    layout: &parley::layout::Layout<TextBrush>,
+    pairs: &[RubyPair],
+    block_axis_starts_at_right: Option<bool>,
+) -> Vec<RubyPlacement> {
+    struct AnnotationRun {
+        range: std::ops::Range<usize>,
+        natural_start: f32,
+        width: f32,
+    }
+
+    let mut placements = Vec::new();
+    for pair in pairs {
+        for (line_index, line) in layout.lines().enumerate() {
+            let line_range = line.text_range();
+            let has_base_on_line = pair.base_ranges.iter().any(|base| {
+                base.start < line_range.end && line_range.start < base.end
+            });
+            let has_annotation_on_line = pair.annotation_range.start < line_range.end
+                && line_range.start < pair.annotation_range.end;
+            if !has_base_on_line && !has_annotation_on_line {
+                continue;
+            }
+            let mut base_top = f32::INFINITY;
+            let mut base_bottom = f32::NEG_INFINITY;
+            let mut base_inline_start = f32::INFINITY;
+            let mut base_inline_end = f32::NEG_INFINITY;
+            let mut annotation_top = f32::INFINITY;
+            let mut annotation_bottom = f32::NEG_INFINITY;
+            let mut annotation_runs = Vec::new();
+
+            for item in line.items() {
+                let parley::PositionedLayoutItem::GlyphRun(glyph_run) = item else {
+                    continue;
+                };
+                let metrics = glyph_run.run().font_metrics();
+                // Ruby base and annotation margin boxes enclose their font content areas. The
+                // span's positive half-leading belongs to ordinary line construction, not the
+                // no-gap stack between ruby containers.
+                let (over, under) = (metrics.ascent, metrics.descent);
+                let baseline = glyph_run.baseline();
+                let mut pen = glyph_run.offset();
+                let mut run_start = usize::MAX;
+                let mut run_end = 0usize;
+                let mut has_annotation = false;
+
+                for cluster in glyph_run.visual_clusters() {
+                    let range = cluster.text_range();
+                    let is_base = pair
+                        .base_ranges
+                        .iter()
+                        .any(|base| base.start <= range.start && range.start < base.end);
+                    let is_annotation = pair.annotation_range.start <= range.start
+                        && range.start < pair.annotation_range.end;
+                    if is_base {
+                        base_top = base_top.min(baseline - over);
+                        base_bottom = base_bottom.max(baseline + under);
+                        base_inline_start = base_inline_start.min(pen);
+                        base_inline_end = base_inline_end.max(pen + cluster.advance());
+                    }
+                    if is_annotation {
+                        has_annotation = true;
+                        annotation_top = annotation_top.min(baseline - over);
+                        annotation_bottom = annotation_bottom.max(baseline + under);
+                        run_start = run_start.min(range.start);
+                        run_end = run_end.max(range.end);
+                    }
+                    pen += cluster.advance();
+                }
+
+                if has_annotation && run_start < run_end {
+                    let (natural_start, natural_end) = glyph_run.positioned_glyphs().fold(
+                        (f32::INFINITY, f32::NEG_INFINITY),
+                        |(start, end), glyph| {
+                            (start.min(glyph.x), end.max(glyph.x + glyph.advance))
+                        },
+                    );
+                    if natural_start.is_finite() && natural_end.is_finite() {
+                        annotation_runs.push(AnnotationRun {
+                            range: run_start..run_end,
+                            natural_start,
+                            width: (natural_end - natural_start).max(0.0),
+                        });
+                    }
+                }
+            }
+
+            if !base_top.is_finite()
+                || !base_bottom.is_finite()
+                || !base_inline_start.is_finite()
+                || !base_inline_end.is_finite()
+                || !annotation_top.is_finite()
+                || !annotation_bottom.is_finite()
+                || annotation_runs.is_empty()
+            {
+                continue;
+            }
+
+            let mut side = pair.side;
+            if block_axis_starts_at_right == Some(false) {
+                side = match side {
+                    RubySide::Over => RubySide::Under,
+                    RubySide::Under => RubySide::Over,
+                };
+            }
+            let block_offset = match side {
+                RubySide::Over => base_top - annotation_bottom,
+                RubySide::Under => base_bottom - annotation_top,
+            };
+            let annotation_width: f32 = annotation_runs.iter().map(|run| run.width).sum();
+            let base_center = (base_inline_start + base_inline_end) * 0.5;
+            let mut prefix = 0.0;
+            for run in annotation_runs {
+                let target_start = base_center - annotation_width * 0.5 + prefix;
+                placements.push(RubyPlacement {
+                    annotation_range: run.range,
+                    line_index,
+                    inline_offset: target_start - run.natural_start,
+                    block_offset,
+                });
+                prefix += run.width;
+            }
+        }
+    }
+    placements
 }
 
 fn interline_slot_geometry(
@@ -3263,6 +3393,12 @@ impl LayoutPassState<'_> {
                         parts: std::mem::take(&mut line_parts[line_index]),
                     })
                     .collect();
+                let wm = self.layout_wm_of(node_id);
+                stream.ruby_placements = resolve_ruby_placements(
+                    &stream.layout,
+                    &stream.ruby_pairs,
+                    wm.is_vertical().then_some(!wm.is_vertical_lr()),
+                );
                 inline_layout.interline = Some(stream);
                 height = new_height;
             }
@@ -3761,6 +3897,13 @@ impl LayoutPassState<'_> {
                 };
             }
         }
+        inline_layout.ruby_placements = resolve_ruby_placements(
+            &inline_layout.layout,
+            &inline_layout.ruby_pairs,
+            inline_layout
+                .vertical_text
+                .map(|vertical| vertical.block_axis_starts_at_right),
+        );
 
         // Put layout back
         self.nodes[node_id]

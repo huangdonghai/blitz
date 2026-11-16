@@ -3,8 +3,8 @@ use anyrender::filters::{Filter, FilterEffect};
 use blitz_dom::{
     BaseDocument, NodeId,
     node::{
-        InlineNoteFragment, InlineNoteSource, MarginNotePageFragment, TextBrush, TextLayout,
-        TextOrientation, VerticalTextPaint,
+        InlineNoteFragment, InlineNoteSource, MarginNotePageFragment, RubyPlacement, TextBrush,
+        TextLayout, TextOrientation, VerticalTextPaint,
     },
     util::ToColorColor,
 };
@@ -594,15 +594,28 @@ fn glyph_advance(font: &parley::FontData, glyph_id: u32) -> f64 {
         .unwrap_or(0.0)
 }
 
+fn ruby_placement_for_range(
+    placements: &[RubyPlacement],
+    line_index: usize,
+    range_start: usize,
+) -> Option<&RubyPlacement> {
+    placements.iter().find(|placement| {
+        placement.line_index == line_index
+            && placement.annotation_range.start <= range_start
+            && range_start < placement.annotation_range.end
+    })
+}
+
 /// Collect a run's glyphs in layout coordinates.
 ///
-/// A ruby annotation is drawn over the character it belongs to rather than after it: its
-/// advance was cleared before the lines were broken (see the inline layout), so the glyphs it
-/// shaped sit where the base character ends. They are moved to the base's centre and lifted by
-/// the line's ascent, the same place `text-emphasis` puts its marks.
+/// Ruby annotations have zero advance, so their per-line inline and block offsets come from
+/// Blitz's resolved ruby layout. Text-emphasis marks still use the base-centering path below.
 fn run_glyphs(
     glyph_run: &parley::layout::GlyphRun<'_, TextBrush>,
     annotations: &[std::ops::Range<usize>],
+    ruby_placements: &[RubyPlacement],
+    emphasis_colors: &[(std::ops::Range<usize>, Color)],
+    line_index: usize,
     ascent: f64,
     baseline: f64,
     base_centre: &mut Option<f64>,
@@ -635,9 +648,35 @@ fn run_glyphs(
             last = Some(pen + advance / 2.0);
             pen += advance;
         }
-        if let Some(last) = last {
-            *base_centre = Some(last);
+        if let Some(centre) = last {
+            *base_centre = Some(centre);
         }
+        return plain();
+    }
+
+    let annotation_start = glyph_run
+        .visual_clusters()
+        .next()
+        .map(|cluster| cluster.text_range().start);
+    if let Some(placement) = annotation_start
+        .and_then(|start| ruby_placement_for_range(ruby_placements, line_index, start))
+    {
+        return glyph_run
+            .positioned_glyphs()
+            .map(|glyph| anyrender::Glyph {
+                id: glyph.id as _,
+                x: glyph.x + placement.inline_offset,
+                y: glyph.y + placement.block_offset,
+            })
+            .collect();
+    }
+
+    let is_emphasis = annotation_start.is_some_and(|start| {
+        emphasis_colors
+            .iter()
+            .any(|(range, _)| range.start <= start && start < range.end)
+    });
+    if !is_emphasis {
         return plain();
     }
 
@@ -665,10 +704,7 @@ fn run_glyphs(
         .map(|glyph| anyrender::Glyph {
             id: glyph.id as _,
             x: (f64::from(glyph.x) + shift) as f32,
-            // The annotation sits in the margin above the base text: its box is one and a half
-            // times its size tall and rests on the edge of the ascent, so its baseline is three
-            // quarters of the way up. This is where Chrome draws it (measured against a render
-            // of the same page).
+            // Keep the existing half-size text-emphasis placement; Ruby uses layout placements above.
             y: (baseline - ascent - font_size * 0.75) as f32,
         })
         .collect()
@@ -1284,6 +1320,12 @@ pub(crate) fn stroke_text<'a>(
         .and_then(|element| element.inline_layout_data.as_ref())
         .map(|data| data.ruby_ranges.as_slice())
         .unwrap_or_default();
+    let ruby_placements = doc
+        .get_node(inline_root_id)
+        .and_then(|node| node.element_data())
+        .and_then(|element| element.inline_layout_data.as_ref())
+        .map(|data| data.ruby_placements.as_slice())
+        .unwrap_or_default();
     let emphasis_colors = doc
         .get_node(inline_root_id)
         .and_then(|node| node.element_data())
@@ -1300,6 +1342,8 @@ pub(crate) fn stroke_text<'a>(
         cull_rect,
         text,
         annotations,
+        ruby_placements,
+        0,
         emphasis_colors,
         context,
     );
@@ -1316,6 +1360,8 @@ pub(crate) fn stroke_text_with_data<'a>(
     cull_rect: Rect,
     text: &str,
     annotations: &[std::ops::Range<usize>],
+    ruby_placements: &[RubyPlacement],
+    ruby_line_index_offset: usize,
     emphasis_colors: &[(std::ops::Range<usize>, Color)],
     context: &mut DrawTextContext,
 ) {
@@ -1392,6 +1438,7 @@ pub(crate) fn stroke_text_with_data<'a>(
     // for each run, only resolve styles for the nodes newly descended into (popping
     // as we ascend). `path_scratch` is a reusable buffer for the run's node path.
     for (line_index, line) in lines.iter().enumerate() {
+        let ruby_line_index = line_index + ruby_line_index_offset;
         // A line is a row of text in a horizontal writing mode and a whole
         // column of it in a vertical one, so a paragraph that is only partly on
         // screen otherwise hands the rasterizer every line it has 閳?and a long
@@ -1427,7 +1474,6 @@ pub(crate) fn stroke_text_with_data<'a>(
         // Where the last ordinary character of this line sits along the inline axis: a ruby
         // annotation is drawn over it.
         let mut base_centre: Option<f64> = None;
-
         // An annotation is text the layout recorded as taking no room in the line: a `<rt>` element
     // or an emphasis mark, both of which are drawn over the character they belong to.
         let annotations = annotations;
@@ -1531,6 +1577,18 @@ pub(crate) fn stroke_text_with_data<'a>(
                 // The inline extent this run covers, in Parley's layout coordinates.
                 // Parley has already resolved vertical advances and spacing gaps, so the
                 // vertical painter can use the same extent as the horizontal painter.
+                let ruby_placement = glyph_run
+                    .visual_clusters()
+                    .next()
+                    .and_then(|cluster| {
+                        ruby_placement_for_range(
+                            ruby_placements,
+                            ruby_line_index,
+                            cluster.text_range().start,
+                        )
+                    });
+                let ruby_inline_offset = ruby_placement.map_or(0.0, |placement| placement.inline_offset);
+                let ruby_block_offset = ruby_placement.map_or(0.0, |placement| placement.block_offset);
                 let run_x0 = glyph_run.offset() as f64;
                 let run_x1 = run_x0 + glyph_run.advance() as f64;
 
@@ -1603,7 +1661,7 @@ pub(crate) fn stroke_text_with_data<'a>(
                                 (glyph.vertical_origin, glyph.vertical_advance)
                             };
 
-                            let inline_pos = pen;
+                            let inline_pos = pen + ruby_inline_offset;
                             // Upright glyphs advance by their vertical advance
                             // (CSS Writing Modes 3 5.1.1) 閳?a Latin letter is
                             // about an em tall but only half an em wide, so
@@ -1620,7 +1678,8 @@ pub(crate) fn stroke_text_with_data<'a>(
                             // sideways offsets rotate with the horizontal run.
                             let centre = baseline
                                 + if sideways { glyph.y } else { 0.0 }
-                                + (line_centre - line_metrics.baseline);
+                                + (line_centre - line_metrics.baseline)
+                                + ruby_block_offset;
                             let block_pos = if vertical.block_axis_starts_at_right {
                                 vertical.block_extent - centre
                             } else {
@@ -1718,6 +1777,9 @@ pub(crate) fn stroke_text_with_data<'a>(
                     let glyphs = run_glyphs(
                         &glyph_run,
                         &annotations,
+                        ruby_placements,
+                        emphasis_colors,
+                        ruby_line_index,
                         f64::from(metrics.ascent),
                         f64::from(glyph_run.baseline()),
                         &mut base_centre,
@@ -1768,6 +1830,9 @@ pub(crate) fn stroke_text_with_data<'a>(
                     let glyphs = run_glyphs(
                         &glyph_run,
                         &annotations,
+                        ruby_placements,
+                        emphasis_colors,
+                        ruby_line_index,
                         f64::from(metrics.ascent),
                         f64::from(glyph_run.baseline()),
                         &mut base_centre,
@@ -2121,6 +2186,8 @@ pub(crate) fn stroke_interline_notes(
         cull_rect,
         &stream.text,
         &stream.ruby_ranges,
+        &stream.ruby_placements,
+        0,
         &stream.emphasis_ranges,
         context,
     );
@@ -2331,6 +2398,8 @@ pub(crate) fn stroke_margin_note_group(
         cull_rect,
         &group.text,
         &group.ruby_ranges,
+        &group.ruby_placements,
+        line_start,
         &group.emphasis_ranges,
         context,
     );
@@ -2975,6 +3044,15 @@ fn paint_inline_note_row(
             let is_annotation = source.ruby_ranges.iter().any(|annotation| {
                 annotation.start <= cluster_range.start && cluster_range.end <= annotation.end
             });
+            let is_ruby = source.ruby_pairs.iter().any(|pair| {
+                pair.annotation_range.start <= cluster_range.start
+                    && cluster_range.start < pair.annotation_range.end
+            });
+            let ruby_placement = ruby_placement_for_range(
+                &source.ruby_placements,
+                segment.line_index,
+                cluster_range.start,
+            );
 
             if let Some(vertical) = vertical {
                 let sideways = match vertical.text_orientation {
@@ -2996,13 +3074,16 @@ fn paint_inline_note_row(
                     } else {
                         (glyph.vertical_origin, glyph.vertical_advance)
                     };
-                    let inline_pos = inline_origin + glyph_pen;
+                    let inline_pos = inline_origin
+                        + glyph_pen
+                        + ruby_placement.map_or(0.0, |placement| placement.inline_offset);
                     glyph_pen += if sideways { glyph_advance } else { step };
 
                     let centre = block_origin
                         + relative_baseline
                         + if sideways { glyph.y } else { 0.0 }
-                        + (relative_line_centre - relative_baseline);
+                        + (relative_line_centre - relative_baseline)
+                        + ruby_placement.map_or(0.0, |placement| placement.block_offset);
                     let block_pos = if vertical.block_axis_starts_at_right {
                         vertical.block_extent - centre
                     } else {
@@ -3038,7 +3119,20 @@ fn paint_inline_note_row(
                     });
                 }
             } else if is_annotation {
-                if let Some(centre) = base_centre {
+                if let Some(placement) = ruby_placement {
+                    for glyph in cluster.glyphs() {
+                        upright.push(anyrender::Glyph {
+                            id: glyph.id as _,
+                            x: inline_origin
+                                + cluster_origin
+                                + new_before
+                                - old_before
+                                + glyph.x
+                                + placement.inline_offset,
+                            y: block_origin + relative_baseline + glyph.y + placement.block_offset,
+                        });
+                    }
+                } else if !is_ruby && let Some(centre) = base_centre {
                     let annotation_glyphs: Vec<_> = cluster.glyphs().collect();
                     let mut start = f64::INFINITY;
                     let mut end = f64::NEG_INFINITY;

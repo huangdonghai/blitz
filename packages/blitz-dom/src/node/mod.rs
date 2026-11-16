@@ -31,7 +31,6 @@ pub use text::{
     GeneratedTextInputEvent, InlineNoteBoxEdges, InlineNoteFragment, InlineNoteRunSpan,
     InlineNoteSegment, InlineNoteSource, InlineNoteUnit, InterlineAnchor, InterlineLine,
     InterlineNoteSource, InterlineNoteStream, InterlinePart, MarginNoteAnchor, MarginNoteGroup,
-    MarginNotePageFragment,
-    MarginNoteRect, MarginNoteSide, TextBrush, TextInputData, TextLayout, TextOrientation,
-    VerticalTextPaint,
+    MarginNotePageFragment, RubyPair, RubyPlacement, RubySide, MarginNoteRect, MarginNoteSide,
+    TextBrush, TextInputData, TextLayout, TextOrientation, VerticalTextPaint,
 };
