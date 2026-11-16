@@ -63,6 +63,9 @@ pub struct DocumentConfig {
     /// whole tree is reconstructed and laid out from scratch through the same
     /// damage-driven pipeline used by incremental mode.
     pub incremental: Option<bool>,
+    /// Whether final layout boxes are snapped to integer CSS pixels. Defaults
+    /// to `true`; disabling it preserves fractional CSS geometry for rendering.
+    pub round_layout: bool,
     /// If set, every sub-resource `Request` blitz-dom creates for this
     /// document will carry this signal. Aborting it cancels every in-flight
     /// fetch tied to this document.
@@ -86,6 +89,7 @@ impl Default for DocumentConfig {
             media_type: None,
             style_threading: StyleThreading::default(),
             incremental: None,
+            round_layout: true,
             abort_signal: None,
             subdocument_depth: 0,
         }

@@ -70,6 +70,7 @@ impl BaseDocument {
             media_type: Some(self.media_type.clone()),
             style_threading: self.style_threading,
             incremental: Some(self.incremental_layout),
+            round_layout: self.round_layout,
             abort_signal: Some(abort_signal),
             subdocument_depth: self.subdocument_depth + 1,
         }

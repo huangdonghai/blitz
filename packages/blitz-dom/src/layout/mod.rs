@@ -106,6 +106,21 @@ pub(crate) struct LayoutPassState<'doc> {
 }
 
 impl<'doc> LayoutPassState<'doc> {
+    /// Copy fractional layout results into the final layout tree without snapping.
+    #[cfg(not(feature = "writing-mode"))]
+    pub(crate) fn copy_unrounded_layout(&mut self, node_id: NodeId) {
+        let layout = self.get_unrounded_layout(node_id);
+        self.set_final_layout(node_id, &layout);
+        for index in 0..self.child_count(node_id) {
+            let child = self.get_child_id(node_id, index);
+            self.copy_unrounded_layout(child);
+        }
+        for index in 0..self.hoisted_child_count(node_id) {
+            let child = self.get_hoisted_child_id(node_id, index);
+            self.copy_unrounded_layout(child);
+        }
+    }
+
     /// The containing block's inline size when `dom_id` is the box currently laid out in an orthogonal
     /// flow: its percentage padding resolves against it (see `layout::writing_mode`).
     #[inline]

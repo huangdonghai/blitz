@@ -264,6 +264,8 @@ pub struct BaseDocument {
     /// every node is treated as damaged on every `resolve`, so the same damage
     /// pipeline reconstructs and relays out the whole tree.
     pub(crate) incremental_layout: bool,
+    /// Whether final layout boxes are snapped to integer CSS pixels.
+    pub(crate) round_layout: bool,
     /// How deeply this document is nested within other documents
     /// (0 for a root document). Used to limit `<iframe>` nesting depth.
     pub(crate) subdocument_depth: usize,
@@ -512,6 +514,7 @@ impl BaseDocument {
             pending_device_changes: DeviceChanges::empty(),
             style_threading: config.style_threading,
             incremental_layout: config.incremental.unwrap_or(true),
+            round_layout: config.round_layout,
             subdocument_depth: config.subdocument_depth,
             devtool_settings: DevtoolSettings::default(),
             url: base_url,
@@ -2228,6 +2231,22 @@ impl BaseDocument {
     /// simply treated as damaged on every `resolve` (see [`Self::incremental_layout`]).
     pub fn set_incremental_layout(&mut self, enabled: bool) {
         self.incremental_layout = enabled;
+    }
+
+    /// Whether final layout boxes are snapped to integer CSS pixels.
+    pub fn round_layout(&self) -> bool {
+        self.round_layout
+    }
+
+    /// Enable or disable final layout pixel snapping. Existing documents are
+    /// marked for a full layout pass so the next resolve uses the new policy.
+    pub fn set_round_layout(&mut self, enabled: bool) {
+        if self.round_layout == enabled {
+            return;
+        }
+        self.round_layout = enabled;
+        self.mark_all_damaged();
+        self.shell_provider.request_redraw();
     }
 
     pub fn devtools(&self) -> &DevtoolSettings {
