@@ -3,7 +3,7 @@ use crate::color::{Color, ToColorColor};
 use crate::gradient::to_peniko_gradient;
 use anyrender::PaintScene;
 use blitz_dom::node::{ImageData, ImageResourceData, SpecialElementData};
-use blitz_dom::{Node, NodeId};
+use blitz_dom::{Node, NodeId, local_name};
 use kurbo::{self, Affine, BezPath, Point, Rect, Shape, Size, Vec2};
 use peniko::{self, Fill};
 use std::collections::{HashMap, HashSet};
@@ -214,7 +214,16 @@ impl ElementCx<'_, '_> {
             if layer_paints_nothing(&layer) {
                 continue;
             }
-            let background_clip_path = self.box_path(layer.clip);
+            // A fixed background on the body is the page background: the
+            // browser paints it against the viewport and clips it to the
+            // canvas, not to the body's content box (which is usually only as
+            // tall as the text). The root colour propagation above already
+            // covers the page; give the image layers the same page clip.
+            let background_clip_path = if self.body_fixed_background(&layer) {
+                self.viewport_clip_path()
+            } else {
+                self.box_path(layer.clip)
+            };
 
             self.context.layer_manager.maybe_with_layer(
                 scene,
@@ -813,6 +822,28 @@ impl ElementCx<'_, '_> {
     /// (the transformed element acts as the layer's containing block).
     fn layer_is_fixed(&self, layer: &ImageLayerStyles) -> bool {
         layer.attachment == StyloBackgroundAttachment::Fixed && !self.is_transformed()
+    }
+
+    /// Whether this is the body's fixed background layer, which stands in for
+    /// the page background.
+    fn body_fixed_background(&self, layer: &ImageLayerStyles) -> bool {
+        self.node.data.is_element_with_tag_name(&local_name!("body"))
+            && self.layer_is_fixed(layer)
+    }
+
+    /// The page viewport as a path in this element's coordinate space. The
+    /// layer code transforms it back by `self.transform`.
+    fn viewport_clip_path(&self) -> BezPath {
+        let viewport = Rect::new(
+            0.0,
+            0.0,
+            self.context.width as f64,
+            self.context.height as f64,
+        );
+        self.transform
+            .inverse()
+            .transform_rect_bbox(viewport)
+            .to_path(0.1)
     }
 
     /// The background positioning area and the transform from its coordinate
