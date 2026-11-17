@@ -1418,6 +1418,7 @@ impl BaseDocument {
                     family_name: overrides.family_name.as_deref(),
                     weight: weight_override,
                     style: overrides.style,
+                    width: overrides.width,
                     unicode_ranges: overrides.unicode_ranges.as_deref(),
                     font_features: overrides.font_features.as_deref(),
                     ..Default::default()
