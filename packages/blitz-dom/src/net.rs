@@ -54,6 +54,8 @@ pub struct FontFaceOverrides {
     pub style: Option<parley::fontique::FontStyle>,
     /// Inclusive codepoint intervals declared by `unicode-range`; `None` means unrestricted.
     pub unicode_ranges: Option<Vec<parley::fontique::FontUnicodeRange>>,
+    /// OpenType feature defaults declared by `font-feature-settings` on the face.
+    pub font_features: Option<Vec<parley::FontFeature>>,
 }
 
 #[derive(Clone, Debug)]
@@ -439,6 +441,17 @@ pub(crate) fn fetch_font_face_rules<'a>(
                             .iter()
                             .map(|range| {
                                 parley::fontique::FontUnicodeRange::new(range.start, range.end)
+                            })
+                            .collect()
+                    }),
+                    font_features: descriptor.font_feature_settings.as_ref().map(|settings| {
+                        settings
+                            .0
+                            .iter()
+                            .map(|setting| parley::FontFeature {
+                                tag: parley::setting::Tag::from_bytes(setting.tag.0.to_be_bytes()),
+                                value: setting.value.get().unwrap_or(0).clamp(0, u16::MAX as i32)
+                                    as u16,
                             })
                             .collect()
                     }),

@@ -537,7 +537,6 @@ impl BaseDocument {
         self.stylist
             .rule_changed(&sheet, &new_rule, &guard, change_kind, &ancestor_refs);
         drop(guard);
-        self.record_font_face_rule(&new_rule);
         Ok(index)
     }
 

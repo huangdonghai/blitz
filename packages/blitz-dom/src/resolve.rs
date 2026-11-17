@@ -408,7 +408,6 @@ impl BaseDocument {
                         &mut layout,
                         self.viewport.scale(),
                         task.node_id,
-                        &self.font_face_features,
                     );
 
                     #[cfg(feature = "parallel-construct")]
