@@ -1108,6 +1108,33 @@ fn plan_inline_note_fragment(
     })
 }
 
+#[derive(Clone, Copy)]
+struct InlineNoteParentStrut {
+    font_size: f32,
+    line_height: f32,
+    /// The block-axis center of the root strut relative to its baseline.
+    center_offset: f32,
+}
+
+fn inline_note_parent_strut(
+    layout: &parley::layout::Layout<crate::node::TextBrush>,
+) -> Option<InlineNoteParentStrut> {
+    let (font_size, line_height) = layout.root_span_size_and_line_height()?;
+    let center_offset = if layout.is_vertical() {
+        0.0
+    } else {
+        layout
+            .root_span_line_box_extents()
+            .map(|(over, under)| (under - over) * 0.5)
+            .unwrap_or(0.0)
+    };
+    Some(InlineNoteParentStrut {
+        font_size,
+        line_height,
+        center_offset,
+    })
+}
+
 fn resolve_inline_note_break(
     breaker: &mut parley::layout::BreakLines<'_, crate::node::TextBrush>,
     box_break: &parley::layout::BoxBreakData,
@@ -1115,7 +1142,7 @@ fn resolve_inline_note_break(
     source_indices: &std::collections::HashMap<u64, usize>,
     cursors: &mut [InlineNoteCursor],
     fragments: &mut [Option<InlineNoteFragment>],
-    parent_strut: Option<(f32, f32)>,
+    parent_strut: Option<InlineNoteParentStrut>,
     inline_wraps: bool,
 ) -> Option<bool> {
     let source_index = *source_indices.get(&box_break.inline_box_id)?;
@@ -1192,16 +1219,25 @@ fn resolve_inline_note_break(
 
     let content_height = plan.first_line_height + plan.second_line_height;
     let box_height = content_height + plan.edges.block_start() + plan.edges.block_end();
-    let (body_font_size, body_line_height) =
-        parent_strut.unwrap_or((box_height.max(1.0), box_height));
-    let body_gap = ((body_line_height - body_font_size) * 0.5).max(0.0);
-    let extent = if box_height > body_line_height {
+    let parent_strut = parent_strut.unwrap_or(InlineNoteParentStrut {
+        font_size: box_height.max(1.0),
+        line_height: box_height,
+        center_offset: 0.0,
+    });
+    let body_gap = ((parent_strut.line_height - parent_strut.font_size) * 0.5).max(0.0);
+    let extent = if box_height > parent_strut.line_height {
         box_height + 2.0 * body_gap
     } else {
         box_height
     };
-    let (ascent, descent) = if box_height > body_line_height {
-        (extent * 0.5, extent * 0.5)
+    // `CustomInFlowCentered` is centered on the line box, not the baseline. If
+    // the note grows the line, keep the root strut's center offset from baseline
+    // so that the annotation remains centered on the body text.
+    let (ascent, descent) = if box_height > parent_strut.line_height {
+        (
+            extent * 0.5 - parent_strut.center_offset,
+            extent * 0.5 + parent_strut.center_offset,
+        )
     } else {
         (box_height * 0.5, box_height * 0.5)
     };
@@ -2619,7 +2655,7 @@ impl LayoutPassState<'_> {
             if inline_layout.inline_notes.is_empty() {
                 inline_layout.layout.break_all_lines(Some(width));
             } else {
-                let parent_strut = inline_layout.layout.root_span_size_and_line_height();
+                let parent_strut = inline_note_parent_strut(&inline_layout.layout);
                 let notes = &inline_layout.inline_notes;
                 let source_indices: std::collections::HashMap<_, _> = notes
                     .iter()
@@ -2693,7 +2729,7 @@ impl LayoutPassState<'_> {
                     );
                 }
             }
-            let parent_strut = inline_layout.layout.root_span_size_and_line_height();
+            let parent_strut = inline_note_parent_strut(&inline_layout.layout);
             let notes = &inline_layout.inline_notes;
             let source_indices: std::collections::HashMap<_, _> = notes
                 .iter()
@@ -3000,10 +3036,10 @@ impl LayoutPassState<'_> {
                 parent_vertical,
             );
             let body_lines = inline_layout.layout.lines().collect::<Vec<_>>();
-            let parent_strut = inline_layout.layout.root_span_size_and_line_height();
-            let body_font_size = parent_strut.map(|(font_size, _)| font_size).unwrap_or(0.0);
+            let parent_strut = inline_note_parent_strut(&inline_layout.layout);
+            let body_font_size = parent_strut.map(|strut| strut.font_size).unwrap_or(0.0);
             let body_strut_line_height = parent_strut
-                .map(|(_, line_height)| line_height)
+                .map(|strut| strut.line_height)
                 .filter(|line_height| *line_height > 0.0)
                 .unwrap_or_else(|| {
                     body_lines
