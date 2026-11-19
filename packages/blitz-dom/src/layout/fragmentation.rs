@@ -166,6 +166,7 @@ use style::computed_values::flex_direction::T as FlexDirection;
 use style::computed_values::flex_wrap::T as FlexWrap;
 use style::media_queries::MediaType;
 use style::properties::ComputedValues;
+use style::servo_arc::Arc as ServoArc;
 use style::values::computed::length::NonNegativeLengthOrAuto;
 use style::properties::PropertyDeclaration;
 use style::values::computed::{
@@ -540,7 +541,15 @@ impl BaseDocument {
     /// This runs before layout: the page area is the root box's containing block in paged media,
     /// so a document that asks for 5in paper has to be laid out for 5in and not for the window.
     pub(crate) fn resolve_page_box(&mut self) {
-        self.page_box = (*self.media_type() == MediaType::print()).then(|| page_box(self));
+        let previous = self.page_box.take();
+        let mut next = (*self.media_type() == MediaType::print()).then(|| page_box(self));
+        if let (Some(previous), Some(next)) = (previous.as_ref(), next.as_mut()) {
+            carry_page_background_images(previous, next);
+        }
+        self.page_box = next;
+        if self.page_box.is_some() {
+            self.flush_page_background_images();
+        }
     }
 
     /// Compute the page bands of the root flow and hang them on the root element.
@@ -560,7 +569,7 @@ impl BaseDocument {
     /// The size of the picture a paged document is drawn into: every page box it was cut into,
     /// stacked. `None` for a document that is not paginated.
     pub fn page_canvas(&self) -> Option<Size<f32>> {
-        let page = self.page_box?;
+        let page = self.page_box.as_ref()?;
         let plan = self.root_element().break_plan.as_deref()?;
         Some(Size {
             width: match plan.axis {
@@ -591,9 +600,19 @@ impl BaseDocument {
             .is_some_and(|plan| plan.axis == FlowAxis::X)
     }
 
+    /// The page box that is currently being laid out, including its computed style.
+    pub fn page_box(&self) -> Option<&PageBox> {
+        self.page_box.as_ref()
+    }
+
     /// Size of one sheet of paper, including its page margins.
     pub fn page_box_size(&self) -> Option<Size<f32>> {
-        self.page_box.map(|page| page.size)
+        self.page_box.as_ref().map(|page| page.size)
+    }
+
+    /// The page box's margins, in CSS pixels.
+    pub fn page_box_margin(&self) -> Option<Rect<f32>> {
+        self.page_box.as_ref().map(|page| page.margin)
     }
 
     /// The flow coordinate under the top-left corner of page `index`'s paper.
@@ -606,7 +625,7 @@ impl BaseDocument {
     /// top-left pixel stands for — the offset pointer coordinates need before
     /// hit testing.
     pub fn page_flow_origin(&self, index: usize) -> Option<(f32, f32)> {
-        let page = self.page_box?;
+        let page = self.page_box.as_ref()?;
         let plan = self.root_element().break_plan.as_deref()?;
         let band = plan.bands.get(index)?;
         let shift = plan.translate(band);
@@ -618,16 +637,47 @@ impl BaseDocument {
     }
 }
 
+/// The computed background and loaded images for one page context.
+#[derive(Clone, Debug)]
+pub struct PageBackground {
+    pub styles: ServoArc<ComputedValues>,
+    pub images: Vec<Option<crate::node::ImageResourceData>>,
+}
+
+impl PageBackground {
+    fn new(styles: ServoArc<ComputedValues>) -> Self {
+        let image_count = styles.get_background().background_image.0.len();
+        Self {
+            styles,
+            images: vec![None; image_count],
+        }
+    }
+}
+
 /// The paper one page is printed on, and the margin that keeps content off its edge, in the CSS
 /// pixels layout works in.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct PageBox {
     pub size: Size<f32>,
     /// The margins, as insets from the page box's edge.
     pub margin: Rect<f32>,
+    /// Background contexts: first page, later right pages, later left pages.
+    pub backgrounds: [PageBackground; 3],
 }
 
 impl PageBox {
+    /// Select the background context for page `index`; the first page is on the right.
+    pub fn background_for_page(&self, index: usize) -> &PageBackground {
+        let context = if index == 0 {
+            0
+        } else if index % 2 == 0 {
+            1
+        } else {
+            2
+        };
+        &self.backgrounds[context]
+    }
+
     /// The page area: what the root box is laid out inside (CSS Page 3 §5.2).
     pub fn area(&self) -> Size<f32> {
         Size {
@@ -672,7 +722,7 @@ struct PageIndexKey {
 
 impl PageIndexKey {
     fn new(doc: &BaseDocument, plan: &BreakPlan) -> Self {
-        let paper = doc.page_box.map(|page| {
+        let paper = doc.page_box.as_ref().map(|page| {
             [
                 page.size.width.to_bits(),
                 page.size.height.to_bits(),
@@ -854,7 +904,7 @@ fn box_paint_bounds(doc: &BaseDocument, node: &Node) -> Option<(f32, f32, f32, f
 /// (margin notes), so membership is tested against the paper rather than the
 /// body's narrower fragment clip.
 fn page_paper_rect(doc: &BaseDocument, plan: &BreakPlan, band: &Band) -> Rect<f32> {
-    let Some(page) = doc.page_box else {
+    let Some(page) = doc.page_box.as_ref() else {
         return plan.fragment_rect(band);
     };
     let left = band.origin.x - page.margin.left;
@@ -1052,6 +1102,119 @@ fn window(doc: &BaseDocument) -> Size<f32> {
     }
 }
 
+/// Preserve in-flight and loaded resources across page-style recomputation when their URLs remain.
+fn carry_page_background_images(previous: &PageBox, next: &mut PageBox) {
+    use style::url::ComputedUrl;
+    use style::values::generics::image::Image as StyloImage;
+
+    for context in 0..next.backgrounds.len() {
+        let style_images = next.backgrounds[context]
+            .styles
+            .get_background()
+            .background_image
+            .0
+            .clone();
+        for (index, style_image) in style_images.iter().enumerate() {
+            let StyloImage::Url(ComputedUrl::Valid(url)) = style_image else {
+                continue;
+            };
+            if let Some(image) = previous
+                .backgrounds
+                .iter()
+                .flat_map(|background| background.images.iter().flatten())
+                .find(|image| image.url.as_str() == url.as_str())
+            {
+                next.backgrounds[context].images[index] = Some(image.clone());
+            }
+        }
+    }
+}
+
+/// Cascade the page context using Stylo's normal origin, importance, layer, and specificity order.
+/// The root element is the page context's inherited parent (CSS Paged Media 3 §5.1.1).
+fn cascade_page_styles(
+    doc: &BaseDocument,
+    parent_style: Option<&ComputedValues>,
+    guards: &style::shared_lock::StylesheetGuards<'_>,
+    pseudos: style::stylesheets::PagePseudoClassFlags,
+    name: &Option<style::Atom>,
+) -> ServoArc<ComputedValues> {
+    use style::applicable_declarations::ApplicableDeclarationList;
+    use style::computed_value_flags::ComputedValueFlags;
+    use style::properties::{CascadeMode, FirstLineReparenting};
+    use style::rule_cache::RuleCacheConditions;
+    use style::rule_tree::RuleCascadeFlags;
+    use style::values::specified::position::PositionTryFallbacksTryTactic;
+
+    let mut matched_rules = Vec::new();
+    for (data, origin) in doc.stylist.iter_extra_data_origins() {
+        data.pages.match_and_append_rules(
+            &mut matched_rules,
+            origin,
+            guards,
+            doc.stylist.cascade_data(),
+            name,
+            pseudos,
+        );
+    }
+
+    let mut applicable = ApplicableDeclarationList::new();
+    applicable.extend(matched_rules);
+    let rule_node = doc
+        .stylist
+        .rule_tree()
+        .compute_rule_node(&mut applicable, guards);
+    let declarations = page_declarations(&rule_node, guards);
+    let mut rule_cache_conditions = RuleCacheConditions::default();
+    let mut tree_counting_caches = style::context::TreeCountingCaches::default();
+
+    style::properties::apply_declarations::<&Node, _>(
+        &doc.stylist,
+        None,
+        &rule_node,
+        guards,
+        declarations,
+        parent_style,
+        None,
+        FirstLineReparenting::No,
+        &PositionTryFallbacksTryTactic::default(),
+        CascadeMode::Unvisited {
+            visited_rules: None,
+        },
+        ComputedValueFlags::empty(),
+        RuleCascadeFlags::empty(),
+        None,
+        &mut rule_cache_conditions,
+        None,
+        &mut tree_counting_caches,
+    )
+}
+
+/// Iterate page declarations in the same reverse priority order as Stylo's rule-tree cascade.
+fn page_declarations<'a>(
+    rule_node: &'a style::rule_tree::StrongRuleNode,
+    guards: &'a style::shared_lock::StylesheetGuards<'a>,
+) -> impl Iterator<Item = (&'a PropertyDeclaration, style::applicable_declarations::CascadePriority)>
+       + 'a {
+    let mut declarations = Vec::new();
+    let mut current = Some(rule_node);
+    while let Some(node) = current {
+        let priority = node.cascade_priority();
+        if let Some(source) = node.style_source() {
+            let guard = priority.cascade_level().origin().guard(guards);
+            for (declaration, importance) in
+                source.read(guard).declaration_importance_iter().rev()
+            {
+                if priority.cascade_level().is_important() == importance.important() {
+                    declarations.push((declaration, priority));
+                }
+            }
+        }
+        current = node.parent();
+    }
+    declarations.into_iter()
+}
+
 /// The page a document starts on, as the document's `@page` rules describe it.
 ///
 /// A document with no page rules prints on the window it was given, with no margin. The page's name
@@ -1062,6 +1225,35 @@ fn window(doc: &BaseDocument) -> Size<f32> {
 /// whole flow is laid out in, so another page's box could only be honoured by laying the flow out
 /// again.
 fn page_box(doc: &BaseDocument) -> PageBox {
+    let root_styles = doc.root_element().primary_styles();
+    let mut area = Size::default();
+    let guard = doc.guard().read();
+    let guards = style::shared_lock::StylesheetGuards::same(&guard);
+    let page_name = starting_page_name(doc);
+    let pseudos = style::stylesheets::PagePseudoClassFlags::FIRST
+        | style::stylesheets::PagePseudoClassFlags::RIGHT;
+    let parent_style = root_styles.as_deref().map(|styles| styles.as_ref());
+    let first_background = cascade_page_styles(
+        doc,
+        parent_style,
+        &guards,
+        pseudos,
+        &page_name,
+    );
+    let right_background = cascade_page_styles(
+        doc,
+        parent_style,
+        &guards,
+        style::stylesheets::PagePseudoClassFlags::RIGHT,
+        &page_name,
+    );
+    let left_background = cascade_page_styles(
+        doc,
+        parent_style,
+        &guards,
+        style::stylesheets::PagePseudoClassFlags::LEFT,
+        &page_name,
+    );
     let mut page = PageBox {
         size: window(doc),
         margin: Rect {
@@ -1070,11 +1262,12 @@ fn page_box(doc: &BaseDocument) -> PageBox {
             top: 0.0,
             bottom: 0.0,
         },
+        backgrounds: [
+            PageBackground::new(first_background),
+            PageBackground::new(right_background),
+            PageBackground::new(left_background),
+        ],
     };
-    let mut area = Size::default();
-    let guard = doc.guard().read();
-    let pseudos = style::stylesheets::PagePseudoClassFlags::FIRST
-        | style::stylesheets::PagePseudoClassFlags::RIGHT;
     // A page inherits from the root element (CSS Page 3 §5.1.1), which is where a page rule's
     // `inherit` comes from — `page-margin-006-print` asks for the root's half-inch margin on every
     // side of the paper. The root box's own containing block is the page area, so a percentage of
@@ -2705,7 +2898,7 @@ fn page_plan(doc: &BaseDocument, root_id: NodeId) -> Option<BreakPlan> {
     #[cfg(not(feature = "writing-mode"))]
     let (axis, reversed) = (FlowAxis::Y, false);
 
-    let page = doc.page_box?;
+    let page = doc.page_box.as_ref()?;
     let area = page.area();
     #[cfg(debug_assertions)]
     if std::env::var_os("CUOTUO_DEBUG_FRAGMENTATION").is_some() {

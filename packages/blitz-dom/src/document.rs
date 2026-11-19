@@ -1346,6 +1346,18 @@ impl BaseDocument {
             Err(err) => {
                 if let Some(url) = res.resolved_url.as_ref() {
                     let waiting_nodes = self.pending_images.remove(url).unwrap_or_default();
+                    for (_, image_type) in &waiting_nodes {
+                        if let ImageType::PageBackground { context, index } = image_type
+                            && let Some(Some(image)) = self
+                                .page_box
+                                .as_mut()
+                                .and_then(|page| page.backgrounds.get_mut(*context))
+                                .and_then(|background| background.images.get_mut(*index))
+                            && image.url.as_str() == url
+                        {
+                            image.status = Status::Error;
+                        }
+                    }
                     #[cfg(feature = "tracing")]
                     tracing::warn!(
                         url = url.as_str(),
@@ -1463,8 +1475,22 @@ impl BaseDocument {
         // Cache the image
         self.image_cache.insert(url.to_string(), image.clone());
 
-        // Apply to all waiting nodes
+        // Apply to all waiting elements and page background layers.
         for (node_id, image_type) in waiting_nodes {
+            if let ImageType::PageBackground { context, index } = image_type {
+                if let Some(Some(layer)) = self
+                    .page_box
+                    .as_mut()
+                    .and_then(|page| page.backgrounds.get_mut(context))
+                    .and_then(|background| background.images.get_mut(index))
+                    && layer.url.as_str() == url
+                {
+                    layer.status = Status::Ok;
+                    layer.image = image.clone();
+                }
+                continue;
+            }
+
             let Some(node) = self.get_node_mut(node_id) else {
                 continue;
             };
@@ -1487,7 +1513,7 @@ impl BaseDocument {
                         let images = match image_type {
                             ImageType::Background(_) => &mut el.background_images,
                             ImageType::Mask(_) => &mut el.mask_images,
-                            ImageType::Image => unreachable!(),
+                            ImageType::Image | ImageType::PageBackground { .. } => unreachable!(),
                         };
                         images.get_mut(idx)
                     });
@@ -1496,6 +1522,7 @@ impl BaseDocument {
                         layer_image.image = image.clone();
                     }
                 }
+                ImageType::PageBackground { .. } => unreachable!(),
             }
         }
     }

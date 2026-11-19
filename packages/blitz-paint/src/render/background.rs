@@ -5,14 +5,16 @@ use anyrender::PaintScene;
 use blitz_dom::node::{ImageData, ImageResourceData, SpecialElementData};
 use blitz_dom::{Node, NodeId, local_name};
 use kurbo::{self, Affine, BezPath, Point, Rect, Shape, Size, Vec2};
-use peniko::{self, Fill};
+use peniko::{self, Fill, Mix};
 use std::collections::{HashMap, HashSet};
 use style::{
     color::AbsoluteColor,
     computed_values::border_collapse::T as BorderCollapse,
     properties::{
+        ComputedValues,
         generated::longhands::{
             background_attachment::single_value::computed_value::T as StyloBackgroundAttachment,
+            background_blend_mode::single_value::computed_value::T as StyloBackgroundBlendMode,
             background_clip::single_value::computed_value::T as StyloBackgroundClip,
             background_origin::single_value::computed_value::T as StyloBackgroundOrigin,
             mask_origin::single_value::computed_value::T as StyloMaskOrigin,
@@ -166,6 +168,338 @@ impl<'a> ImageLayerStyles<'a> {
             origin: (*get_cyclic(&svg_styles.mask_origin.0, idx)).into(),
             // There is no `mask-attachment` property
             attachment: StyloBackgroundAttachment::Scroll,
+        }
+    }
+}
+
+/// Paint one page context's complete background stack. Unlike an element background, the page
+/// painting area is always the whole sheet; `background-clip` does not trim it (CSS Page 3 §4.1).
+pub(super) fn draw_page_background(
+    scene: &mut impl PaintScene,
+    style: &ComputedValues,
+    image_data: &[Option<ImageResourceData>],
+    paper_rect: Rect,
+    page_area_rect: Rect,
+    visible_clip: Rect,
+    scale: f64,
+) {
+    let background = style.get_background();
+    let current_color = style.clone_color();
+    let color = background
+        .background_color
+        .resolve_to_absolute(&current_color)
+        .as_srgb_color();
+
+    let has_blend_mode = background
+        .background_blend_mode
+        .0
+        .iter()
+        .any(|mode| *mode != StyloBackgroundBlendMode::Normal);
+    scene.push_clip_layer(Fill::NonZero, Affine::IDENTITY, &visible_clip);
+    if has_blend_mode {
+        // Background blend modes composite the image layers with the page background, not with
+        // unrelated content already on the canvas. Isolate this stack before blending its layers.
+        scene.push_layer(
+            Fill::NonZero,
+            Mix::Normal,
+            1.0,
+            Affine::IDENTITY,
+            &paper_rect,
+            None,
+            None,
+        );
+    }
+    if color != Color::TRANSPARENT {
+        scene.fill(Fill::NonZero, Affine::IDENTITY, color, None, &paper_rect);
+    }
+
+    // The first listed image is the frontmost layer, so draw layers from back to front.
+    for index in (0..background.background_image.0.len()).rev() {
+        let layer = ImageLayerStyles::from_background(background, image_data, index);
+        if layer_paints_nothing(&layer) {
+            continue;
+        }
+        if has_blend_mode {
+            let blend = *get_cyclic(&background.background_blend_mode.0, index);
+            scene.push_layer(
+                Fill::NonZero,
+                to_peniko_mix(blend),
+                1.0,
+                Affine::IDENTITY,
+                &paper_rect,
+                None,
+                None,
+            );
+        }
+        draw_page_image_layer(
+            scene,
+            style,
+            &current_color,
+            &layer,
+            paper_rect,
+            page_area_rect,
+            scale,
+        );
+        if has_blend_mode {
+            scene.pop_layer();
+        }
+    }
+    if has_blend_mode {
+        scene.pop_layer();
+    }
+    scene.pop_layer();
+}
+
+fn to_peniko_mix(mode: StyloBackgroundBlendMode) -> Mix {
+    use StyloBackgroundBlendMode::*;
+
+    match mode {
+        Normal => Mix::Normal,
+        Multiply => Mix::Multiply,
+        Screen => Mix::Screen,
+        Overlay => Mix::Overlay,
+        Darken => Mix::Darken,
+        Lighten => Mix::Lighten,
+        ColorDodge => Mix::ColorDodge,
+        ColorBurn => Mix::ColorBurn,
+        HardLight => Mix::HardLight,
+        SoftLight => Mix::SoftLight,
+        Difference => Mix::Difference,
+        Exclusion => Mix::Exclusion,
+        Hue => Mix::Hue,
+        Saturation => Mix::Saturation,
+        Color => Mix::Color,
+        Luminosity => Mix::Luminosity,
+    }
+}
+
+fn draw_page_image_layer(
+    scene: &mut impl PaintScene,
+    style: &ComputedValues,
+    current_color: &AbsoluteColor,
+    layer: &ImageLayerStyles,
+    paper_rect: Rect,
+    page_area_rect: Rect,
+    scale: f64,
+) {
+    let origin_rect = if layer.attachment == StyloBackgroundAttachment::Fixed {
+        // In paged media, `fixed` is fixed to the page's margin box, not to a viewport shared by
+        // all pages (CSS Page 3 §4.1).
+        paper_rect
+    } else {
+        match layer.origin {
+            BoxModelBox::BorderBox => paper_rect,
+            BoxModelBox::PaddingBox | BoxModelBox::ContentBox => page_area_rect,
+        }
+    };
+
+    match layer.stylo_image {
+        GenericImage::None => {}
+        GenericImage::Gradient(gradient) => {
+            let (position, size) = compute_layer_position_and_size(
+                layer,
+                origin_rect.width() / scale,
+                origin_rect.height() / scale,
+                BackgroundSizeComputeMode::Auto,
+            );
+            let position = (position.to_vec2() * scale).to_point();
+            let size = size * scale;
+            let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
+            let x = gradient_axis_tiling(
+                *repeat_x,
+                origin_rect.x0,
+                origin_rect.width(),
+                paper_rect.x0,
+                paper_rect.width(),
+                position.x,
+                size.width,
+            );
+            let y = gradient_axis_tiling(
+                *repeat_y,
+                origin_rect.y0,
+                origin_rect.height(),
+                paper_rect.y0,
+                paper_rect.height(),
+                position.y,
+                size.height,
+            );
+            if x.count as u64 * y.count as u64 > 500 {
+                return;
+            }
+            let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
+            let (gradient, gradient_transform) = to_peniko_gradient(
+                gradient,
+                tile_rect,
+                origin_rect.bounding_box(),
+                scale,
+                current_color,
+            );
+            let brush = anyrender::Paint::Gradient(&gradient);
+            let transform = Affine::translate((x.translate, y.translate));
+            for row in 0..y.count {
+                for column in 0..x.count {
+                    let transform = transform.then_translate(Vec2 {
+                        x: column as f64 * x.stride,
+                        y: row as f64 * y.stride,
+                    });
+                    scene.fill(
+                        Fill::NonZero,
+                        transform,
+                        brush.clone(),
+                        gradient_transform,
+                        &tile_rect,
+                    );
+                }
+            }
+        }
+        GenericImage::Url(_) => {
+            let Some(image_data) = layer.image_data else {
+                return;
+            };
+            match &image_data.image {
+                ImageData::Raster(image) => {
+                    let image_width = image.width as f64;
+                    let image_height = image.height as f64;
+                    let (position, size) = compute_layer_position_and_size(
+                        layer,
+                        origin_rect.width() / scale,
+                        origin_rect.height() / scale,
+                        BackgroundSizeComputeMode::Size(image_width as f32, image_height as f32),
+                    );
+                    let position = (position.to_vec2() * scale).to_point();
+                    let size = size * scale;
+                    let x_ratio = size.width / image_width;
+                    let y_ratio = size.height / image_height;
+                    let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
+                    let x = page_raster_axis_tiling(
+                        *repeat_x,
+                        origin_rect.x0,
+                        origin_rect.width(),
+                        paper_rect.x0,
+                        paper_rect.width(),
+                        position.x,
+                        size.width,
+                        image_width,
+                        x_ratio,
+                    );
+                    let y = page_raster_axis_tiling(
+                        *repeat_y,
+                        origin_rect.y0,
+                        origin_rect.height(),
+                        paper_rect.y0,
+                        paper_rect.height(),
+                        position.y,
+                        size.height,
+                        image_height,
+                        y_ratio,
+                    );
+                    let transform = Affine::IDENTITY
+                        .pre_scale_non_uniform(x_ratio, y_ratio)
+                        .then_translate(Vec2 {
+                            x: x.translate,
+                            y: y.translate,
+                        });
+                    let tile_rect = Rect::new(0.0, 0.0, x.rect_len, y.rect_len);
+                    let quality = to_image_quality(style.clone_image_rendering());
+                    for row in 0..y.count {
+                        for column in 0..x.count {
+                            let transform = transform.then_translate(Vec2 {
+                                x: column as f64 * x.stride,
+                                y: row as f64 * y.stride,
+                            });
+                            scene.fill(
+                                Fill::NonZero,
+                                transform,
+                                to_peniko_image(image, quality).as_ref(),
+                                None,
+                                &tile_rect,
+                            );
+                        }
+                    }
+                }
+                #[cfg(feature = "svg")]
+                ImageData::Svg(svg) => {
+                    if svg.intrinsic_dimensions.degenerate_view_box {
+                        return;
+                    }
+                    let frame_w = (origin_rect.width() / scale) as f32;
+                    let frame_h = (origin_rect.height() / scale) as f32;
+                    let intrinsic_width =
+                        svg.intrinsic_width().filter(|w| w.is_finite() && *w > 0.0);
+                    let intrinsic_height =
+                        svg.intrinsic_height().filter(|h| h.is_finite() && *h > 0.0);
+                    let aspect_ratio = match (intrinsic_width, intrinsic_height) {
+                        (Some(width), Some(height)) => Some(width / height),
+                        _ => svg.viewbox_aspect_ratio(),
+                    }
+                    .filter(|ratio| ratio.is_finite() && *ratio > 0.0);
+                    let size = compute_layer_size(
+                        layer,
+                        frame_w,
+                        frame_h,
+                        BackgroundSizeComputeMode::Intrinsic {
+                            width: intrinsic_width,
+                            height: intrinsic_height,
+                            ratio: aspect_ratio,
+                        },
+                    );
+                    if size.width <= 0.0 || size.height <= 0.0 {
+                        return;
+                    }
+                    let tile_width = size.width as f64 * scale;
+                    let tile_height = size.height as f64 * scale;
+                    let position = compute_layer_position(
+                        layer,
+                        frame_w - size.width as f32,
+                        frame_h - size.height as f32,
+                    );
+                    let position = (position.to_vec2() * scale).to_point();
+                    let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
+                    let x = gradient_axis_tiling(
+                        *repeat_x,
+                        origin_rect.x0,
+                        origin_rect.width(),
+                        paper_rect.x0,
+                        paper_rect.width(),
+                        position.x,
+                        tile_width,
+                    );
+                    let y = gradient_axis_tiling(
+                        *repeat_y,
+                        origin_rect.y0,
+                        origin_rect.height(),
+                        paper_rect.y0,
+                        paper_rect.height(),
+                        position.y,
+                        tile_height,
+                    );
+                    if x.count as u64 * y.count as u64 > 500 {
+                        return;
+                    }
+                    let viewport =
+                        super::svg_viewport_affine(svg, tile_width as f32, tile_height as f32);
+                    for row in 0..y.count {
+                        for column in 0..x.count {
+                            let transform = Affine::translate((
+                                x.translate + column as f64 * x.stride,
+                                y.translate + row as f64 * y.stride,
+                            )) * viewport;
+                            anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
+                        }
+                    }
+                }
+                ImageData::None => {}
+                #[cfg(not(feature = "svg"))]
+                ImageData::Svg(_) => {}
+            }
+        }
+        GenericImage::LightDark(_)
+        | GenericImage::PaintWorklet(_)
+        | GenericImage::CrossFade(_)
+        | GenericImage::Image(_)
+        | GenericImage::ImageSet(_) => {
+            #[cfg(feature = "tracing")]
+            warn!("Implement this image layer type for page backgrounds");
         }
     }
 }
@@ -1403,6 +1737,52 @@ struct AxisTiling {
 ///
 /// The fill rect is in image pixel coordinates (the drawing transform is
 /// pre-scaled by `ratio`), while translations are in device pixels.
+fn page_raster_axis_tiling(
+    repeat: BackgroundRepeatKeyword,
+    origin_start: f64,
+    origin_len: f64,
+    clip_start: f64,
+    clip_len: f64,
+    bg_pos: f64,
+    tile_len: f64,
+    image_len: f64,
+    ratio: f64,
+) -> AxisTiling {
+    use BackgroundRepeatKeyword::*;
+
+    if !matches!(repeat, Repeat | Round) {
+        return raster_axis_tiling(
+            repeat,
+            origin_start,
+            origin_len,
+            clip_start,
+            clip_len,
+            bg_pos,
+            tile_len,
+            image_len,
+            ratio,
+        );
+    }
+
+    // Page backgrounds paint into the whole sheet even when their positioning area is
+    // the page area. Extend repeating raster tiles into the page margins, matching the
+    // clip-aware gradient and SVG paths above.
+    let clip_is_outer =
+        clip_start < origin_start || clip_start + clip_len > origin_start + origin_len;
+    let (area_start, area_len) = if clip_is_outer {
+        (clip_start, clip_len)
+    } else {
+        (origin_start, origin_len)
+    };
+    let extend_len = extend((origin_start - area_start) + bg_pos, tile_len);
+    AxisTiling {
+        translate: area_start - extend_len,
+        rect_len: (area_len + extend_len) / ratio,
+        count: 1,
+        stride: 0.0,
+    }
+}
+
 fn raster_axis_tiling(
     repeat: BackgroundRepeatKeyword,
     origin_start: f64,
