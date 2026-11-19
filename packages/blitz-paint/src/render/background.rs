@@ -883,11 +883,15 @@ impl ElementCx<'_, '_> {
     /// space to the scene for a fixed layer: the viewport, unaffected by any
     /// scrolling.
     fn fixed_positioning_area(&self) -> (Rect, Affine) {
+        // The viewport sits at the document origin, so the crop the painter
+        // was given (`initial`, the negative of the page offset) says where it
+        // lands in this scene. Without adding that back, a fixed layer is
+        // drawn against the first page and a later page shows nothing.
         let viewport_rect = Rect::new(
-            0.0,
-            0.0,
-            self.context.width as f64,
-            self.context.height as f64,
+            -self.context.initial_x,
+            -self.context.initial_y,
+            -self.context.initial_x + self.context.width as f64,
+            -self.context.initial_y + self.context.height as f64,
         );
         let transform = Affine::translate((self.context.initial_x, self.context.initial_y));
         (viewport_rect, transform)
