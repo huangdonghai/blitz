@@ -226,6 +226,7 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
             return;
         };
         let root_id = root_element.id;
+        let root_has_principal_box = root_element.taffy_display() != taffy::Display::None;
         let bg_width = (self.width as f32).max(root_element.final_layout().size.width);
         let bg_height = (self.height as f32).max(root_element.final_layout().size.height);
 
@@ -320,6 +321,30 @@ impl<'dom, 'a> BlitzDomPainter<'dom, 'a> {
                     let clip = paper_rect.intersect(viewport_clip_rect);
                     if clip.area() <= 0.0 {
                         continue;
+                    }
+                    // A root with `display:none` has no principal box and produces no printed
+                    // page content; its page context must not paint a background onto the blank
+                    // canvas (CSS Paged Media 3 §5.1).
+                    if root_has_principal_box
+                        && let Some(page_box) = self.dom.page_box()
+                    {
+                        let margin = page_box.margin;
+                        let page_area_rect = Rect::new(
+                            paper_rect.x0 + margin.left as f64 * self.scale,
+                            paper_rect.y0 + margin.top as f64 * self.scale,
+                            paper_rect.x1 - margin.right as f64 * self.scale,
+                            paper_rect.y1 - margin.bottom as f64 * self.scale,
+                        );
+                        let page_background = page_box.background_for_page(index);
+                        background::draw_page_background(
+                            scene,
+                            &page_background.styles,
+                            &page_background.images,
+                            paper_rect,
+                            page_area_rect,
+                            clip,
+                            self.scale,
+                        );
                     }
                     // The clip has to be a real layer: culling only drops boxes that fall
                     // entirely outside, and a box that straddles the break line paints whole

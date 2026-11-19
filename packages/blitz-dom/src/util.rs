@@ -72,6 +72,7 @@ pub enum ImageType {
     Image,
     Background(usize),
     Mask(usize),
+    PageBackground { context: usize, index: usize },
 }
 
 /// A point

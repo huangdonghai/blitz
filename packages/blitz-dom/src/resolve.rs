@@ -451,7 +451,7 @@ impl BaseDocument {
     pub fn resolve_layout(&mut self) {
         // A paged document is laid out for its page area; the window only says what paper it is
         // printed on when the document asks for none.
-        let available_space = match self.page_box.map(|page| page.area()) {
+        let available_space = match self.page_box.as_ref().map(|page| page.area()) {
             Some(area) => taffy::Size {
                 width: AvailableSpace::Definite(area.width),
                 height: AvailableSpace::Definite(area.height),

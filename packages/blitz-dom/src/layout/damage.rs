@@ -7,6 +7,7 @@ use crate::node::{Node, NodeFlags};
 use crate::tree::NodeTree;
 use crate::{
     BaseDocument, net::ImageHandler, node::ImageResourceData, node::Status, util::ImageLayerKind,
+    util::ImageType,
 };
 use style::matching::StyleChange;
 use style::properties::ComputedValues;
@@ -623,6 +624,80 @@ impl BaseDocument {
 
             // Element will always exist due to resize_with above
             elem_images[idx] = new_image;
+        }
+    }
+
+    /// Flush CSS page background-image layers into page-box storage.
+    pub(crate) fn flush_page_background_images(&mut self) {
+        let Some(page) = self.page_box.as_mut() else {
+            return;
+        };
+        let styles: [_; 3] =
+            std::array::from_fn(|context| page.backgrounds[context].styles.clone());
+        let mut images: [Vec<Option<ImageResourceData>>; 3] = std::array::from_fn(|context| {
+            std::mem::take(&mut page.backgrounds[context].images)
+        });
+        let doc_id = self.id();
+
+        for context in 0..styles.len() {
+            let style_images = &styles[context].get_background().background_image.0;
+            let context_images = &mut images[context];
+            context_images.resize_with(style_images.len(), || None);
+
+            for (index, style_image) in style_images.iter().enumerate() {
+                let StyloImage::Url(ComputedUrl::Valid(new_url)) = style_image else {
+                    context_images[index] = None;
+                    continue;
+                };
+
+                if context_images[index]
+                    .as_ref()
+                    .is_some_and(|old| old.url.as_str() == new_url.as_str())
+                {
+                    continue;
+                }
+
+                let url = new_url.as_str();
+                let target = ImageType::PageBackground { context, index };
+                context_images[index] = if let Some(cached) = self.image_cache.get(url) {
+                    Some(ImageResourceData {
+                        url: new_url.clone(),
+                        status: Status::Ok,
+                        image: cached.clone(),
+                    })
+                } else if let Some(waiting) = self.pending_images.get_mut(url) {
+                    if !waiting.iter().any(|(_, kind)| {
+                        matches!(kind, ImageType::PageBackground { context: pending_context, index: pending_index } if *pending_context == context && *pending_index == index)
+                    }) {
+                        waiting.push((self.root_node_id, target));
+                    }
+                    Some(ImageResourceData::new(new_url.clone()))
+                } else {
+                    self.pending_images
+                        .insert(url.to_string(), vec![(self.root_node_id, target)]);
+                    self.net_provider.fetch(
+                        doc_id,
+                        crate::net::stamped_request(
+                            (**new_url).clone(),
+                            self.abort_signal.as_ref(),
+                        ),
+                        ResourceHandler::boxed(
+                            self.tx.clone(),
+                            doc_id,
+                            None,
+                            self.shell_provider.clone(),
+                            ImageHandler::new(target),
+                        ),
+                    );
+                    Some(ImageResourceData::new(new_url.clone()))
+                };
+            }
+        }
+
+        if let Some(page) = self.page_box.as_mut() {
+            for (context, images) in images.into_iter().enumerate() {
+                page.backgrounds[context].images = images;
+            }
         }
     }
 }

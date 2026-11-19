@@ -133,7 +133,7 @@ fn side_physical(wm: stylo_taffy::WritingMode, side: MarginNoteSide) -> Physical
 }
 
 fn page_rect(doc: &BaseDocument) -> Rect {
-    if let Some(page) = doc.page_box {
+    if let Some(page) = doc.page_box.as_ref() {
         let area = page.area();
         Rect::new(0.0, 0.0, area.width, area.height)
     } else {
