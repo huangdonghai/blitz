@@ -137,7 +137,8 @@ impl ElementCx<'_, '_> {
                 None,
                 None,
             );
-            self.draw_image_layer(scene, &layer);
+            // A mask layer is never a canvas background.
+            self.draw_image_layer(scene, &layer, None);
             scene.pop_layer();
         }
     }

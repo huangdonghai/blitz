@@ -200,6 +200,11 @@ impl ElementCx<'_, '_> {
         let bg_styles = &self.style.get_background();
         let image_data = &self.element.background_images;
         let layer_count = bg_styles.background_image.0.len();
+        // The root element's background becomes the canvas background, whose
+        // painting area covers the whole page — the `@page` margins included
+        // (CSS Backgrounds 3 §2.11.2). Only the colour was propagated so far,
+        // which left a textured page margin bare.
+        let canvas_area = self.canvas_background_area();
 
         // The background color is clipped by the clip of the last layer in the list
         let background_clip: BoxModelBox =
@@ -217,9 +222,12 @@ impl ElementCx<'_, '_> {
             // A fixed background on the body is the page background: the
             // browser paints it against the viewport and clips it to the
             // canvas, not to the body's content box (which is usually only as
-            // tall as the text). The root colour propagation above already
-            // covers the page; give the image layers the same page clip.
-            let background_clip_path = if self.body_fixed_background(&layer) {
+            // tall as the text). The canvas background gets the same page
+            // clip; its images keep the element's box as their positioning
+            // area, which `paint_area` carries into the layer.
+            let page_background = self.body_fixed_background(&layer) || canvas_area.is_some();
+            let paint_area = canvas_area.filter(|_| !self.layer_is_fixed(&layer));
+            let background_clip_path = if page_background {
                 self.viewport_clip_path()
             } else {
                 self.box_path(layer.clip)
@@ -234,7 +242,7 @@ impl ElementCx<'_, '_> {
                 None,
                 None,
                 |scene| {
-                    self.draw_image_layer(scene, &layer);
+                    self.draw_image_layer(scene, &layer, paint_area);
                 },
             );
         }
@@ -258,15 +266,25 @@ impl ElementCx<'_, '_> {
         }
     }
 
-    /// Draw a single layer of a CSS image layer list (`background-image` or `mask-image`)
-    pub(super) fn draw_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
+    /// Draw a single layer of a CSS image layer list (`background-image` or
+    /// `mask-image`). `paint_area` is the region (in this element's
+    /// coordinates) a canvas background covers, when the layer is the page
+    /// background rather than the element's own.
+    pub(super) fn draw_image_layer(
+        &self,
+        scene: &mut impl PaintScene,
+        layer: &ImageLayerStyles,
+        paint_area: Option<Rect>,
+    ) {
         match layer.stylo_image {
             GenericImage::None => {
                 // Do nothing
             }
-            GenericImage::Gradient(gradient) => self.draw_gradient_layer(scene, gradient, layer),
+            GenericImage::Gradient(gradient) => {
+                self.draw_gradient_layer(scene, gradient, layer, paint_area)
+            }
             GenericImage::Url(_) => {
-                self.draw_raster_image_layer(scene, layer);
+                self.draw_raster_image_layer(scene, layer, paint_area);
                 #[cfg(feature = "svg")]
                 self.draw_svg_image_layer(scene, layer);
             }
@@ -831,19 +849,34 @@ impl ElementCx<'_, '_> {
             && self.layer_is_fixed(layer)
     }
 
-    /// The page viewport as a path in this element's coordinate space. The
-    /// layer code transforms it back by `self.transform`.
-    fn viewport_clip_path(&self) -> BezPath {
+    /// The page (the painted surface) as a rect in this element's coordinate
+    /// space: the area a canvas background covers.
+    fn viewport_rect(&self) -> Rect {
         let viewport = Rect::new(
             0.0,
             0.0,
             self.context.width as f64,
             self.context.height as f64,
         );
-        self.transform
-            .inverse()
-            .transform_rect_bbox(viewport)
-            .to_path(0.1)
+        self.transform.inverse().transform_rect_bbox(viewport)
+    }
+
+    /// The page viewport as a path in this element's coordinate space. The
+    /// layer code transforms it back by `self.transform`.
+    fn viewport_clip_path(&self) -> BezPath {
+        self.viewport_rect().to_path(0.1)
+    }
+
+    /// The rect a canvas background paints over, when this element carries
+    /// the canvas background (CSS Backgrounds 3 §2.11.2).
+    ///
+    /// Only the root element qualifies. A body's background stands in for a
+    /// transparent root too, but in a paged flow every child box is painted
+    /// inside its page band's clip, so the body's own paint cannot reach the
+    /// page margins. Its colour still reaches the canvas through the root
+    /// colour propagation in `paint_scene`.
+    fn canvas_background_area(&self) -> Option<Rect> {
+        (self.context.root_element_id == Some(self.node.id)).then(|| self.viewport_rect())
     }
 
     /// The background positioning area and the transform from its coordinate
@@ -950,7 +983,12 @@ impl ElementCx<'_, '_> {
         anyrender_svg::render_svg_tree(scene, &svg.tree, transform);
     }
 
-    fn draw_raster_image_layer(&self, scene: &mut impl PaintScene, layer: &ImageLayerStyles) {
+    fn draw_raster_image_layer(
+        &self,
+        scene: &mut impl PaintScene,
+        layer: &ImageLayerStyles,
+        paint_area: Option<Rect>,
+    ) {
         let Some(bg_image) = layer.image_data else {
             return;
         };
@@ -985,10 +1023,16 @@ impl ElementCx<'_, '_> {
 
         let BackgroundRepeat(repeat_x, repeat_y) = layer.repeat;
 
+        // A canvas background paints over `paint_area`; the origin box still
+        // places the tiles. Every other layer's painting area is its clip box.
+        let clip_rect = paint_area.unwrap_or_else(|| self.box_rect(layer.clip));
+
         let x = raster_axis_tiling(
             *repeat_x,
             origin_rect.x0,
             origin_rect.width(),
+            clip_rect.x0,
+            clip_rect.width(),
             bg_pos.x,
             bg_size.width,
             image_width,
@@ -998,6 +1042,8 @@ impl ElementCx<'_, '_> {
             *repeat_y,
             origin_rect.y0,
             origin_rect.height(),
+            clip_rect.y0,
+            clip_rect.height(),
             bg_pos.y,
             bg_size.height,
             image_height,
@@ -1035,6 +1081,7 @@ impl ElementCx<'_, '_> {
         scene: &mut impl PaintScene,
         gradient: &StyloGradient,
         layer: &ImageLayerStyles,
+        paint_area: Option<Rect>,
     ) {
         // For a fixed layer the positioning area (the viewport) already covers
         // everything visible, so it also serves as the clip rect (no extension
@@ -1046,7 +1093,7 @@ impl ElementCx<'_, '_> {
             (
                 self.box_rect(layer.origin),
                 self.transform,
-                self.box_rect(layer.clip),
+                paint_area.unwrap_or_else(|| self.box_rect(layer.clip)),
             )
         };
 
@@ -1347,9 +1394,12 @@ struct AxisTiling {
 }
 
 /// Per-axis placement and tiling for a raster image layer. `Repeat`/`Round`
-/// produce a single fill covering the whole positioning area (relying on the
+/// produce a single fill covering the whole painting area (relying on the
 /// image brush repeating), while `Space` produces `count` explicit tiles
-/// spaced `stride` apart.
+/// spaced `stride` apart. When the painting area (the clip box, or the page
+/// behind a canvas background) extends beyond the origin box, the tiling
+/// starts from that edge so the pattern covers the whole clipped area with
+/// the origin box still setting the phase.
 ///
 /// The fill rect is in image pixel coordinates (the drawing transform is
 /// pre-scaled by `ratio`), while translations are in device pixels.
@@ -1357,6 +1407,8 @@ fn raster_axis_tiling(
     repeat: BackgroundRepeatKeyword,
     origin_start: f64,
     origin_len: f64,
+    clip_start: f64,
+    clip_len: f64,
     bg_pos: f64,
     tile_len: f64,
     image_len: f64,
@@ -1366,10 +1418,19 @@ fn raster_axis_tiling(
 
     match repeat {
         Repeat | Round => {
-            let extend_len = extend(bg_pos, tile_len);
+            // The clip and origin boxes are nested, so the clip box extends
+            // beyond the origin box iff it does so at either end
+            let clip_is_outer =
+                clip_start < origin_start || clip_start + clip_len > origin_start + origin_len;
+            let (area_start, area_len) = if clip_is_outer {
+                (clip_start, clip_len)
+            } else {
+                (origin_start, origin_len)
+            };
+            let extend_len = extend((origin_start - area_start) + bg_pos, tile_len);
             AxisTiling {
-                translate: origin_start - extend_len,
-                rect_len: (origin_len + extend_len) / ratio,
+                translate: area_start - extend_len,
+                rect_len: (area_len + extend_len) / ratio,
                 count: 1,
                 stride: 0.0,
             }
